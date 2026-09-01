@@ -1,11 +1,12 @@
 import { defineTool, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 // Side-effect import — picks up the cordis `Context` augmentation declared
-// in index.ts (`ctx.mediaStudio: { getSettings(), workspaceRoot, llm }`).
+// in index.ts (`ctx.mediaStudio: { getSettings(), workspaceRoot, llm, canvasStore }`).
 // Without it, TS would only see the bare `Context` and error on `.getSettings`.
 import './index'
 import { callLlm } from './llm-bridge'
 import { generateImage, generateVideo, generateMusic, MediaError, type MediaProviderConfig, type MediaMusicConfig } from './media-providers'
+import { CanvasStore, type CanvasOp, type CanvasSnapshot } from './canvas-store'
 import { join } from 'node:path'
 import { DEFAULT_MEDIA_STUDIO, type MediaStudioSettingsShape } from './settings'
 
@@ -33,8 +34,9 @@ function ctxMediaStudio(): NonNullable<typeof _ctx> {
 }
 
 /** Bound at apply() so the tool closures can read `ctx.mediaStudio`. */
-export function bindMediaStudioContext(ctx: Context): void {
+export function bindMediaStudioContext(ctx: Context, store: CanvasStore): void {
   _ctx = ctx
+  ctx.mediaStudio.canvasStore = store
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +160,109 @@ const okMusicOutput = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool registration — one tool per modality, all reading from mediaStudio.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `canvas_graph_view` — read the current canvas snapshot. Agents should
+ * call this before `canvas_graph_patch` so they don't operate blind.
+ */
+export function registerCanvasViewTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_graph_view',
+      description: 'Read the current canvas graph (nodes + edges) for a canvas. Returns JSON; pass canvasId to disambiguate when the user has multiple canvases open (defaults to the plugin-wide defaultCanvasId).',
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            graph: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                nodes: { type: 'array', items: { type: 'object' as const, additionalProperties: true as const } },
+                edges: { type: 'array', items: { type: 'object' as const, additionalProperties: true as const } },
+              },
+            },
+            version: { type: 'number' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text' as const,
+          text: `canvas version ${(value as { version: number }).version}: ${(value as { graph: { nodes: unknown[] } }).graph.nodes.length} nodes, ${(value as { graph: { edges: unknown[] } }).graph.edges.length} edges`,
+        }],
+      },
+      async execute(args, exec) {
+        const mst = ctxMediaStudio() as unknown as { canvasStore: CanvasStore; getSettings(): MediaStudioSettingsShape }
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || mst.getSettings().textModel || 'main'
+        return store.snapshot(canvasId || 'main') as unknown as object
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_graph_patch` — batched, atomic canvas mutation. This is the
+ * primary tool the agent uses to "operate the canvas" from conversation.
+ *
+ * Why batch ops (vs. addNode / updateNode / deleteNode as separate tools)?
+ *   - Atomic: the whole batch applies or nothing does. The agent can plan
+ *     a 10-node workflow and ship it in one turn; no half-drawn canvases.
+ *   - Cheap: model output tokens don't grow with tool count.
+ *   - Composable: media-generate returns a nodeId that the next patch uses,
+ *     and `batchAddMedia` lets the agent dump several results in one op.
+ *
+ * The store applies the 4-guard pattern from workflow-one (no-graph /
+ * stale-version / empty-regression), persists to disk, and fires an SSE
+ * event so the canvas tab reflects the change live.
+ */
+export function registerCanvasPatchTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_graph_patch',
+      description:
+        'Batch-apply canvas graph ops atomically. Ops: addNode (type: text|image|video|music|note, label, data?, position?); updateNode (id, data); renameNode (id, label); deleteNode (id); moveNode (id, position); connect (from, to, branch?); deleteEdge (id); batchAddMedia (items: [{kind, url, prompt?, model?, position?, nodeId?}]). On reject, the whole batch fails — fix the lint hint and retry.',
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        ops: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            applied: { type: 'number' },
+            version: { type: 'number' },
+            lintOk: { type: 'boolean' },
+            issues: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text' as const,
+          text: `applied ${(value as { applied: number }).applied} ops → version ${(value as { version: number }).version}; lint: ${(value as { lintOk: boolean }).lintOk ? 'pass' : 'warnings'}`,
+        }],
+      },
+      async execute(args, exec) {
+        const store = (ctxMediaStudio() as unknown as { canvasStore: CanvasStore }).canvasStore
+        const canvasId = args.canvasId?.trim() || 'main'
+        const ops = Array.isArray(args.ops) ? (args.ops as unknown as CanvasOp[]) : []
+        if (ops.length === 0) throw new Error('canvas_graph_patch: ops must be a non-empty array')
+        if (ops.length > 60) throw new Error(`canvas_graph_patch: batch too large (${ops.length} ops, max 60)`)
+        const result = store.apply(canvasId, ops)
+        // Persist + SSE notify (SSE handler is registered by registerRoutes).
+        return {
+          applied: result.patch.length,
+          version: result.version,
+          lintOk: result.lintOk,
+          issues: result.issues,
+        }
+      },
+    }),
+  )
+}
 
 export function registerGenerateTextTool(ctx: Context): void {
   ctx.tools.register(

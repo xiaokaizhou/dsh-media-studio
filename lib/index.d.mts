@@ -2,6 +2,146 @@ import "@deepseek-ai/dsh-llm";
 import Schema from "@deepseek-ai/schemastery";
 import { SettingsScope } from "@deepseek-ai/dsh-settings";
 import { Context } from "@deepseek-ai/cordis";
+//#region src/canvas-store.d.ts
+/**
+ * Canvas state management — server-side source of truth for the canvas tab.
+ *
+ * Modeled directly on the workflow-one `engine.js` Canvas 4-guard pattern:
+ *   1. `no-graph`              — incoming payload has no nodes[] array
+ *   2. `stale-version`         — incoming version < current version (someone else wrote newer)
+ *   3. `empty-regression`     — incoming is empty while current isn't (don't blank the canvas)
+ *   4. closed fiber cleanup   — disposed when the plugin unloads
+ *
+ * Persistence: every accepted write is atomically JSON-flushed to disk
+ * (`workspaceRoot/canvases/<canvasId>.json`). The canvas store is
+ * recovered from disk on plugin boot so closing/reopening DSH restores
+ * the canvas exactly.
+ */
+interface CanvasNode {
+  id: string;
+  type: 'text' | 'image' | 'video' | 'music' | 'note';
+  /** User-friendly label rendered in the canvas card. */
+  label: string;
+  /** Free-form data attached by the agent / UI: prompt, resultUrl, status, etc. */
+  data: Record<string, unknown>;
+  /** Logical position in the canvas; UI maps to x/y in px. */
+  position?: {
+    x: number;
+    y: number;
+  };
+}
+interface CanvasEdge {
+  id: string;
+  source: string;
+  target: string;
+  /** Optional branch label for condition nodes (true / false). */
+  branch?: 'true' | 'false';
+}
+interface CanvasGraph {
+  nodes: CanvasNode[];
+  edges: CanvasEdge[];
+}
+interface CanvasState {
+  graph: CanvasGraph;
+  /** Monotonic version, increments on every accepted patch. */
+  version: number;
+  /** Session ids currently bound to this canvas (for SSE scoping). */
+  boundSessions: Set<string>;
+}
+interface CanvasSnapshot {
+  graph: CanvasGraph;
+  version: number;
+}
+interface PatchResult {
+  /** The new graph after the patch was applied. */
+  graph: CanvasGraph;
+  /** Echo back the ops that were accepted (for the SSE listener). */
+  patch: CanvasOp[];
+  /** Canvas version after this patch (the SSE listener uses this to dedup). */
+  version: number;
+  /** Whether the post-patch lint passed (no errors, only warnings). */
+  lintOk: boolean;
+  /** Lint issues (warnings + errors). */
+  issues: string[];
+}
+/**
+ * The op union — extends dsh-harness-one's set with our own op codes.
+ * See `validateOps` for the full grammar.
+ */
+type CanvasOp = {
+  op: 'addNode';
+  type: CanvasNode['type'];
+  label: string;
+  data?: Record<string, unknown>;
+  position?: {
+    x: number;
+    y: number;
+  };
+} | {
+  op: 'updateNode';
+  id: string;
+  data: Record<string, unknown>;
+} | {
+  op: 'renameNode';
+  id: string;
+  label: string;
+} | {
+  op: 'deleteNode';
+  id: string;
+} | {
+  op: 'moveNode';
+  id: string;
+  position: {
+    x: number;
+    y: number;
+  };
+} | {
+  op: 'connect';
+  from: string;
+  to: string;
+  branch?: 'true' | 'false';
+} | {
+  op: 'deleteEdge';
+  id: string;
+} | {
+  op: 'batchAddMedia';
+  items: Array<{
+    kind: 'image' | 'video' | 'audio';
+    url: string;
+    prompt?: string;
+    model?: string;
+    /** Position hint for the new node (UI may snap-to-grid). */
+    position?: {
+      x: number;
+      y: number;
+    };
+    /** Optional explicit id; if absent we generate one. */
+    nodeId?: string;
+  }>;
+};
+declare class CanvasStore {
+  private canvases;
+  private workspaceRoot;
+  constructor(workspaceRoot: string);
+  /** Resolve one canvas (lazily created if absent). Key includes the workspace
+   *  root so two profiles pointing at the same canvasId never collide. */
+  canvasOf(canvasId: string): CanvasState;
+  /**
+   * Apply a batch of ops atomically. Either every op succeeds or the canvas
+   * is left untouched and the caller gets a lint error back to fix and retry.
+   */
+  apply(canvasId: string, ops: CanvasOp[]): PatchResult;
+  /** Read the snapshot the canvas tab needs to render. */
+  snapshot(canvasId: string): CanvasSnapshot;
+  /** Bind a session id to this canvas (for SSE scoping). */
+  bindSession(canvasId: string, sessionId: string): void;
+  unbindSession(canvasId: string, sessionId: string): void;
+  boundSessions(canvasId: string): readonly string[];
+  /** Restore every persisted canvas from disk into the in-memory map. */
+  restore(): Promise<void>;
+  private persist;
+}
+//#endregion
 //#region src/settings.d.ts
 interface MediaProvider {
   provider: string;
@@ -70,6 +210,10 @@ declare module '@deepseek-ai/cordis' {
       llm: unknown;
       /** Resolved absolute workspace directory (cordis config wins over env). */
       workspaceRoot: string;
+      /** Server-side canvas state (Day 4). Tools read / write through this. */
+      canvasStore: CanvasStore;
+      /** SSE client registry (Day 4) — the canvas tab subscribes here. */
+      sseClients: Set<import('node:http').ServerResponse>;
     };
   }
 }

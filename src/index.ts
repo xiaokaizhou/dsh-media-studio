@@ -5,7 +5,9 @@ import '@deepseek-ai/dsh-llm'
 import { MediaStudioSettings, NS, readMediaStudio, DEFAULT_MEDIA_STUDIO, type MediaStudioScope, type MediaStudioSettingsShape } from './settings'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
-import { registerGenerateTextTool, registerGenerateImageTool, registerGenerateVideoTool, registerGenerateMusicTool, bindMediaStudioContext } from './tools'
+import { registerGenerateTextTool, registerGenerateImageTool, registerGenerateVideoTool, registerGenerateMusicTool, registerCanvasViewTool, registerCanvasPatchTool, bindMediaStudioContext } from './tools'
+import { CanvasStore } from './canvas-store'
+import { registerCanvasRoutes } from './routes'
 
 export const name = 'dsh-media-studio'
 /**
@@ -33,6 +35,10 @@ declare module '@deepseek-ai/cordis' {
       llm: unknown
       /** Resolved absolute workspace directory (cordis config wins over env). */
       workspaceRoot: string
+      /** Server-side canvas state (Day 4). Tools read / write through this. */
+      canvasStore: import('./canvas-store').CanvasStore
+      /** SSE client registry (Day 4) — the canvas tab subscribes here. */
+      sseClients: Set<import('node:http').ServerResponse>
     }
   }
 }
@@ -50,7 +56,7 @@ declare module '@deepseek-ai/cordis' {
  * minimum that proves settings + llm injection end-to-end.
  */
 export function apply(ctx: Context, config: ConfigShape): void {
-  ctx.inject(['settings', 'llm'], (sctx) => {
+  ctx.inject(['settings', 'llm', 'webServer'], (sctx) => {
     // Register the namespace; the harness validates the schema and any
     // existing user section at load time. We accept whatever the user
     // already has — no destructive defaults.
@@ -59,15 +65,23 @@ export function apply(ctx: Context, config: ConfigShape): void {
     // Attach plugin-scoped handles. Tool code reads these instead of going
     // through cordis lookup each call (and avoids "mediaStudio not bound"
     // races when tools execute before apply() finishes).
+    const canvasStore = new CanvasStore(config.workspaceRoot)
+    // restore() runs in the background — we don't await because apply()
+    // must be sync; the first tool call may race with disk read but the
+    // in-memory state is empty either way.
+    void canvasStore.restore()
+
     ctx.mediaStudio = {
       scope,
       getSettings: (): MediaStudioSettingsShape => readMediaStudio(scope),
       llm: sctx.llm,
       workspaceRoot: config.workspaceRoot,
+      canvasStore,
+      sseClients: new Set(),
     }
 
     // Bind the ctx pointer used by media tool closures (Day 3).
-    bindMediaStudioContext(ctx)
+    bindMediaStudioContext(ctx, canvasStore)
 
     // Live settings → ctx cache refresh + log. The Settings UI re-reads
     // ctx.mediaStudio.getSettings() on every commit; this watcher just
@@ -98,7 +112,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
     registerGenerateImageTool(ctx)
     registerGenerateVideoTool(ctx)
     registerGenerateMusicTool(ctx)
-    ctx.logger?.info?.('[media-studio] registered generate_text + generate_image + generate_video + generate_music tools')
+    registerCanvasViewTool(ctx)
+    registerCanvasPatchTool(ctx)
+    // SSE + REST routes for the canvas tab.
+    registerCanvasRoutes(ctx)
+    ctx.logger?.info?.(
+      '[media-studio] registered generate_text + generate_image + generate_video + generate_music + canvas_graph_view + canvas_graph_patch + /api/media-studio/canvas/{sse,state}',
+    )
   })
 }
 
