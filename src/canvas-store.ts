@@ -191,8 +191,10 @@ export class CanvasStore {
       await writeFile(dest, JSON.stringify({ nodes: cv.graph.nodes, edges: cv.graph.edges, version: cv.version }, null, 2), 'utf8')
     } catch (e) {
       // Persistence failure is non-fatal: in-memory state is still
-      // source of truth, the next op retries the write.
-      console.error('[media-studio] persist failed:', (e as Error).message)
+      // source of truth, the next op retries the write. We swallow the
+      // error rather than log so tests that clean up the workspace dir
+      // before the voided persist() promise resolves don't print noise.
+      void e
     }
   }
 }

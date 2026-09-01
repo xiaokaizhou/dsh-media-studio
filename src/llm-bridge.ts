@@ -74,6 +74,7 @@ export async function callLlm(
       content: [{ type: 'text', text: prompt }],
       source: { kind: 'user' },
     }],
+    signal, // forward cancellation so adapters can short-circuit
   })) {
     // StreamChunk is a discriminated union; we narrow by `type` and only
     // handle the chunks that contribute text or usage. Reasoning and tool-call
