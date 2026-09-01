@@ -5,7 +5,7 @@ import '@deepseek-ai/dsh-llm'
 import { MediaStudioSettings, NS, readMediaStudio, DEFAULT_MEDIA_STUDIO, type MediaStudioScope, type MediaStudioSettingsShape } from './settings'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
-import { registerGenerateTextTool } from './tools'
+import { registerGenerateTextTool, registerGenerateImageTool, registerGenerateVideoTool, registerGenerateMusicTool, bindMediaStudioContext } from './tools'
 
 export const name = 'dsh-media-studio'
 /**
@@ -31,6 +31,8 @@ declare module '@deepseek-ai/cordis' {
        * and to let stub-friendly tests pass `undefined`.
        */
       llm: unknown
+      /** Resolved absolute workspace directory (cordis config wins over env). */
+      workspaceRoot: string
     }
   }
 }
@@ -61,7 +63,11 @@ export function apply(ctx: Context, config: ConfigShape): void {
       scope,
       getSettings: (): MediaStudioSettingsShape => readMediaStudio(scope),
       llm: sctx.llm,
+      workspaceRoot: config.workspaceRoot,
     }
+
+    // Bind the ctx pointer used by media tool closures (Day 3).
+    bindMediaStudioContext(ctx)
 
     // Live settings → ctx cache refresh + log. The Settings UI re-reads
     // ctx.mediaStudio.getSettings() on every commit; this watcher just
@@ -87,10 +93,12 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
     // Tool registration — `ctx.tools` is `undefined` until the tools service
     // activates; the `tools` inject dependency above guarantees it is live
-    // by the time apply() runs, so calling `registerGenerateTextTool` here
-    // is safe.
+    // by the time apply() runs, so calling these here is safe.
     registerGenerateTextTool(ctx)
-    ctx.logger?.info?.('[media-studio] registered generate_text tool')
+    registerGenerateImageTool(ctx)
+    registerGenerateVideoTool(ctx)
+    registerGenerateMusicTool(ctx)
+    ctx.logger?.info?.('[media-studio] registered generate_text + generate_image + generate_video + generate_music tools')
   })
 }
 

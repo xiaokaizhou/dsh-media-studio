@@ -68,6 +68,8 @@ declare module '@deepseek-ai/cordis' {
        * and to let stub-friendly tests pass `undefined`.
        */
       llm: unknown;
+      /** Resolved absolute workspace directory (cordis config wins over env). */
+      workspaceRoot: string;
     };
   }
 }
