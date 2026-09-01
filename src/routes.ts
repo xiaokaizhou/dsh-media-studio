@@ -69,6 +69,35 @@ export function registerCanvasRoutes(ctx: Context): void {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(snap))
   })
+
+  // Patch endpoint — the client (and any external automation) can POST
+  // a batch of ops. The host's store.apply() runs the same lint / atomicity
+  // guard the agent's `canvas_graph_patch` tool uses; on success the SSE
+  // broadcast fires so every connected tab updates.
+  wserver.route('POST', '/api/media-studio/canvas/patch', (req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string; ops?: unknown[] }
+        const canvasId = body.canvasId || 'main'
+        const ops = Array.isArray(body.ops) ? body.ops : []
+        const result = store.apply(canvasId, ops as never)
+        broadcastCanvasPatch(ctx, canvasId, { version: result.version, graph: result.graph, patch: result.patch })
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          ok: true,
+          applied: result.patch.length,
+          version: result.version,
+          lintOk: result.lintOk,
+          issues: result.issues,
+        }))
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: (e as Error).message }))
+      }
+    })
+  })
 }
 
 /**

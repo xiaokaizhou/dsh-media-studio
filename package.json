@@ -16,6 +16,9 @@
     "prepare": "tsdown && bash scripts/setup-preset.sh"
   },
   "dependencies": {
+    "@xyflow/react": "^12.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "tsdown": "^0.22.14",
     "typescript": "^5.9.3"
   },
@@ -26,6 +29,8 @@
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0",
     "@deepseek-ai/schemastery": "^3.18.0",
     "@types/node": "^22.20.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "vitest": "^3.2.7"
   },
   "peerDependencies": {
@@ -33,7 +38,9 @@
     "@deepseek-ai/dsh-llm": ">=0.1.0-rc.8 <0.2.0",
     "@deepseek-ai/dsh-settings": ">=0.1.0-rc.8 <0.2.0",
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-llm": { "optional": true },
