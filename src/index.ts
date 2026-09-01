@@ -5,6 +5,7 @@ import '@deepseek-ai/dsh-llm'
 import { MediaStudioSettings, NS, readMediaStudio, DEFAULT_MEDIA_STUDIO, type MediaStudioScope, type MediaStudioSettingsShape } from './settings'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
+import { registerGenerateTextTool } from './tools'
 
 export const name = 'dsh-media-studio'
 /**
@@ -83,6 +84,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
       `[media-studio] ready: workspaceRoot=${config.workspaceRoot}, defaultCanvas=${config.defaultCanvasId}, ` +
       `textModel="${ctx.mediaStudio.getSettings().textModel || '(auto)'}"`,
     )
+
+    // Tool registration — `ctx.tools` is `undefined` until the tools service
+    // activates; the `tools` inject dependency above guarantees it is live
+    // by the time apply() runs, so calling `registerGenerateTextTool` here
+    // is safe.
+    registerGenerateTextTool(ctx)
+    ctx.logger?.info?.('[media-studio] registered generate_text tool')
   })
 }
 
