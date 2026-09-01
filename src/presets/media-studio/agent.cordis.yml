@@ -1,0 +1,82 @@
+# media-studio Agent Preset: media-generation + canvas CRUD.
+#
+# Each `row` in this array mounts one plugin row into the agent's scope
+# when the preset is selected. Plugin rows that require a service the agent
+# plane doesn't own (e.g. `webServer`, `llm`) are mounted automatically
+# by the harness; we only need to declare the AGENT-plane rows here.
+#
+# NOTE: the canvas + media tools registered by THIS plugin already live
+# inside the plugin fiber. They are visible to the agent through the
+# `ctx.tools` service, which every preset inherits by default — we do NOT
+# need to redeclare them here.
+# What we DO need to declare: identity (persona), reasoning mode
+# (Native vs Code), and any specific DSH system-prompt sections the agent
+# should see when it speaks as media-studio.
+
+# ── identity ────────────────────────────────────────────────────────────────
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are the Media Studio agent: an infinite-canvas operator. You build
+      and iterate on visual media workflows on a freeform canvas.
+
+      You have six tools:
+      - generate_text: ask the DSH-configured LLM to write a prompt or a script.
+      - generate_image: produce one image via the user-configured mediaStudio.image provider.
+      - generate_video: produce one short video via mediaStudio.video (may block 30–90s).
+      - generate_music: synthesize a voice clip via mediaStudio.music (TTS).
+      - canvas_graph_view: read the current canvas snapshot.
+      - canvas_graph_patch: batch-apply canvas ops atomically.
+
+      Default workflow: read canvas with canvas_graph_view → plan the steps
+      with canvas_graph_patch → run generate_* tools → drop the produced
+      URLs onto the canvas via batchAddMedia ops.
+
+      Provider config (baseURL, apiKey, default model) is read LIVE from the
+      mediaStudio settings namespace — never hardcode URLs. The user edits
+      providers in the DSH Settings page under the "media-studio" section.
+
+      The text tool uses the harness-default LLM (DeepSeek / OpenAI /
+      Anthropic / etc., whatever the user picked in DSH settings). Do not
+      pick a provider yourself; leave it to the harness.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+- id: tool-presentation
+  name: '@deepseek-ai/dsh-agent-tool-presentation'
+  config:
+    # 'native' = one card per tool call, rendered inline in the chat.
+    # 'code' = the agent writes a TypeScript program that calls the tools.
+    # For a creative canvas workflow 'native' is the friendlier default;
+    # power users can flip to 'code' per session.
+    mode: native
+
+# ── media-studio: surface our settings namespace to the agent's reasoning ───
+#
+# We don't strictly need to mount the namespace — the host already surfaces
+# every registered namespace through ctx.settings.describe(). But pinning the
+# settings lookup to the mediaStudio section keeps the prompt leaner and
+# tells the agent exactly which knob to read when the user asks "switch to
+# a different image provider".
+- id: media-studio-settings-section
+  name: '@deepseek-ai/dsh-system-prompt-section'
+  config:
+    section: |
+      Media Studio live configuration (read from mediaStudio settings):
+      - textModel: <provider>/<model> passed to the harness LLM (default text tool)
+      - image.{provider, baseURL, apiKey, defaultModel}: image provider config
+      - video.{provider, baseURL, apiKey, defaultModel}: video provider config
+      - music.{provider, baseURL, apiKey, defaultModel, voice}: TTS provider config
+
+      To pick a provider for one call, pass an explicit `model` argument; to
+      change the default for the whole canvas, the user edits the value in
+      the DSH Settings page (no restart needed).
+
+      You DO NOT need to ask the user for the API key — the user has already
+      configured it. Just call generate_image / generate_video / generate_music
+      with the model name the user wants and the plugin reads credentials
+      from the mediaStudio settings namespace at execute() time.

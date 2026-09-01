@@ -13,7 +13,7 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "prepare": "tsdown"
+    "prepare": "tsdown && bash scripts/setup-preset.sh"
   },
   "dependencies": {
     "tsdown": "^0.22.14",
