@@ -10,9 +10,12 @@ tsdown.config.mjs.bak
 .workbuddy/
 
 # local temp
-_tmp_*/
+_tmp_*
 .vite-temp/
 *.log
+.probe-tmp
 
-# os / editor
+# editor / OS temp
+..gitignore.*
+*.tmpdir/
 .DS_Store

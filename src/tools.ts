@@ -247,6 +247,50 @@ export function registerCanvasPatchTool(ctx: Context): void {
   )
 }
 
+/**
+ * `canvas_auto_arrange` — re-layout all nodes by topological depth
+ * (same algorithm as the client's bottom-right wand button). Call this
+ * after finishing a workflow so the canvas looks good immediately.
+ */
+export function registerAutoArrangeTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_auto_arrange',
+      description: 'Auto-arrange all nodes in a canvas by topological flow depth (columns ordered by BFS from sources, nodes stacked vertically within each column). Mirrors the client\'s bottom-right wand button. Call this after building a workflow for an immediately clean layout.',
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            applied: { type: 'number' },
+            version: { type: 'number' },
+            lintOk: { type: 'boolean' },
+            issues: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text' as const,
+          text: `auto-arranged → version ${(value as { version: number }).version}; lint: ${(value as { lintOk: boolean }).lintOk ? 'pass' : 'warnings'}`,
+        }],
+      },
+      async execute(args) {
+        const store = getMediaStudioHandles().canvasStore
+        const canvasId = args.canvasId?.trim() || 'main'
+        const result = store.autoArrange(canvasId)
+        return {
+          applied: result.patch.length,
+          version: result.version,
+          lintOk: result.lintOk,
+          issues: result.issues,
+        }
+      },
+    }),
+  )
+}
+
 export function registerGenerateTextTool(ctx: Context): void {
   ctx.tools.register(
     defineTool({

@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import { MediaStudioSettings, NS, readMediaStudio, DEFAULT_MEDIA_STUDIO, type MediaStudioScope, type MediaStudioSettingsShape } from './settings'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
-import { registerCanvasViewTool, registerCanvasPatchTool } from './tools'
+import { registerCanvasViewTool, registerCanvasPatchTool, registerAutoArrangeTool } from './tools'
 import { CanvasStore } from './canvas-store'
 import { registerCanvasRoutes } from './routes'
 import type { ServerResponse } from 'node:http'
@@ -149,6 +149,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     const toolRegs: Array<[string, () => void]> = [
       ['canvas_graph_view', () => registerCanvasViewTool(ctx)],
       ['canvas_graph_patch', () => registerCanvasPatchTool(ctx)],
+      ['canvas_auto_arrange', () => registerAutoArrangeTool(ctx)],
     ]
     for (const [name, reg] of toolRegs) {
       try {

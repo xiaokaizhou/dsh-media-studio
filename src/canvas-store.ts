@@ -173,6 +173,70 @@ export class CanvasStore {
     return { graph: next, patch: ops, version: cv.version, lintOk, issues }
   }
 
+  /**
+   * Auto-arrange nodes by topological depth (same algorithm as the client
+   * view-bar wand). Columns are ordered by BFS depth from sources; within
+   * each column nodes stack vertically. Uses a default card height of 200
+   * px so the server-side result is close to what the client would produce.
+   */
+  autoArrange(canvasId: string): PatchResult {
+    const cv = this.canvasOf(canvasId)
+    const g = cv.graph
+    if (g.nodes.length === 0) return { graph: cloneGraph(g), patch: [], version: cv.version, lintOk: true, issues: [] }
+
+    // Build adjacency maps.
+    const inMap = new Map<string, string[]>()
+    const outMap = new Map<string, string[]>()
+    for (const e of g.edges) {
+      const inArr = inMap.get(e.target) ?? []
+      inArr.push(e.source)
+      inMap.set(e.target, inArr)
+      const outArr = outMap.get(e.source) ?? []
+      outArr.push(e.target)
+      outMap.set(e.source, outArr)
+    }
+    // BFS depth from roots (nodes with no incoming edges).
+    const depth = new Map<string, number>()
+    const queue: Array<{ id: string; d: number }> = []
+    for (const n of g.nodes) {
+      if (!inMap.get(n.id)?.length) { depth.set(n.id, 0); queue.push({ id: n.id, d: 0 }) }
+    }
+    while (queue.length) {
+      const { id, d } = queue.shift()!
+      for (const t of outMap.get(id) ?? []) {
+        if ((depth.get(t) ?? -1) < d + 1) { depth.set(t, d + 1); queue.push({ id: t, d: d + 1 }) }
+      }
+    }
+    for (const n of g.nodes) if (!depth.has(n.id)) depth.set(n.id, 0)
+
+    // Group ids by depth.
+    const byDepth = new Map<number, string[]>()
+    for (const n of g.nodes) {
+      const d = depth.get(n.id) ?? 0
+      const list = byDepth.get(d) ?? []
+      list.push(n.id)
+      byDepth.set(d, list)
+    }
+
+    // Column pitch mirrors the client: cardW (default 260) + 130 = 390 px.
+    const colPitch = 390
+    const rowGap = 44
+    const defaultH = 200
+    const marginX = 60
+    const marginY = 60
+    const moves: CanvasOp[] = []
+    for (const [d, ids] of [...byDepth.entries()].sort((a, b) => a[0] - b[0])) {
+      let y = marginY
+      for (const id of ids) {
+        moves.push({ op: 'moveNode', id, position: { x: marginX + d * colPitch, y } })
+        y += defaultH + rowGap
+      }
+    }
+
+    // Apply atomically — reuse the same store path so SSE fires.
+    return this.apply(canvasId, moves)
+  }
+
   /** Read the snapshot the canvas tab needs to render. */
   snapshot(canvasId: string): CanvasSnapshot {
     const cv = this.canvasOf(canvasId)

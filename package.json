@@ -4,10 +4,10 @@
   "description": "DSH plugin: infinite-canvas media studio with DSH-native LLM (text) + user-configured media providers (image/video/music).",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/index.d.ts",
+  "types": "lib/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/index.d.ts",
+      "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": {
@@ -56,8 +56,12 @@
     "react-dom": "^19.0.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-settings": { "optional": true }
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {
@@ -66,7 +70,9 @@
     "client": {
       "inject": [
         "betterSidebar",
-        "slots"
+        "slots",
+        "locale",
+        "settingsScope"
       ],
       "platform": "web"
     }

@@ -51,8 +51,10 @@ const PLATFORM_MODULES = [
 
 /** Externals resolved from the loader module table. Anything NOT in this list
  *  gets bundled into the wrapper closure so the loader's `require` never sees
- *  it — DSH 0.1.0-rc.7 does not seed UI-vendor libs like @xyflow/react.      */
-const CLIENT_EXTERNALS = [...PLATFORM_MODULES]
+ *  it — DSH does not seed UI-vendor libs like @xyflow/react into the module table.   */
+const CLIENT_EXTERNALS = [
+  ...PLATFORM_MODULES,
+]
 
 export default [
   // ── 1. Host entry ─────────────────────────────────────────────────────
@@ -97,6 +99,8 @@ export default [
       // `require` from the loader resolves them; everything else gets
       // inlined into the IIFE-style factory closure.
       neverBundle: [...CLIENT_EXTERNALS],
+      // Always inline @xyflow/react — DSH does not seed it into the loader's
+      // module table, so a require() for it would resolve to undefined.
       alwaysBundle: ['@xyflow/react'],
     },
     define: {
