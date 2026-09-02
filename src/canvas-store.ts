@@ -71,7 +71,20 @@ export interface PatchResult {
  * See `validateOps` for the full grammar.
  */
 export type CanvasOp =
-  | { op: 'addNode'; type: CanvasNode['type']; label: string; data?: Record<string, unknown>; position?: { x: number; y: number } }
+  | {
+    op: 'addNode'
+    type: CanvasNode['type']
+    label: string
+    data?: Record<string, unknown>
+    position?: { x: number; y: number }
+    /**
+     * Optional explicit node id. The canvas UI uses this when it needs to
+     * reference the new node from a later op in the same batch (e.g. create
+     * node + connect atomically). Must be unique on the canvas; when absent
+     * the store generates an id.
+     */
+    nodeId?: string
+  }
   | { op: 'updateNode'; id: string; data: Record<string, unknown> }
   | { op: 'renameNode'; id: string; label: string }
   | { op: 'deleteNode'; id: string }
@@ -92,14 +105,24 @@ export type CanvasOp =
     }>
   }
 
+/** Hook invoked after every accepted `apply()` so transport layers (SSE)
+ *  can push the new graph to subscribed clients. Wired by the host `apply()`;
+ *  `undefined` disables broadcasting (tests / headless). */
+export type CanvasBroadcast = (
+  canvasId: string,
+  payload: { version: number; graph: CanvasGraph; patch: CanvasOp[] },
+) => void
+
 const NEW_NODE_KINDS = new Set<CanvasNode['type']>(['text', 'image', 'video', 'music', 'note'])
 
 export class CanvasStore {
   private canvases = new Map<string, CanvasState>()
   private workspaceRoot: string
+  private broadcast?: CanvasBroadcast
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, opts?: { broadcast?: CanvasBroadcast }) {
     this.workspaceRoot = workspaceRoot
+    this.broadcast = opts?.broadcast
   }
 
   /** Resolve one canvas (lazily created if absent). Key includes the workspace
@@ -140,6 +163,12 @@ export class CanvasStore {
     // Persist on the same thread so a frontend crash before SSE delivery
     // does not roll the canvas back.
     void this.persist(canvasId, cv)
+
+    // Push the new graph to every connected SSE client (the canvas tab
+    // subscribes here). Centralized in `apply` so the agent's
+    // `canvas_graph_patch` tool AND the client's REST PATCH endpoint both
+    // broadcast through the same path — no drift between the two callers.
+    this.broadcast?.(canvasId, { version: cv.version, graph: next, patch: ops })
 
     return { graph: next, patch: ops, version: cv.version, lintOk, issues }
   }
@@ -214,12 +243,14 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
     case 'addNode': {
       if (!NEW_NODE_KINDS.has(op.type)) return `unknown node type "${op.type}" (allowed: ${[...NEW_NODE_KINDS].join(', ')})`
       if (typeof op.label !== 'string' || !op.label.trim()) return 'label is required'
+      const id = op.nodeId && typeof op.nodeId === 'string' && op.nodeId.trim() ? op.nodeId.trim() : newId('n')
+      if (graph.nodes.some((x) => x.id === id)) return `duplicate node id "${id}"`
       graph.nodes.push({
-        id: newId('n'),
+        id,
         type: op.type,
         label: op.label,
         data: op.data ?? {},
-        ...(op.position ? { position: op.position } : {}),
+        ...(op.position ? { position: op.position } : { position: defaultSlot(graph.nodes) }),
       })
       return null
     }
@@ -269,6 +300,7 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
         const kind = item.kind === 'audio' ? 'music' : item.kind === 'image' ? 'image' : item.kind === 'video' ? 'video' : null
         if (!kind) return `batchAddMedia: unknown kind "${item.kind}"`
         const id = item.nodeId ?? newId(kind === 'music' ? 'm' : kind[0])
+        if (graph.nodes.some((x) => x.id === id)) return `batchAddMedia: duplicate node id "${id}"`
         graph.nodes.push({
           id,
           type: kind,
@@ -279,7 +311,7 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
             resultUrl: item.url,
             status: 'done',
           },
-          ...(item.position ? { position: item.position } : {}),
+          ...(item.position ? { position: item.position } : { position: defaultSlot(graph.nodes) }),
         })
       }
       return null
@@ -312,4 +344,32 @@ function lintGraph(g: CanvasGraph): string[] {
  *  only inside the canvas JSON and never cross the LLM wire. */
 function newId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+// Auto-placement grid for ops that arrive without a `position` (the agent's
+// tools and the canvas UI both send positions only when they care). Nodes are
+// placed in a row-major grid (COL_PITCH × ROW_PITCH, starting at MARGIN) that
+// skips occupied cells, so agent-driven additions never stack invisibly on
+// top of each other at (0,0).
+const SLOT_MARGIN = 60
+const SLOT_COL = 300
+const SLOT_ROW = 300
+const SLOT_COLS = 8
+const SLOT_CAP = 400
+
+function defaultSlot(nodes: CanvasNode[]): { x: number; y: number } {
+  const occupied = nodes.map((n) => n.position ?? { x: 0, y: 0 })
+  const overlaps = (x: number, y: number) => occupied.some(
+    (p) => Math.abs(p.x - x) < SLOT_COL - 40 && Math.abs(p.y - y) < SLOT_ROW - 90,
+  )
+  for (let i = 0; i < SLOT_CAP; i++) {
+    const col = i % SLOT_COLS
+    const row = Math.floor(i / SLOT_COLS)
+    const x = SLOT_MARGIN + col * SLOT_COL
+    const y = SLOT_MARGIN + row * SLOT_ROW
+    if (!overlaps(x, y)) return { x, y }
+  }
+  // Degenerate fallback — stagger below the lowest node.
+  const maxY = occupied.reduce((m, p) => Math.max(m, p.y), SLOT_MARGIN)
+  return { x: SLOT_MARGIN, y: maxY + SLOT_ROW }
 }

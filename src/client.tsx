@@ -1,100 +1,103 @@
-// dsh-media-studio client entry — mounted by the DSH web runtime.
+// dsh-media-studio — client entry for DSH web runtime.
 //
-// Pattern follows dsh-harness-one's canvasui client.js:
-//   1. Define an `inject` list declaring the client-runtime services we
-//      need at apply() time (slots + UI primitives + modules).
-//   2. Export an `apply(ctx, config)` that, when betterSidebar is present,
-//      registers a sidebar tab pointing at our infinite canvas.
-//   3. Wire an SSE subscription that mirrors the host's CanvasStore —
-//      every canvas_graph_patch the agent runs lands here as a React Flow
-//      node/edge update.
+// Registers two surfaces:
+//   1. A betterSidebar TAB ("Media Studio") that hosts the React Flow
+//      canvas. This is the primary surface — the agent's canvas tools
+//      write to the same 'main' canvas the tab renders, so pipeline
+//      updates land live via SSE.
+//   2. A Settings section ("Media Studio") that lets the user configure
+//      the text/image/video/music provider endpoints. Kept as a settings
+//      section so it lives next to the other plugin settings.
 //
-// The full React Flow canvas + settings panel + node types live in
-// `client/canvas.tsx`, `client/nodes.tsx`, `client/panel.tsx`. This file
-// is intentionally a thin bootstrap that the harness bundles.
-//
-// Loads lazily via `window.__DSH_BOOT__` (the runtime injects this module
-// graph into the page before any DSH UI mounts).
+// The betterSidebar service is a soft dependency: if dsh-better-sidebar
+// is not installed we gracefully skip the tab (the canvas simply has no
+// home) but the settings section still works through `slots`.
 
-import { createElement } from 'react'
+import type {} from 'dsh-better-sidebar' // triggers `ctx.betterSidebar` cordis augmentation
+import { createElement, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { Canvas } from './client/canvas'
 import { SettingsPanel } from './client/settings-panel'
+import type { TabDescriptor } from 'dsh-better-sidebar'
 
-/** Runtime services we depend on. The harness guarantees these are live by
- *  the time apply() runs (per the dsh.client manifest in package.json). */
-export const inject = [
-  '@deepseek-ai/dsh-client-runtime',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-modules',
-]
+/**
+ * Runtime services we need:
+ * - `betterSidebar` — to register the canvas tab (soft dependency)
+ * - `slots`          — to register the Media Studio settings section
+ */
+export const inject = ['betterSidebar', 'slots']
 
-/** Cache the React roots so HMR can unmount cleanly. */
+/** The canvas every tab + tool shares. Matches the tool default so the
+ *  agent's `canvas_graph_patch` / `canvas_graph_view` operate on the
+ *  exact canvas the tab renders. */
+export const DEFAULT_CANVAS_ID = 'main'
+
 const roots = new Map<HTMLElement, Root>()
 
-/** Mount the infinite-canvas editor into a host element. Returns a disposer
- *  that ReactDOM calls when the tab closes (unmount + cleanup). */
-function mountCanvas(host: HTMLElement): () => void {
-  // The slot might be reused across navigations; reuse the existing root.
-  let root = roots.get(host)
-  if (!root) {
-    root = createRoot(host)
-    roots.set(host, root)
-  }
-  root.render(createElement(Canvas, { host }))
-  return () => {
-    root?.unmount()
-    roots.delete(host)
-  }
-}
-
-/** Mount the per-canvas settings form (apiKey, baseURL, model pickers). */
-function mountSettings(host: HTMLElement): () => void {
-  let root = roots.get(host)
-  if (!root) {
-    root = createRoot(host)
-    roots.set(host, root)
-  }
-  root.render(createElement(SettingsPanel, { host }))
-  return () => {
-    root?.unmount()
-    roots.delete(host)
-  }
+/**
+ * Settings section rendered inside DSH Settings UI.
+ *
+ * The slots host may pass `{ close }` when the dialog closes; we accept
+ * and ignore it — the host removes the DOM node, and React GC collects
+ * our subtree automatically.
+ */
+function SettingsSection(_props?: { close?: () => void }): ReactNode {
+  return createElement('div', {
+    ref: (el: HTMLElement | null) => {
+      if (!el || roots.has(el)) return
+      const root = createRoot(el)
+      roots.set(el, root)
+      root.render(createElement(SettingsPanel, { host: el }))
+    },
+  })
 }
 
 /**
- * Client plugin entry. The harness calls this once per active DSH profile.
- *
- * Soft-deps on betterSidebar: if the user has not installed the sidebar
- * plugin, we surface a settings panel only — the canvas tab is omitted
- * (the agent can still drive the canvas through the chat UI).
+ * Plugin entry point — called by the DSH client runtime once all declared
+ * services are available.
  */
 export function apply(ctx: unknown): void {
   const c = ctx as {
-    inject(services: string[], body: (s: unknown) => void): void
-    get(name: string): unknown
-    effect(disposer: () => () => void, label?: string): void
-    on(event: string, handler: (...args: unknown[]) => void): void
+    /** Provided by dsh-better-sidebar (soft dependency). */
+    betterSidebar?: { registerTab(descriptor: TabDescriptor): () => void }
+    /** Provided by @deepseek-ai/dsh-client-ui-slots. */
+    slots?: {
+      inject: (path: string, cb: () => void) => void
+      register: (
+        descriptor: { name: string; id?: string; order?: number; label?: () => string },
+        comp: () => ReactNode,
+      ) => void
+    }
   }
 
-  // Register the canvas tab IF better-sidebar is installed.
-  c.inject(['@deepseek-ai/dsh-client-ui-slots'], () => {
-    const slots = c.get('@deepseek-ai/dsh-client-ui-slots') as
-      | { registerSlot(name: string, factory: (host: HTMLElement) => () => void): void }
-      | undefined
-    if (slots && typeof slots.registerSlot === 'function') {
-      slots.registerSlot('media-studio-canvas', mountCanvas)
-    }
-  })
+  // 1) Canvas tab — the headline surface.
+  if (c.betterSidebar) {
+    c.betterSidebar.registerTab({
+      id: 'media-studio:canvas',
+      title: 'Media Studio',
+      // One shared canvas instance per workspace (the canvas is keyed by
+      // 'main', not by the conversation), so reopening focuses the same tab
+      // instead of spawning duplicates.
+      single: true,
+      // Sit near the top of the + menu, just under the built-in explorers.
+      order: 40,
+      component: () => createElement(Canvas, { canvasId: DEFAULT_CANVAS_ID }),
+    })
+  }
 
-  // Register the settings panel slot (always available, even without
-  // better-sidebar — the settings panel is consumed by the dsh Settings UI).
-  c.inject(['@deepseek-ai/dsh-client-ui-slots'], () => {
-    const slots = c.get('@deepseek-ai/dsh-client-ui-slots') as
-      | { registerSlot(name: string, factory: (host: HTMLElement) => () => void): void }
-      | undefined
-    if (slots && typeof slots.registerSlot === 'function') {
-      slots.registerSlot('media-studio-settings', mountSettings)
-    }
-  })
+  // 2) Settings section — provider configuration.
+  if (c.slots && typeof c.slots.inject === 'function') {
+    c.slots.inject('settings.section', () => {
+      if (typeof c.slots!.register !== 'function') return
+      c.slots!.register(
+        {
+          name: 'settings.section',
+          id: 'dsh-media-studio-settings',
+          order: 60,
+          label: () => 'Media Studio',
+        },
+        SettingsSection,
+      )
+    })
+  }
 }

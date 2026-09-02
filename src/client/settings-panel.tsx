@@ -123,8 +123,8 @@ export function SettingsPanel({ host }: SettingsPanelProps) {
 }
 
 interface ProviderFieldsProps {
-  value: { provider: string; baseURL: string; apiKey: string; defaultModel: string }
-  onChange: (next: { provider: string; baseURL: string; apiKey: string; defaultModel: string }) => void
+  value: { provider: string; baseURL: string; apiKey: string; defaultModel: string; voice?: string }
+  onChange: (next: { provider: string; baseURL: string; apiKey: string; defaultModel: string; voice?: string }) => void
   defaultModelPlaceholder: string
 }
 

@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { callLlm, listTextModels, type LlmLike } from '../src/llm-bridge'
+import type { GenerateOptions, LlmModelInfo, PreparedLlmCall, LlmCallConfig } from '@deepseek-ai/dsh-llm'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm/types'
 
 /**
  * Lightweight fake LlmRuntime that drives the LLM bridge through its public
@@ -8,21 +10,23 @@ import { callLlm, listTextModels, type LlmLike } from '../src/llm-bridge'
  */
 class FakeLlm implements LlmLike {
   /** Override these per test to drive the chunk stream. */
-  chunks: Array<Record<string, unknown>> = []
-  prepareCallArgs: { provider: string; model: string; maxTokens?: number } | null = null
+  chunks: StreamChunk[] = []
+  prepareCallArgs: LlmCallConfig | null = null
 
-  async prepareCall(config: { provider: string; model: string; maxTokens?: number }, _signal: AbortSignal) {
+  async prepareCall(config: LlmCallConfig, _signal?: AbortSignal): Promise<PreparedLlmCall> {
     this.prepareCallArgs = config
     const chunks = this.chunks
     return {
-      model: { id: `${config.provider}/${config.model}`, modalities: [], provider: config.provider, capabilities: {} },
-      async *stream() {
-        for (const c of chunks) yield c as never
+      config,
+      retryPolicy: { maxAttempts: 3, initialDelayMs: 100 } as never,
+      adapterDefaults: {},
+      async *stream(_opts: GenerateOptions) {
+        for (const c of chunks) yield c
       },
     }
   }
 
-  async listModels(_provider: string): Promise<Array<{ provider?: string; id: string; name?: string }>> {
+  async listModels(_provider: string): Promise<LlmModelInfo[]> {
     return [
       { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
       { provider: 'openai', id: 'gpt-4o-mini', name: 'GPT-4o mini' },
@@ -68,22 +72,27 @@ describe('callLlm', () => {
   it('honors the AbortSignal mid-stream', async () => {
     // Adapter that blocks on a signal between chunks — proves the bridge
     // propagates the abort and doesn't silently keep reading.
-    const llm: LlmLike = {
-      prepareCall: async () => ({
-        model: { id: 'deepseek/deepseek-chat', modalities: [], provider: 'deepseek', capabilities: {} },
-        async *stream(opts: { signal?: AbortSignal }) {
-          const signal = opts.signal
-          yield { type: 'text-delta', index: 0, text: 'partial ' } as never
-          // Wait for abort or 50ms (whichever comes first).
-          await new Promise<void>((resolve, reject) => {
-            const t = setTimeout(resolve, 50)
-            signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')) })
-          })
-          yield { type: 'finish', reason: { kind: 'stop' } } as never
-        },
-      }),
-      listModels: async () => [],
+    function makeFakeLlm(): LlmLike {
+      return {
+        prepareCall: async (config: LlmCallConfig): Promise<PreparedLlmCall> => ({
+          config,
+          retryPolicy: { maxAttempts: 3, initialDelayMs: 100 } as never,
+          adapterDefaults: {},
+          async *stream(opts: GenerateOptions) {
+            const signal = opts.signal
+            yield { type: 'text-delta', index: 0, text: 'partial ' }
+            // Wait for abort or 50ms (whichever comes first).
+            await new Promise<void>((resolve, reject) => {
+              const t = setTimeout(resolve, 50)
+              signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')) })
+            })
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        }),
+        listModels: async () => [],
+      }
     }
+    const llm = makeFakeLlm()
     const ac = new AbortController()
     setTimeout(() => ac.abort(), 5)
     await expect(callLlm(llm, 'deepseek', 'deepseek-chat', 'hi', ac.signal)).rejects.toThrow(/aborted/i)

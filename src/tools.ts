@@ -1,14 +1,11 @@
 import { defineTool, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
-// Side-effect import — picks up the cordis `Context` augmentation declared
-// in index.ts (`ctx.mediaStudio: { getSettings(), workspaceRoot, llm, canvasStore }`).
-// Without it, TS would only see the bare `Context` and error on `.getSettings`.
-import './index'
 import { callLlm } from './llm-bridge'
 import { generateImage, generateVideo, generateMusic, MediaError, type MediaProviderConfig, type MediaMusicConfig } from './media-providers'
 import { CanvasStore, type CanvasOp, type CanvasSnapshot } from './canvas-store'
 import { join } from 'node:path'
 import { DEFAULT_MEDIA_STUDIO, type MediaStudioSettingsShape } from './settings'
+import { getMediaStudioHandles } from './service-state'
 
 /**
  * Resolve the mediaStudio settings into a per-modality config object the
@@ -16,27 +13,10 @@ import { DEFAULT_MEDIA_STUDIO, type MediaStudioSettingsShape } from './settings'
  * when the user section is empty so first-run works out of the box.
  */
 function pickProvider(kind: 'image' | 'video'): MediaProviderConfig {
-  const mst = ctxMediaStudio() as unknown as { getSettings(): MediaStudioSettingsShape }
-  return mst.getSettings()[kind]
+  return getMediaStudioHandles().getSettings()[kind]
 }
 function pickMusic(): MediaMusicConfig {
-  const mst = ctxMediaStudio() as unknown as { getSettings(): MediaStudioSettingsShape }
-  return mst.getSettings().music
-}
-
-// Tiny indirection so tools can call `ctxMediaStudio()` from inside tool
-// closures without capturing `ctx` in their scope. Replaced at module load
-// by `installMediaTools(ctx)` which mutates the binding.
-let _ctx: Context | null = null
-function ctxMediaStudio(): NonNullable<typeof _ctx> {
-  if (!_ctx) throw new MediaError('not-initialized', 'media-studio tools were called before apply() ran')
-  return _ctx
-}
-
-/** Bound at apply() so the tool closures can read `ctx.mediaStudio`. */
-export function bindMediaStudioContext(ctx: Context, store: CanvasStore): void {
-  _ctx = ctx
-  ctx.mediaStudio.canvasStore = store
+  return getMediaStudioHandles().getSettings().music
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,10 +175,13 @@ export function registerCanvasViewTool(ctx: Context): void {
         }],
       },
       async execute(args, exec) {
-        const mst = ctxMediaStudio() as unknown as { canvasStore: CanvasStore; getSettings(): MediaStudioSettingsShape }
+        const mst = getMediaStudioHandles()
         const store = mst.canvasStore
-        const canvasId = args.canvasId?.trim() || mst.getSettings().textModel || 'main'
-        return store.snapshot(canvasId || 'main') as unknown as object
+        // Blank canvasId → the plugin-wide default (config.defaultCanvasId,
+        // which itself defaults to 'main'). Previously this wrongly fell back
+        // to `textModel` — a provider id, not a canvas id.
+        const canvasId = args.canvasId?.trim() || mst.defaultCanvasId || 'main'
+        return store.snapshot(canvasId) as unknown as object
       },
     }),
   )
@@ -224,7 +207,7 @@ export function registerCanvasPatchTool(ctx: Context): void {
     defineTool({
       name: 'canvas_graph_patch',
       description:
-        'Batch-apply canvas graph ops atomically. Ops: addNode (type: text|image|video|music|note, label, data?, position?); updateNode (id, data); renameNode (id, label); deleteNode (id); moveNode (id, position); connect (from, to, branch?); deleteEdge (id); batchAddMedia (items: [{kind, url, prompt?, model?, position?, nodeId?}]). On reject, the whole batch fails — fix the lint hint and retry.',
+        'Batch-apply canvas graph ops atomically. Ops: addNode (type: text|image|video|music|note, label, data?, position?, nodeId? — position optional: auto-placed in a free grid slot when omitted; nodeId lets a later op in the same batch reference this node); updateNode (id, data); renameNode (id, label); deleteNode (id); moveNode (id, position); connect (from, to, branch?); deleteEdge (id); batchAddMedia (items: [{kind, url, prompt?, model?, position?, nodeId?}]). On reject, the whole batch fails — fix the lint hint and retry.',
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
         ops: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true },
@@ -246,7 +229,7 @@ export function registerCanvasPatchTool(ctx: Context): void {
         }],
       },
       async execute(args, exec) {
-        const store = (ctxMediaStudio() as unknown as { canvasStore: CanvasStore }).canvasStore
+        const store = getMediaStudioHandles().canvasStore
         const canvasId = args.canvasId?.trim() || 'main'
         const ops = Array.isArray(args.ops) ? (args.ops as unknown as CanvasOp[]) : []
         if (ops.length === 0) throw new Error('canvas_graph_patch: ops must be a non-empty array')
@@ -308,7 +291,7 @@ export function registerGenerateTextTool(ctx: Context): void {
         }],
       },
       async execute(args, exec) {
-        const mst = ctx.mediaStudio
+        const mst = getMediaStudioHandles()
         const configured = (args.model?.trim() || mst.getSettings().textModel || '').trim()
         // Split "<provider>/<model>" into provider + model. Empty provider
         // falls back to whatever the harness considers default.
@@ -481,6 +464,6 @@ function errorResult(e: unknown, kind: 'image' | 'video' | 'audio'): ImageError 
 /** Resolve workspaceRoot from the plugin's cordis config. We read it back
  *  from the ctx extension set in apply(). */
 function workspaceRoot(): string {
-  const mst = ctxMediaStudio() as unknown as { workspaceRoot?: string }
+  const mst = getMediaStudioHandles()
   return mst.workspaceRoot || `${process.env.HOME || '~'}/.franklin/media-studio`
 }

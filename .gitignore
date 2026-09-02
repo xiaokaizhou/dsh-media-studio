@@ -1,0 +1,18 @@
+# deps
+node_modules/
+
+# build / package artifacts
+lib/
+*.tgz
+tsdown.config.mjs.bak
+
+# local agent memory (not for public/private sharing)
+.workbuddy/
+
+# local temp
+_tmp_*/
+.vite-temp/
+*.log
+
+# os / editor
+.DS_Store

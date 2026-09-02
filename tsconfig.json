@@ -13,5 +13,6 @@
     "moduleDetection": "force",
     "noEmit": true
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests"],
+  "exclude": ["src/client.tsx", "src/client", "node_modules"]
 }

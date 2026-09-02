@@ -154,3 +154,68 @@ describe('CanvasStore — persistence round-trip', () => {
     expect(otherSnap.graph.nodes[0].label).toBe('B')
   })
 })
+
+describe('CanvasStore — explicit nodeId (canvas UI create+connect)', () => {
+  it('adds a node with the caller-supplied id and auto position', () => {
+    const r = store.apply('main', [
+      { op: 'addNode', type: 'image', label: 'fixed', nodeId: 'ui-img-1', position: { x: 100, y: 200 } },
+    ])
+    expect(r.graph.nodes).toHaveLength(1)
+    expect(r.graph.nodes[0].id).toBe('ui-img-1')
+    expect(r.graph.nodes[0].position).toEqual({ x: 100, y: 200 })
+  })
+
+  it('creates a node and connects to it atomically in one batch', () => {
+    const r1 = store.apply('main', [{ op: 'addNode', type: 'text', label: 'src' }])
+    const src = r1.graph.nodes[0].id
+    const r2 = store.apply('main', [
+      { op: 'addNode', type: 'video', label: 'dst', nodeId: 'ui-vid-1', position: { x: 300, y: 0 } },
+      { op: 'connect', from: src, to: 'ui-vid-1' },
+    ])
+    expect(r2.version).toBe(2)
+    expect(r2.graph.edges).toHaveLength(1)
+    expect(r2.graph.edges[0].source).toBe(src)
+    expect(r2.graph.edges[0].target).toBe('ui-vid-1')
+  })
+
+  it('rejects a duplicate explicit node id', () => {
+    store.apply('main', [{ op: 'addNode', type: 'text', label: 'A', nodeId: 'dup' }])
+    expect(() => store.apply('main', [
+      { op: 'addNode', type: 'text', label: 'B', nodeId: 'dup' },
+    ])).toThrow(/duplicate node id/)
+  })
+})
+
+describe('CanvasStore — default auto-placement', () => {
+  it('stagger-places nodes that omit position instead of stacking at (0,0)', () => {
+    const r1 = store.apply('main', [
+      { op: 'addNode', type: 'text', label: 'one' },
+      { op: 'addNode', type: 'image', label: 'two' },
+      { op: 'addNode', type: 'image', label: 'three' },
+    ])
+    const positions = r1.graph.nodes.map((n) => n.position)
+    expect(positions[0]).toBeDefined()
+    const pts = new Set(positions.map((p) => `${p?.x},${p?.y}`))
+    expect(pts.size).toBe(3)
+  })
+
+  it('keeps two consecutive empty batches from overlapping', () => {
+    const a = store.apply('main', [{ op: 'addNode', type: 'image', label: 'x' }]).graph.nodes.at(-1)!.position!
+    const b = store.apply('main', [{ op: 'addNode', type: 'image', label: 'y' }]).graph.nodes.at(-1)!.position!
+    expect(Math.abs(a.x - b.x) + Math.abs(a.y - b.y)).toBeGreaterThan(0)
+  })
+
+  it('auto-places batchAddMedia items without position', () => {
+    const r = store.apply('main', [
+      {
+        op: 'batchAddMedia',
+        items: [
+          { kind: 'image', url: 'file:///a.png' },
+          { kind: 'video', url: 'file:///b.mp4' },
+        ],
+      },
+    ])
+    expect(r.graph.nodes).toHaveLength(2)
+    for (const n of r.graph.nodes) expect(n.position).toBeDefined()
+  })
+})
