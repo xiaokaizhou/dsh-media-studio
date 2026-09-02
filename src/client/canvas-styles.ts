@@ -58,6 +58,17 @@ export const MEDIA_STUDIO_CSS = String.raw`
   pointer-events: none;
   overflow: visible;
 }
+/* xyflow v12 renders EACH edge as its own <svg> child of the edges
+ * container. Its own stylesheet positions those svgs absolutely so they all
+ * overlap at the flow origin (sourceX/sourceY are flow coordinates); without
+ * this rule each svg falls back to an inline 300x150 replaced element, so
+ * every subsequent edge is shifted/clipped and connection lines no longer
+ * line up with their nodes. The re-implemented base sheet must carry it too. */
+.media-studio-canvas .react-flow__edges svg {
+  position: absolute;
+  overflow: visible;
+  pointer-events: none;
+}
 .media-studio-canvas .react-flow__edge { pointer-events: all; cursor: pointer; }
 .media-studio-canvas .react-flow__edge-path { stroke-linecap: round; }
 .media-studio-canvas .react-flow__edge-textpointer { cursor: text; }
@@ -132,12 +143,30 @@ export const MEDIA_STUDIO_CSS = String.raw`
   box-shadow: var(--ms-shadow-md);
 }
 .media-studio-canvas .react-flow__minimap svg { display: block; }
+/* xyflow's own stylesheet colors minimap nodes/mask through class rules that
+ * fall back to its :root palette; the canvas doesn't load that sheet, so
+ * without these rules node chips render default black and the mask is inert.
+ * Theme them from the ms tokens instead (they flip with the DSH theme). */
+.media-studio-canvas .react-flow__minimap-node {
+  fill: var(--ms-fg-dim, rgba(255,255,255,0.68));
+  stroke: transparent;
+}
+.media-studio-canvas .react-flow__minimap-mask {
+  fill: rgba(8, 10, 14, 0.55);
+}
+body:not([data-ds-dark-theme]) .media-studio-canvas .react-flow__minimap-mask {
+  fill: rgba(250, 251, 252, 0.6);
+}
 .media-studio-canvas .react-flow__attribution { display: none; }
 
 /* ────────────────────────────────────────────────────────────────
    2. Theme tokens
    ──────────────────────────────────────────────────────────────── */
-.media-studio-canvas {
+.media-studio-canvas,
+.ms-menu-backdrop {
+  /* .ms-menu-backdrop is the portaled <body> host for the add/connect popup
+   * (see CreateMenu): it leaves .media-studio-canvas, so the token set it
+   * needs is re-declared here on the backdrop itself. */
   --ms-bg: var(--dsw-alias-bg-base, #0c0e13);
   --ms-bg2: var(--dsw-alias-bg-layer-1, #14171d);
   --ms-card: var(--dsw-alias-bg-layer-2, #1c1f27);
@@ -149,8 +178,11 @@ export const MEDIA_STUDIO_CSS = String.raw`
   --ms-accent-soft: rgba(124, 131, 255, 0.14);
   --ms-border: var(--dsw-alias-border-l2, rgba(255,255,255,0.11));
   --ms-border-strong: var(--dsw-alias-border-l4, rgba(255,255,255,0.24));
-  --ms-panel: rgba(26, 29, 38, 0.96);
-  --ms-panel-soft: rgba(255,255,255,0.06);
+  /* Floating surfaces (menus / pills / view bar) read the host's popover
+   * token so they follow the DSH theme instead of staying dark in light
+   * mode. */
+  --ms-panel: var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 0.96));
+  --ms-panel-soft: rgba(255,255,255,0.08);
   --ms-error: #ef4444;
   --ms-ok: #4ade80;
   --ms-shadow-sm: 0 1px 2px rgba(0,0,0,0.4), 0 1px 1px rgba(0,0,0,0.3);
@@ -158,6 +190,18 @@ export const MEDIA_STUDIO_CSS = String.raw`
   --ms-shadow-lg: 0 14px 40px rgba(0,0,0,0.5), 0 5px 12px rgba(0,0,0,0.35);
   --ms-radius: 12px;
   --ms-radius-lg: 18px;
+}
+
+/* DSH light color scheme: translucent "panel" tints and shadows that are
+ * hard-coded dark above get a light equivalent. Alias tokens (--dsw-alias-*)
+ * already flip with the theme, so only the non-tokenized values are reset. */
+body:not([data-ds-dark-theme]) .media-studio-canvas,
+body:not([data-ds-dark-theme]) .ms-menu-backdrop {
+  --ms-card-hi: rgba(15, 17, 22, 0.05);
+  --ms-panel-soft: rgba(15, 17, 22, 0.07);
+  --ms-shadow-sm: 0 1px 2px rgba(15,17,22,0.10), 0 1px 1px rgba(15,17,22,0.06);
+  --ms-shadow-md: 0 6px 18px rgba(15,17,22,0.10), 0 2px 5px rgba(15,17,22,0.06);
+  --ms-shadow-lg: 0 14px 40px rgba(15,17,22,0.16), 0 5px 12px rgba(15,17,22,0.10);
 }
 
 .media-studio-canvas {
@@ -458,6 +502,15 @@ export const MEDIA_STUDIO_CSS = String.raw`
   overflow: hidden;
   box-shadow: var(--ms-shadow-sm);
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
+  /* Default layout is content-sized (prompt + textarea at its natural rows
+     height). Once the user pins a height via the resize grip (.is-fixed,
+     inline height) the card becomes a flex column and the editor fills the
+     remaining space, scrolling internally instead of stretching the card. */
+}
+.canvas-node.is-fixed {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .canvas-node:hover { border-color: var(--ms-border-strong); }
 .node-note {
@@ -477,17 +530,22 @@ export const MEDIA_STUDIO_CSS = String.raw`
 .ms-doc-editor {
   display: block;
   width: 100%;
-  box-sizing: border-box;
+  height: auto;
   min-height: 84px;
+  box-sizing: border-box;
   padding: 10px 12px;
   border: 0;
   background: transparent;
   color: var(--ms-fg);
   font: 12px/1.55 system-ui, -apple-system, sans-serif;
-  resize: vertical;
+  resize: none;
   outline: none;
 }
 .node-note .ms-doc-editor { min-height: 64px; }
+.canvas-node.is-fixed .ms-doc-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+}
 .ms-doc-editor::placeholder { color: var(--ms-fg-faint); }
 .ms-doc-running {
   display: inline-flex;
@@ -498,7 +556,60 @@ export const MEDIA_STUDIO_CSS = String.raw`
   font-size: 11px;
 }
 
-/* corner delete */
+/* ────────────────────────────────────────────────────────────────
+    9. Vertical resize grip (Text/Note cards, bottom-right corner)
+    ──────────────────────────────────────────────────────────────── */
+.ms-resize-handle-wrap {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 20px;
+  height: 20px;
+  cursor: ns-resize;
+  touch-action: none; /* keep the drag from panning/zooming the canvas on touch */
+  z-index: 8;
+  /* Corner triangle — reads as a grip, glows when the drag is active */
+  background: linear-gradient(
+    135deg,
+    transparent 42%,
+    var(--ms-accent-soft) 42%,
+    var(--ms-accent) 100%
+  );
+  border-radius: 0 0 var(--ms-radius-lg) 0;
+  opacity: 0;
+  transition: opacity 0.14s ease, background 0.14s ease;
+}
+.canvas-card-wrap:hover .ms-resize-handle-wrap,
+.react-flow__node.selected .ms-resize-handle-wrap { opacity: 1; }
+.canvas-card-wrap .ms-resize-handle-wrap:hover,
+.canvas-card-wrap:active .ms-resize-handle-wrap { opacity: 1; background: var(--ms-accent); }
+/* Keep existing NodeResizer classes for media nodes that may use them later */
+.ms-resize-handle {
+  width: 10px;
+  height: 10px;
+  background: var(--ms-accent);
+  border: 2px solid var(--ms-bg);
+  border-radius: 50%;
+  opacity: 0;
+  transition: opacity 0.14s ease, background 0.14s ease;
+}
+.react-flow__node:hover .ms-resize-handle,
+.react-flow__node.selected .ms-resize-handle { opacity: 0.7; }
+.ms-resize-handle:hover { opacity: 1; background: #fff; }
+.ms-resize-line {
+  stroke: var(--ms-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+  pointer-events: none;
+}
+.react-flow__node:hover .ms-resize-line,
+.react-flow__node.selected .ms-resize-line { opacity: 0.5; }
+
+/* ────────────────────────────────────────────────────────────────
+    10. Connection handles (visible on hover so drag-to-connect stays discoverable)
+    ──────────────────────────────────────────────────────────────── */
 .ms-corner-delete {
   position: absolute;
   top: 8px;

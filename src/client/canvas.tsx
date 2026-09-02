@@ -49,6 +49,7 @@ import {
   type OnConnectEnd,
   type OnConnectStart,
 } from '@xyflow/react'
+import { createPortal } from 'react-dom'
 import { NODE_CATALOG, NODE_TYPES, defaultLabel } from './nodes'
 import {
   MediaCanvasContext,
@@ -117,22 +118,33 @@ function restoreOps(target: MsSnapshot): MsOp[] {
 // ── Projection host-graph ↔ React Flow ───────────────────────────────────
 
 function projectNodes(graph: SGraph): FlowNode[] {
-  return graph.nodes.map((n) => ({
-    id: n.id,
-    type: n.type,
-    position: n.position ?? { x: 0, y: 0 },
-    data: {
-      kind: n.type,
-      label: n.label,
-      prompt: n.data.prompt,
-      model: n.data.model,
-      resultUrl: n.data.resultUrl,
-      status: n.data.status,
-      errorMsg: n.data.errorMsg,
-      text: n.data.text,
-      content: n.data.content,
-    },
-  }))
+  return graph.nodes.map((n) => {
+    const isDoc = n.type === 'text' || n.type === 'note'
+    return {
+      id: n.id,
+      type: n.type,
+      position: n.position ?? { x: 0, y: 0 },
+      // Restrict drag origin to .ms-drag-area for text/note nodes so the
+      // resize handle (outside that element) never triggers a node drag.
+      ...(isDoc ? { dragHandle: '.ms-drag-area' } : {}),
+      data: {
+        kind: n.type,
+        label: n.label,
+        prompt: n.data.prompt,
+        model: n.data.model,
+        resultUrl: n.data.resultUrl,
+        status: n.data.status,
+        errorMsg: n.data.errorMsg,
+        text: n.data.text,
+        content: n.data.content,
+        // Text/note cards persist their user-resized height in data.height
+        // (updateNode). Carry it through the projection so an SSE snapshot —
+        // including the echo of the very patch that stored it — doesn't drop
+        // it and collapse the card back to its default size.
+        height: n.data.height,
+      },
+    }
+  })
 }
 
 function projectEdges(graph: SGraph): FlowEdge[] {
@@ -432,6 +444,7 @@ function CanvasView({ canvasId }: CanvasProps) {
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     let draggingNow = false
     const commits: Array<{ id: string; position: { x: number; y: number } }> = []
+    const dimCommits: Array<{ id: string; height: number }> = []
     for (const ch of changes) {
       if (ch.type === 'position' && ch.dragging) {
         interactingRef.current = true
@@ -443,6 +456,9 @@ function CanvasView({ canvasId }: CanvasProps) {
       if (ch.type === 'select' && !draggingNow) {
         queueMicrotask(() => { interactingRef.current = false })
       }
+      if (ch.type === 'dimensions' && !ch.resizing && ch.dimensions) {
+        dimCommits.push({ id: ch.id, height: ch.dimensions.height })
+      }
     }
     onNodesChangeBase(changes as never)
     if (commits.length > 0) {
@@ -450,6 +466,11 @@ function CanvasView({ canvasId }: CanvasProps) {
       const cur = appliedRef.current
       if (cur) queueHistory(cur)
       postLocal(commits.map((c) => ({ op: 'moveNode', id: c.id, position: c.position })))
+    }
+    if (dimCommits.length > 0) {
+      const cur = appliedRef.current
+      if (cur) queueHistory(cur)
+      postLocal(dimCommits.map((c) => ({ op: 'updateNode', id: c.id, data: { height: c.height } })))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onNodesChangeBase, postLocal, queueHistory])
@@ -904,7 +925,13 @@ function CreateMenu({ menu, onClose, onPick }: {
   const isConnect = menu.kind === 'connect'
   const left = Math.max(8, Math.min(menu.x, window.innerWidth - 240))
   const top = Math.max(8, Math.min(menu.y, window.innerHeight - 330))
-  return (
+  // Portal to <body>: the canvas host carries `contain: layout style` and can
+  // live inside transformed/containing sidebar shells, both of which hijack
+  // `position: fixed` descendants (the popup would be laid out from the
+  // canvas origin while `left/top` are viewport coordinates → way off the
+  // "+"/cursor). On <body> fixed is truly viewport-relative. The backdrop is
+  // the token host for the popup's colors, so it matches the DSH theme.
+  return createPortal(
     <div className="ms-menu-backdrop" onClick={onClose}>
       <div
         className="ms-connect-menu"
@@ -938,7 +965,8 @@ function CreateMenu({ menu, onClose, onPick }: {
           )
         })}
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

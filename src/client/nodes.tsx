@@ -13,7 +13,7 @@
 // Everything renders from the host's node.data; the host stays the single
 // source of truth (SSE reconciliation in canvas.tsx).
 
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Handle,
   NodeToolbar,
@@ -83,6 +83,88 @@ function useRefreshHandles(id: string) {
     updateNodeInternals(id)
     return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout) }
   }, [id, updateNodeInternals])
+}
+
+/**
+ * Bottom-right height-resize grip for text/note cards.
+ *
+ * Resizing is driven by native pointer events. The grip previews the new
+ * height locally on every pointermove (no host traffic mid-drag) and commits
+ * ONE `updateNode({ height })` on pointer-up, so undo/redo, the SSE stream and
+ * the agent's canvas_graph_view all settle on the final size.
+ *
+ * Why dragging this corner resizes instead of moving the node: xyflow only
+ * starts a node drag from elements matching the node's `dragHandle`
+ * ('.ms-drag-area' — the card body; set in projectNodes in canvas.tsx). XYDrag
+ * filters each pointer-down through hasSelector(), which walks the target and
+ * its ancestors up to the node wrapper — this grip is a sibling OUTSIDE
+ * `.ms-drag-area`, so the filter rejects the gesture and no d3 drag begins.
+ * `.nodrag` is a second, independent guard on top of that.
+ */
+function DocResizeGrip({ startHeight, minHeight, maxHeight, onPreview, onCommit }: {
+  startHeight: number
+  minHeight: number
+  maxHeight: number
+  /** Live preview height (flow units) while the drag is in progress. */
+  onPreview: (h: number) => void
+  /** Called once when the drag ends (pointer-up) with the final height. */
+  onCommit: (h: number) => void
+}) {
+  const { screenToFlowPosition } = useReactFlow()
+  const liveRef = useRef<{ startFlowY: number; startHeight: number } | null>(null)
+
+  const clamp = (v: number) => Math.max(minHeight, Math.min(maxHeight, v))
+
+  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !e.isPrimary) return
+    // Keep this away from xyflow's d3 drag / pane handlers (React's own
+    // listener is at the root, after d3's, so this is belt-and-braces —
+    // the real guard is the dragHandle filter described above).
+    e.stopPropagation()
+    e.preventDefault()
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    const start = screenToFlowPosition({ x: e.clientX, y: e.clientY })
+    liveRef.current = { startFlowY: start.y, startHeight }
+    onPreview(startHeight)
+
+    const onMove = (ev: PointerEvent) => {
+      const live = liveRef.current
+      if (!live) return
+      const cur = screenToFlowPosition({ x: ev.clientX, y: ev.clientY })
+      onPreview(clamp(Math.round(live.startHeight + (cur.y - live.startFlowY))))
+    }
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+    }
+    const finish = (ev: PointerEvent, cancel: boolean) => {
+      const live = liveRef.current
+      if (!live) return
+      liveRef.current = null
+      cleanup()
+      if (cancel) return // keep the last persisted height
+      const cur = screenToFlowPosition({ x: ev.clientX, y: ev.clientY })
+      onCommit(clamp(Math.round(live.startHeight + (cur.y - live.startFlowY))))
+    }
+    const onUp = (ev: PointerEvent) => finish(ev, false)
+    const onCancel = (ev: PointerEvent) => finish(ev, true)
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onCancel)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startHeight, screenToFlowPosition])
+
+  return (
+    <div
+      className="ms-resize-handle-wrap nodrag"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize card height"
+      title="Drag to resize height"
+      onPointerDown={onPointerDown}
+    />
+  )
 }
 
 // ── Small building blocks ────────────────────────────────────────────────
@@ -424,6 +506,7 @@ function makeDocNode(kind: 'text' | 'note') {
     const title = d.label ?? meta.placeholder
     const field: 'text' | 'content' = kind === 'text' ? 'text' : 'content'
     const value = (d[field] as string | undefined) ?? ''
+    const storedH = typeof d.height === 'number' ? d.height : undefined
 
     const [draft, setDraft] = useState(value)
     const editingRef = useRef(false)
@@ -437,9 +520,20 @@ function makeDocNode(kind: 'text' | 'note') {
       if (v !== value) api.patchData(id, { [field]: v })
     }
 
+    // Preview height while the bottom-right grip is dragged; null = not
+    // resizing, and data.height (or the per-kind default) decides the size.
+    const [previewH, setPreviewH] = useState<number | null>(null)
+    const defaultH = kind === 'note' ? 90 : 120
+    const minH = kind === 'note' ? 64 : 84
+    const maxH = 1600
+    const shownH = previewH ?? storedH
+
     return (
       <NodeShell id={id} kind={kind} status={status} title={title}>
-        <div className={`canvas-node node-${kind}`}>
+        <div
+          className={`canvas-node node-${kind} ms-drag-area${shownH ? ' is-fixed' : ''}`}
+          style={shownH ? { height: shownH } : undefined}
+        >
           <CornerDelete id={id} />
           {d.prompt && status !== 'running' && <div className="ms-doc-prompt">{d.prompt}</div>}
           <textarea
@@ -456,6 +550,16 @@ function makeDocNode(kind: 'text' | 'note') {
             <div className="ms-doc-running"><IconLoader className="ms-spin" size={12} /> generating…</div>
           )}
         </div>
+        <DocResizeGrip
+          startHeight={shownH ?? defaultH}
+          minHeight={minH}
+          maxHeight={maxH}
+          onPreview={setPreviewH}
+          onCommit={(h) => {
+            setPreviewH(null)
+            if (h !== storedH) api.patchData(id, { height: h })
+          }}
+        />
       </NodeShell>
     )
   }

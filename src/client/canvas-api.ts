@@ -26,6 +26,9 @@ export interface MsData extends Record<string, unknown> {
   errorMsg?: string
   text?: string
   content?: string
+  /** Persisted card height (px, flow units) for text/note nodes after the
+   *  user drags the bottom-right resize grip. */
+  height?: number
 }
 
 export type MsOp =
