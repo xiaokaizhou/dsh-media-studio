@@ -294,14 +294,56 @@ const S = {
     flexDirection: 'column',
     gap: '2px',
   } as React.CSSProperties,
-  sectionLabel: {
+  collapsibleSection: {
+    border: '1px solid var(--dsw-alias-border-l2)',
+    borderRadius: '8px',
+    overflow: 'hidden',
+    marginTop: '8px',
+  } as React.CSSProperties,
+  collapsibleHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '10px 12px',
+    cursor: 'pointer',
+    background: 'var(--dsw-alias-bg-layer-4)',
+    userSelect: 'none',
+    transition: 'background 0.15s',
+  } as React.CSSProperties,
+  collapsibleTitle: {
+    flex: 1,
+    color: 'var(--dsw-alias-label-primary)',
+    fontSize: '13px',
+    fontWeight: 500,
+  } as React.CSSProperties,
+  collapsibleChevron: {
+    color: 'var(--dsw-alias-label-secondary)',
+    fontSize: '12px',
+    transition: 'transform 0.2s',
+    display: 'inline-block',
+  } as React.CSSProperties,
+  collapsibleBody: {
+    padding: '8px 12px 12px',
+    borderTop: '1px solid var(--dsw-alias-border-l2)',
+  } as React.CSSProperties,
+  /** Inline status summary rendered next to a section title when collapsed. */
+  collapsibleSummary: {
+    color: 'var(--dsw-alias-label-tertiary)',
+    fontSize: '12px',
+    fontWeight: 400,
+    lineHeight: '1.5',
+    marginLeft: 'auto',
+  } as React.CSSProperties,
+  /** Provider badge (e.g. "image · custom-agnes") inside a section header. */
+  collapsibleProvider: {
     color: 'var(--dsw-alias-label-secondary)',
     fontSize: '11px',
+    background: 'var(--dsw-alias-bg-layer-3)',
+    padding: '1px 8px',
+    borderRadius: '999px',
+    border: '1px solid var(--dsw-alias-border-l2)',
     fontWeight: 500,
-    textTransform: 'uppercase' as const,
-    letterSpacing: '0.05em',
-    marginTop: '12px',
-    marginBottom: '4px',
+    lineHeight: '17px',
   } as React.CSSProperties,
   fieldBlock: {
     display: 'flex',
@@ -392,14 +434,91 @@ const S = {
     fontSize: '12px',
     lineHeight: '1.5',
   } as React.CSSProperties,
+
+  // ── Disclosure card (matches host PluginCard visual language) ──────────
+  /** Variant of `card` for the expanded state — subtle tint shift. */
+  cardOpen: {
+    background: 'var(--dsw-alias-bg-layer-2)',
+    borderColor: 'var(--dsw-alias-label-dimmed)',
+  } as React.CSSProperties,
+  /** Whole-row disclosure button (header). */
+  headerButton: {
+    appearance: 'none' as const,
+    width: '100%',
+    font: 'inherit',
+    color: 'inherit',
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: '12px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+    padding: '14px 16px',
+  } as React.CSSProperties,
+  /** Two-line text block (title + description) inside the header. */
+  headText: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    flex: 1,
+    gap: '4px',
+    minWidth: 0,
+  } as React.CSSProperties,
+  cardTitle: {
+    color: 'var(--dsw-alias-label-primary)',
+    fontSize: '15px',
+    fontWeight: 600,
+    lineHeight: '1.4',
+  } as React.CSSProperties,
+  cardDescription: {
+    color: 'var(--dsw-alias-label-tertiary)',
+    fontSize: '13px',
+    lineHeight: '1.5',
+  } as React.CSSProperties,
+  /** "N / 4 已配置" pill shown only while collapsed. */
+  cardSummary: {
+    fontSize: '12px',
+    lineHeight: '1.5',
+    flex: 'none',
+    padding: '1px 8px',
+    borderRadius: '999px',
+    border: '1px solid var(--dsw-alias-border-l2)',
+    background: 'var(--dsw-alias-bg-layer-3)',
+    color: 'var(--dsw-alias-label-secondary)',
+    whiteSpace: 'nowrap' as const,
+  } as React.CSSProperties,
+  /** Replace the legacy `badge` style for the new header pill. */
+  pending: {
+    whiteSpace: 'nowrap' as const,
+    background: 'var(--dsw-alias-bg-module-platform)',
+    color: 'var(--dsw-alias-label-secondary)',
+    borderRadius: '999px',
+    padding: '1px 8px',
+    fontSize: '11px',
+    fontWeight: 500,
+    lineHeight: '17px',
+    flex: 'none',
+  } as React.CSSProperties,
+  /** Right-aligned disclosure chevron; rotates 180° when open. */
+  chevron: {
+    color: 'var(--dsw-alias-label-tertiary)',
+    flex: 'none',
+    transition: 'transform 0.16s',
+    fontSize: '14px',
+    display: 'inline-block',
+  } as React.CSSProperties,
+  chevronOpen: {
+    transform: 'rotate(180deg)',
+  } as React.CSSProperties,
+  /** Wrapper that holds form sections. */
+  bodyInner: {
+    padding: '0 16px',
+  } as React.CSSProperties,
 } as const
 
 function FieldRow(props: { children: ReactNode }) {
   return createElement('div', { style: { marginTop: 4 }, children: props.children })
-}
-
-function SectionLabel({ children }: { children: ReactNode }) {
-  return createElement('div', { style: S.sectionLabel, children })
 }
 
 function ValueField(props: {
@@ -472,11 +591,56 @@ function SecretField(props: {
   ])
 }
 
+function CollapsibleSection({
+  title,
+  summary,
+  provider,
+  children,
+  defaultOpen = true,
+}: {
+  title: ReactNode
+  /** Inline status (right-aligned, dim) — e.g. "2 / 3 已配置". */
+  summary?: ReactNode
+  /** Provider badge (between title and summary). */
+  provider?: ReactNode
+  children: ReactNode
+  defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return createElement('div', { style: S.collapsibleSection }, [
+    createElement(
+      'div',
+      {
+        style: S.collapsibleHeader,
+        onClick: () => setOpen((v) => !v),
+        role: 'button',
+        'aria-expanded': open,
+        tabIndex: 0,
+        onKeyDown: (e: { key: string; preventDefault: () => void }) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen((v) => !v) }
+        },
+      },
+      [
+        createElement('span', { style: S.collapsibleChevron, children: open ? '▾' : '▸' }),
+        createElement('span', { style: S.collapsibleTitle, children: title }),
+        provider ? createElement('span', { style: S.collapsibleProvider, children: provider }) : null,
+        summary ? createElement('span', { style: S.collapsibleSummary, children: summary }) : null,
+      ],
+    ),
+    open ? createElement('div', { style: S.collapsibleBody }, children) : null,
+  ])
+}
+
 export function MediaStudioCard(props: MediaStudioCardProps) {
   const { t, controller } = props
   // touch the version to re-render when controller notifies
   useControllerVersion(controller)
 
+  // Default collapsed — matches every other plugin card rendered by
+  // ConfigurablePluginsTab (PluginCard's useState(false)).
+  const [open, setOpen] = useState(false)
+  // Collapse state stays across re-renders. Staged edits survive — same
+  // disclosure semantics as the host PluginCard.
   const disabled = !controller.isReady()
   const dirty = controller.isDirty()
   const saving = controller.isSaving()
@@ -509,65 +673,142 @@ export function MediaStudioCard(props: MediaStudioCardProps) {
       onEdit: (text: string) => controller.stageEdit(`${kind}.apiKey`, text),
     })
 
-  return createElement('div', { style: S.card }, [
-    createElement('div', { style: S.header }, [
-      createElement('p', { style: S.title, children: t('title') }),
-      createElement('span', { style: { flex: 1 } }),
-      dirty && !saving ? createElement('span', { style: S.badge, children: t('unsaved') }) : null,
-    ]),
+  // Per-provider status (used both inline in expanded form and as collapsed
+  // summary). Drives the "X 已配置" pills so users can see at a glance which
+  // providers still need their key + baseURL filled.
+  const imageConfigured = controller.isSecretConfigured('image')
+  const videoConfigured = controller.isSecretConfigured('video')
+  const musicConfigured = controller.isSecretConfigured('music')
+  const textConfigured = controller.textFor('textModel').trim() !== ''
+  const configuredCount =
+    (textConfigured ? 1 : 0) +
+    (imageConfigured ? 1 : 0) +
+    (videoConfigured ? 1 : 0) +
+    (musicConfigured ? 1 : 0)
+  const cardSummary = `${configuredCount} / 4 ${t('configured')}`
+  const providerSummary = (kind: 'image' | 'video' | 'music', ok: boolean) =>
+    ok ? t('configured') : t('notConfigured')
 
-    createElement('div', { style: S.body }, [
-      createElement('p', { style: S.description, children: t('description') }),
-      vf('textModel', 'textModel', 'textModelHint', 'deepseek/deepseek-chat'),
-
-      createElement(SectionLabel, { children: t('imageProvider') }),
-      createElement(FieldRow, { children: vf('image.provider', 'imageProvider', 'imageProviderHint', 'custom-agnes') }),
-      createElement(FieldRow, { children: vf('image.baseURL', 'imageBaseUrl', 'imageBaseUrlHint', 'https://…') }),
-      createElement(FieldRow, { children: sf('image', 'imageApiKey', 'imageApiKeyHint') }),
-      createElement(FieldRow, { children: vf('image.defaultModel', 'imageDefaultModel', 'imageDefaultModelHint', 'agnes-image-2.1-flash') }),
-
-      createElement(SectionLabel, { children: t('videoProvider') }),
-      createElement(FieldRow, { children: vf('video.provider', 'videoProvider', 'videoProviderHint', 'custom-agnes') }),
-      createElement(FieldRow, { children: vf('video.baseURL', 'videoBaseUrl', 'videoBaseUrlHint', 'https://…') }),
-      createElement(FieldRow, { children: sf('video', 'videoApiKey', 'videoApiKeyHint') }),
-      createElement(FieldRow, { children: vf('video.defaultModel', 'videoDefaultModel', 'videoDefaultModelHint', 'agnes-video-2.5-flash') }),
-
-      createElement(SectionLabel, { children: t('musicProvider') }),
-      createElement(FieldRow, { children: vf('music.provider', 'musicProvider', 'musicProviderHint', 'custom-minimax') }),
-      createElement(FieldRow, { children: vf('music.baseURL', 'musicBaseUrl', 'musicBaseUrlHint', 'https://…') }),
-      createElement(FieldRow, { children: sf('music', 'musicApiKey', 'musicApiKeyHint') }),
-      createElement(FieldRow, { children: vf('music.defaultModel', 'musicDefaultModel', 'musicDefaultModelHint', 'speech-02-hd') }),
-      createElement(FieldRow, { children: vf('music.voice', 'musicVoice', 'musicVoiceHint', 'male-qn-jingying') }),
-
-      !controller.isReady()
-        ? createElement('p', { style: S.readOnly, role: 'status', children: t('readOnly') })
-        : null,
-    ]),
-
-    createElement('div', { style: S.footer }, [
-      controller.isFailed()
-        ? createElement('p', { style: S.failed, role: 'status', children: t('saveFailed') })
-        : null,
+  return createElement(
+    'li',
+    { style: { ...S.card, ...(open ? S.cardOpen : null) } },
+    [
+      // Header — collapsed disclosure button (whole-card toggle)
       createElement(
         'button',
         {
           type: 'button',
-          style: { ...S.btnDiscard, opacity: !dirty || saving ? 0.5 : 1, cursor: !dirty || saving ? 'not-allowed' : 'pointer' },
-          disabled: !dirty || saving,
-          onClick: () => controller.discard(),
-          children: t('discard'),
+          style: S.headerButton,
+          'aria-expanded': open,
+          'aria-label': `${t(open ? 'collapse' : 'expand')}: ${t('title')}`,
+          onClick: () => setOpen((v) => !v),
         },
+        [
+          createElement('span', { style: S.headText }, [
+            createElement('span', { style: S.cardTitle, children: t('title') }),
+            createElement('span', { style: S.cardDescription, children: t('description') }),
+          ]),
+          dirty && !saving ? createElement('span', { style: S.pending, children: t('unsaved') }) : null,
+          // Compact summary visible while collapsed — keeps the card informative
+          // without forcing the user to expand it.
+          createElement('span', { style: S.cardSummary, children: open ? '' : cardSummary }),
+          createElement('span', {
+            style: { ...S.chevron, ...(open ? S.chevronOpen : null) },
+            'aria-hidden': true,
+            children: '▾',
+          }),
+        ],
       ),
-      createElement(
-        'button',
-        {
-          type: 'button',
-          style: { ...S.btnSave, opacity: blocked ? 0.5 : 1, cursor: blocked ? 'not-allowed' : 'pointer' },
-          disabled: blocked,
-          onClick: () => { void controller.save() },
-          children: t(saving ? 'saving' : 'save'),
-        },
-      ),
-    ]),
-  ])
+
+      // Body — only when expanded
+      open
+        ? createElement('div', { style: S.body }, [
+            createElement('div', { style: S.bodyInner }, [
+              // Text model — one field, no need for a section
+              createElement(CollapsibleSection, {
+                children: [
+                  createElement(FieldRow, { children: vf('textModel', 'textModel', 'textModelHint', 'deepseek/deepseek-chat') }),
+                ],
+                title: t('textModel'),
+                summary: textConfigured ? t('configured') : t('notConfigured'),
+                defaultOpen: false,
+              }),
+
+              // Three media providers — each in its own collapsible section
+              createElement(CollapsibleSection, {
+                children: [
+                  createElement(FieldRow, { children: vf('image.provider', 'imageProvider', 'imageProviderHint', 'custom-agnes') }),
+                  createElement(FieldRow, { children: vf('image.baseURL', 'imageBaseUrl', 'imageBaseUrlHint', 'https://…') }),
+                  createElement(FieldRow, { children: sf('image', 'imageApiKey', 'imageApiKeyHint') }),
+                  createElement(FieldRow, { children: vf('image.defaultModel', 'imageDefaultModel', 'imageDefaultModelHint', 'agnes-image-2.1-flash') }),
+                ],
+                title: t('imageProvider'),
+                provider: controller.textFor('image.provider') || '—',
+                summary: providerSummary('image', imageConfigured),
+                defaultOpen: false,
+              }),
+
+              createElement(CollapsibleSection, {
+                children: [
+                  createElement(FieldRow, { children: vf('video.provider', 'videoProvider', 'videoProviderHint', 'custom-agnes') }),
+                  createElement(FieldRow, { children: vf('video.baseURL', 'videoBaseUrl', 'videoBaseUrlHint', 'https://…') }),
+                  createElement(FieldRow, { children: sf('video', 'videoApiKey', 'videoApiKeyHint') }),
+                  createElement(FieldRow, { children: vf('video.defaultModel', 'videoDefaultModel', 'videoDefaultModelHint', 'agnes-video-2.5-flash') }),
+                ],
+                title: t('videoProvider'),
+                provider: controller.textFor('video.provider') || '—',
+                summary: providerSummary('video', videoConfigured),
+                defaultOpen: false,
+              }),
+
+              createElement(CollapsibleSection, {
+                children: [
+                  createElement(FieldRow, { children: vf('music.provider', 'musicProvider', 'musicProviderHint', 'custom-minimax') }),
+                  createElement(FieldRow, { children: vf('music.baseURL', 'musicBaseUrl', 'musicBaseUrlHint', 'https://…') }),
+                  createElement(FieldRow, { children: sf('music', 'musicApiKey', 'musicApiKeyHint') }),
+                  createElement(FieldRow, { children: vf('music.defaultModel', 'musicDefaultModel', 'musicDefaultModelHint', 'speech-02-hd') }),
+                  createElement(FieldRow, { children: vf('music.voice', 'musicVoice', 'musicVoiceHint', 'male-qn-jingying') }),
+                ],
+                title: t('musicProvider'),
+                provider: controller.textFor('music.provider') || '—',
+                summary: providerSummary('music', musicConfigured),
+                defaultOpen: false,
+              }),
+
+              !controller.isReady()
+                ? createElement('p', { style: S.readOnly, role: 'status', children: t('readOnly') })
+                : null,
+            ]),
+
+            // Footer — discard / save. Always shown when expanded so the user
+            // can finalize edits even after collapsing individual sections.
+            createElement('div', { style: S.footer }, [
+              controller.isFailed()
+                ? createElement('p', { style: S.failed, role: 'status', children: t('saveFailed') })
+                : null,
+              createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...S.btnDiscard, opacity: !dirty || saving ? 0.5 : 1, cursor: !dirty || saving ? 'not-allowed' : 'pointer' },
+                  disabled: !dirty || saving,
+                  onClick: () => controller.discard(),
+                  children: t('discard'),
+                },
+              ),
+              createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...S.btnSave, opacity: blocked ? 0.5 : 1, cursor: blocked ? 'not-allowed' : 'pointer' },
+                  disabled: blocked,
+                  onClick: () => { void controller.save() },
+                  children: t(saving ? 'saving' : 'save'),
+                },
+              ),
+            ]),
+          ])
+        : null,
+    ],
+  )
 }

@@ -47,6 +47,10 @@ export type MediaStudioLocaleKey =
   | 'save'
   | 'saving'
   | 'discard'
+  | 'expand'
+  | 'collapse'
+  | 'configured'
+  | 'notConfigured'
 
 /** English copy. */
 export const EN: Record<MediaStudioLocaleKey, string> = {
@@ -95,6 +99,10 @@ export const EN: Record<MediaStudioLocaleKey, string> = {
   save: 'Save',
   saving: 'Saving…',
   discard: 'Discard',
+  expand: 'Expand',
+  collapse: 'Collapse',
+  configured: 'configured',
+  notConfigured: 'not configured',
 }
 
 /** Simplified Chinese copy (same keys as en). */
@@ -144,4 +152,8 @@ export const zh: Record<MediaStudioLocaleKey, string> = {
   save: '保存',
   saving: '保存中…',
   discard: '放弃修改',
+  expand: '展开',
+  collapse: '折叠',
+  configured: '已配置',
+  notConfigured: '未配置',
 }
