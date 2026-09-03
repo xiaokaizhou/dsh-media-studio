@@ -27,11 +27,15 @@
     "prepare": "tsdown && bash scripts/setup-preset.sh"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.8 <0.2.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.0-rc.8 <0.2.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0",
     "@xyflow/react": "^12.4.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tsdown": "^0.22.14",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
