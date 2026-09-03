@@ -1,12 +1,20 @@
 import type { Context } from '@deepseek-ai/cordis'
-// Value-import (not type-only) — needed for the `declare module` augmentation
-// in @deepseek-ai/dsh-llm that adds `ctx.llm` to the cordis Context type.
-import '@deepseek-ai/dsh-llm'
+// Type-only import — pulls in `@deepseek-ai/dsh-llm/lib/types/index.d.ts`
+// which declares `module '@deepseek-ai/cordis'` so `ctx.llm` is in scope.
+// Crucially this is type-only: rolldown erases the whole statement and
+// never emits a runtime `require('@deepseek-ai/dsh-llm')`. The earlier
+// value-import (`import '@deepseek-ai/dsh-llm'`) pulled the package's
+// runtime attribution header into the SHARED dep graph, which then bled
+// into the BROWSER entry (`src/client.tsx`) and surfaced there as
+// `require("node:module")` — the DSH client-modules loader has no
+// `node:module` seed, so the factory aborted with
+// "require(\"node:module\") missed the module table".
+import type {} from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { MediaStudioSettings, NS, readMediaStudio, DEFAULT_MEDIA_STUDIO, type MediaStudioScope, type MediaStudioSettingsShape } from './settings'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
-import { registerCanvasViewTool, registerCanvasPatchTool, registerAutoArrangeTool } from './tools'
+import { registerCanvasViewTool, registerCanvasPatchTool, registerAutoArrangeTool, registerCanvasRefreshNodeTool } from './tools'
 import { CanvasStore } from './canvas-store'
 import { registerCanvasRoutes } from './routes'
 import type { ServerResponse } from 'node:http'
@@ -150,6 +158,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
       ['canvas_graph_view', () => registerCanvasViewTool(ctx)],
       ['canvas_graph_patch', () => registerCanvasPatchTool(ctx)],
       ['canvas_auto_arrange', () => registerAutoArrangeTool(ctx)],
+      ['canvas_refresh_node', () => registerCanvasRefreshNodeTool(ctx)],
     ]
     for (const [name, reg] of toolRegs) {
       try {
