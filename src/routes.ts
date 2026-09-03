@@ -8,6 +8,7 @@ import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles } from './service-state'
+import { executeNodeRefresh } from './tools'
 
 const MEDIA_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -81,10 +82,42 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
   createReadStream(target).on('error', () => res.destroy()).pipe(res)
 }
 
+/** True when `target` is `root` itself or sits underneath it. Compares
+ *  resolved absolute paths with a separator guard so `/a/bc` never counts
+ *  as being inside `/a/b`. */
+function isUnderRoot(target: string, root: string): boolean {
+  const r = resolve(root)
+  return target === r || target.startsWith(r + sep)
+}
+
+/**
+ * Allow-list check for the media-file proxy.
+ *
+ * `workspaceRoot` is always allowed; `mediaRoots` adds the directories a host
+ * admin opted into (typically the project folder an agent writes generated
+ * media to). Everything else is refused — a relative `path` query still
+ * resolves against `workspaceRoot`, so `../../../etc/passwd` stays a 403.
+ */
+export function resolveMediaTarget(
+  requested: string,
+  workspaceRoot: string,
+  mediaRoots: readonly string[] = [],
+): { ok: true; target: string } | { ok: false } {
+  const wsRoot = resolve(workspaceRoot)
+  const target = resolve(wsRoot, requested)
+  const roots = [wsRoot, ...mediaRoots.filter((r) => typeof r === 'string' && r.trim() !== '')]
+  return roots.some((r) => isUnderRoot(target, r)) ? { ok: true, target } : { ok: false }
+}
+
 /**
  * Register canvas-related HTTP routes under `ctx.webServer`. Pattern:
  * `ctx.webServer.register({ kind, path, handler })`. The harness's webServer
  * service also exposes a static-serve path; we own the canvas API surface.
+ *
+ * After the multimodal refactor this routes module exposes ONLY canvas +
+ * media-proxy routes. The `/api/media-studio/models` and
+ * `/api/media-studio/providers` endpoints are gone: the dsh-llm-multimodal
+ * plugin owns the LLM-facing UI; media-studio is a pure canvas plugin.
  *
  * SSE wire shape (per canvas):
  *   data: {"type":"canvas-patch","canvasId":"...","version":42,"graph":{...},"patch":[...]}\n\n
@@ -204,15 +237,63 @@ export function registerCanvasRoutes(ctx: Context): () => void {
         res.end('{"ok":false,"error":"missing path"}')
         return
       }
-      const wsRoot = getMediaStudioHandles().workspaceRoot
-      const root = resolve(wsRoot)
-      const target = resolve(root, requested)
-      if (target !== root && !target.startsWith(root + sep)) {
+      const handles = getMediaStudioHandles()
+      const resolved = resolveMediaTarget(requested, handles.workspaceRoot, handles.mediaRoots ?? [])
+      if (!resolved.ok) {
         res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end('{"ok":false,"error":"forbidden"}')
+        res.end('{"ok":false,"error":"forbidden: path is outside workspaceRoot and every configured mediaRoots entry"}')
         return
       }
-      void serveMediaFile(target, req, res)
+      void serveMediaFile(resolved.target, req, res)
+    },
+  })
+
+  // Refresh endpoint — client calls this when a user clicks the refresh button
+  // on a node with upstream connections. Delegates to the same logic as the
+  // agent tool (executeNodeRefresh) so both paths share one implementation.
+  // executeNodeRefresh now reaches the dsh-llm-multimodal plugin's
+  // generate_image / generate_video / generate_music tools via
+  // ctx.tools.execute().
+  wserver.register({
+    kind: 'exact',
+    path: '/api/media-studio/canvas/refresh',
+    handler: (req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', async () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string; nodeId?: string }
+          const canvasId = body.canvasId || 'main'
+          const nodeId = String(body.nodeId ?? '').trim()
+          console.log(`[media-studio] refresh: canvasId=${canvasId} nodeId=${nodeId}`)
+          if (!nodeId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: 'nodeId is required' }))
+            return
+          }
+          const store = getMediaStudioHandles().canvasStore
+          // Use a generous timeout (5 min) instead of req.on('close') — the
+          // latter fires after the response is sent, which would abort a
+          // generation that already completed. The timeout guards against
+          // truly stuck generations (provider API hang).
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 5 * 60_000)
+          try {
+            const result = await executeNodeRefresh(store, canvasId, nodeId, controller.signal, ctx)
+            console.log(`[media-studio] refresh: done, ok=${result.ok} kind=${result.kind}`)
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(result))
+          } finally {
+            clearTimeout(timeout)
+          }
+        } catch (e) {
+          console.error(`[media-studio] refresh: error ${(e as Error).message}`)
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: (e as Error).message }))
+          }
+        }
+      })
     },
   })
 

@@ -1,4 +1,4 @@
-// Canvas node renderers — franklin-canvas-inspired card system:
+// Canvas node renderers — card system:
 //
 //   • Editable title row floats ABOVE the card (kind icon · title input ·
 //     status glyph) — edits commit through `renameNode` to the host store.
@@ -19,7 +19,6 @@ import {
   NodeToolbar,
   Position,
   useReactFlow,
-  useStore,
   useUpdateNodeInternals,
   type NodeProps,
 } from '@xyflow/react'
@@ -33,6 +32,7 @@ import {
   IconMusic,
   IconNote,
   IconPlus,
+  IconRefreshCw,
   IconTrash2,
   IconType,
   IconX,
@@ -46,6 +46,7 @@ import {
   type NodeKind,
 } from './canvas-api'
 import Lightbox from './lightbox'
+import { resolveLang, translate } from './i18n'
 
 // ── Kinds / catalog ──────────────────────────────────────────────────────
 
@@ -192,12 +193,13 @@ function CornerDelete({ id }: { id: string }) {
 }
 
 function AddSideButton({ id, side }: { id: string; side: 'left' | 'right' }) {
-  const { openConnectMenu } = useMediaCanvas()
-  // Ambient when idle, revealed on hover/selection so a branch is still
-  // possible once an edge already exists.
-  const isConnected = useStore((s) =>
-    s.edges.some((e) => (side === 'right' ? e.source === id : e.target === id)),
-  )
+  const { openConnectMenu, edgesLeft, edgesRight } = useMediaCanvas()
+  // Connectivity is precomputed once per SSE merge in canvas.tsx (kept as
+  // stable Set references) and shipped through the canvas context. That
+  // avoids the per-gesture cost of running `s.edges.some(...)` inside an
+  // xyflow `useStore` selector — every pan/zoom frame would otherwise
+  // re-invoke the selector for every AddSideButton × every node.
+  const isConnected = side === 'right' ? edgesRight.has(id) : edgesLeft.has(id)
   return (
     <button
       type="button"
@@ -212,6 +214,50 @@ function AddSideButton({ id, side }: { id: string; side: 'left' | 'right' }) {
       }}
     >
       <IconPlus size={18} strokeWidth={2.75} />
+    </button>
+  )
+}
+
+/**
+ * Refresh button — appears at the bottom-center of nodes that have upstream edges.
+ * Hover visibility matches the "+" side buttons. On click, triggers regeneration
+ * from upstream node content via the host refresh endpoint.
+ */
+function RefreshSideButton({ id }: { id: string }) {
+  const { refreshNode, hasUpstreamById } = useMediaCanvas()
+  // Show only when this node has at least one upstream edge. We read the
+  // precomputed Set from context (see AddSideButton above for the why).
+  const hasUpstream = hasUpstreamById.has(id)
+  const [refreshing, setRefreshing] = useState(false)
+
+  if (!hasUpstream) return null
+
+  const handleRefresh = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      await refreshNode(id)
+    } catch { /* SSE reconciles on its own */ }
+    finally {
+      // Brief delay so the spinner doesn't flicker away too fast.
+      setTimeout(() => setRefreshing(false), 600)
+    }
+  }, [id, refreshing, refreshNode])
+
+  return (
+    <button
+      type="button"
+      className={`ms-refresh-btn nodrag`}
+      aria-label="Refresh node from upstream content"
+      title={refreshing ? 'Refreshing…' : 'Refresh from upstream'}
+      onClick={handleRefresh}
+      disabled={refreshing}
+    >
+      {refreshing
+        ? <IconLoader className="ms-spin" size={13} strokeWidth={2} />
+        : <IconRefreshCw size={13} strokeWidth={2} />
+      }
     </button>
   )
 }
@@ -234,22 +280,29 @@ interface ShellProps {
   /** Toolbar shown on hover / selection (media cards). Omit → hidden. */
   toolbar?: ToolbarItem[]
   children: ReactNode
+  /** Mirrors `NodeProps.selected` so NodeShell can skip an xyflow store
+   *  selector subscription per node (see the comment inside NodeShell). */
+  selected?: boolean
 }
 
 /**
- * Wraps any card body with the franklin-style chrome: the floating title
+ * Wraps any card body with the floating title
  * row above the card, the optional hover/selected pill toolbar, target +
  * source handles (left/right), corner-delete affordance slot and the "+"
  * branch buttons on both sides.
  */
-function NodeShell({ id, kind, status, title, toolbar, children }: ShellProps) {
+function NodeShell({ id, kind, status, title, toolbar, children, selected = false }: ShellProps) {
   const api = useMediaCanvas()
   const { cardW } = api
   const meta = KIND_META[kind]
   const Icon = meta.Icon
 
   const [hover, setHover] = useState(false)
-  const selected = useStore((s) => s.nodes.find((n) => n.id === id)?.selected ?? false)
+  // `selected` comes from NodeProps in the parent renderers (xyflow already
+  // passes it on every node wrapper). Reading it from props avoids an
+  // xyflow `useStore` selector per node — selectors fire on every store
+  // dispatch, including viewport pan/zoom ticks, so on large canvases the
+  // per-gesture `s.nodes.find(...)` cost was a measurable jank source.
   const visible = hover || selected
 
   const [draft, setDraft] = useState<string | null>(null)
@@ -263,7 +316,7 @@ function NodeShell({ id, kind, status, title, toolbar, children }: ShellProps) {
   const showPill = visible && !!toolbar && toolbar.length > 0
 
   return (
-    <div className="canvas-card-wrap" style={cardWidthVar(cardW)}>
+    <div className="canvas-card-wrap" style={cardWidthVar(cardW)} data-ms-id={id}>
       <Handle type="target" position={Position.Left} id={`${id}-in`} className="ms-handle" />
       <div
         className="node-frame-wrap"
@@ -318,6 +371,8 @@ function NodeShell({ id, kind, status, title, toolbar, children }: ShellProps) {
 
       <AddSideButton id={id} side="left" />
       <AddSideButton id={id} side="right" />
+      {/* Bottom-center refresh button — only visible when the node has upstream edges */}
+      <RefreshSideButton id={id} />
       <Handle type="source" position={Position.Right} id={`${id}-out`} className="ms-handle" />
     </div>
   )
@@ -342,6 +397,231 @@ interface MediaCardProps {
   data: MsData
 }
 
+/** Mount the media element only once its card approaches the viewport —
+ *  dozens of <video> elements otherwise all start buffering at once (the
+ *  "many videos → endless loading" stall on big canvases). */
+function useInViewOnce(): { containerRef: (el: HTMLDivElement | null) => void; visible: boolean } {
+  const [visible, setVisible] = useState(false)
+  const [el, setEl] = useState<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!el || visible) return
+    if (typeof IntersectionObserver === 'undefined') { setVisible(true); return }
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) { setVisible(true); io.disconnect() }
+      },
+      { rootMargin: '260px' },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [el, visible])
+  return { containerRef: setEl, visible }
+}
+
+function LazyVideo({ src }: { src: string }) {
+  const { containerRef, visible } = useInViewOnce()
+  return (
+    <div ref={containerRef} className="media-fill media-video-slot" title="▶ 播放">
+      {visible ? (
+        <video className="media-fill media-video" src={src} controls preload="metadata" playsInline />
+      ) : (
+        <span className="media-lazy-hint">▶</span>
+      )}
+    </div>
+  )
+}
+
+function LazyAudio({ src }: { src: string }) {
+  const { containerRef, visible } = useInViewOnce()
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const peaksRef = useRef<Float32Array | null>(null)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const [playing, setPlaying] = useState(false)
+  const [time, setTime] = useState(0)
+  const [duration, setDuration] = useState(0)
+  const [decoded, setDecoded] = useState(false)
+  const [decodeError, setDecodeError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!visible || !src) return
+    const audio = audioRef.current
+    if (!audio) return
+    const onMeta = () => setDuration(audio.duration || 0)
+    const onTime = () => setTime(audio.currentTime || 0)
+    const onEnd = () => setPlaying(false)
+    audio.addEventListener('loadedmetadata', onMeta)
+    audio.addEventListener('timeupdate', onTime)
+    audio.addEventListener('ended', onEnd)
+    return () => {
+      audio.removeEventListener('loadedmetadata', onMeta)
+      audio.removeEventListener('timeupdate', onTime)
+      audio.removeEventListener('ended', onEnd)
+    }
+  }, [visible, src])
+
+  // WebAudio decode → peaks for real waveform.
+  useEffect(() => {
+    if (!visible || !src || decoded) return
+    let aborted = false
+    const Ctor = (typeof window !== 'undefined' && (window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)) || null
+    if (!Ctor) { setDecodeError('WebAudio not supported'); return }
+    const ctx = new Ctor()
+    audioCtxRef.current = ctx
+    const cleanup = () => { try { void ctx.close() } catch { /* ignore */ } }
+    ;(async () => {
+      try {
+        const res = await fetch(src)
+        if (!res.ok) throw new Error(`fetch ${res.status}`)
+        const buf = await res.arrayBuffer()
+        if (aborted) return
+        const audio = await ctx.decodeAudioData(buf.slice(0))
+        if (aborted) return
+        const data = audio.getChannelData(0)
+        const bars = 96
+        const stride = Math.max(1, Math.floor(data.length / bars))
+        const peaks = new Float32Array(bars)
+        for (let i = 0; i < bars; i += 1) {
+          let peak = 0
+          const start = i * stride
+          const end = Math.min(data.length, start + stride)
+          for (let j = start; j < end; j += 1) {
+            const v = Math.abs(data[j] ?? 0)
+            if (v > peak) peak = v
+          }
+          peaks[i] = peak
+        }
+        peaksRef.current = peaks
+        setDecoded(true)
+      } catch (e) {
+        if (!aborted) setDecodeError((e as Error).message)
+      } finally {
+        cleanup()
+        audioCtxRef.current = null
+      }
+    })()
+    return () => { aborted = true; cleanup() }
+  }, [visible, src, decoded])
+
+  // Draw the waveform + playback progress whenever peaks / time change.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1
+    const cssW = canvas.clientWidth || 220
+    const cssH = canvas.clientHeight || 56
+    canvas.width = Math.round(cssW * dpr)
+    canvas.height = Math.round(cssH * dpr)
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.scale(dpr, dpr)
+    ctx.clearRect(0, 0, cssW, cssH)
+    const peaks = peaksRef.current
+    if (!peaks || peaks.length === 0) {
+      // fallback bars while decoding
+      ctx.fillStyle = 'rgba(255,255,255,0.18)'
+      const fb = 32
+      const bw = cssW / fb
+      for (let i = 0; i < fb; i += 1) {
+        const h = Math.max(2, Math.random() * (cssH * 0.7))
+        ctx.fillRect(i * bw + 1, (cssH - h) / 2, Math.max(1, bw - 2), h)
+      }
+      return
+    }
+    const bars = peaks.length
+    const bw = cssW / bars
+    const mid = cssH / 2
+    const dur = duration || 1
+    const playedRatio = Math.min(1, Math.max(0, time / dur))
+    for (let i = 0; i < bars; i += 1) {
+      const peak = peaks[i] ?? 0
+      const h = Math.max(2, peak * (cssH * 0.92))
+      const x = i * bw + 1
+      const w = Math.max(1, bw - 2)
+      const ratio = (i + 0.5) / bars
+      const played = ratio <= playedRatio
+      ctx.fillStyle = played ? 'rgba(124,131,255,0.95)' : 'rgba(255,255,255,0.32)'
+      ctx.fillRect(x, mid - h / 2, w, h)
+    }
+  }, [decoded, time, duration, visible])
+
+  const toggle = () => {
+    const audio = audioRef.current
+    if (!audio) return
+    if (audio.paused) {
+      audio.play().catch(() => { /* user gesture missing or media error */ })
+      setPlaying(true)
+    } else {
+      audio.pause()
+      setPlaying(false)
+    }
+  }
+
+  const scrub = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const t = Number(e.target.value)
+    const audio = audioRef.current
+    if (audio && Number.isFinite(t)) {
+      audio.currentTime = t
+      setTime(t)
+    }
+  }
+
+  const seekByRatio = (clientX: number) => {
+    const canvas = canvasRef.current
+    const audio = audioRef.current
+    if (!canvas || !audio || !duration) return
+    const r = canvas.getBoundingClientRect()
+    const ratio = Math.min(1, Math.max(0, (clientX - r.left) / r.width))
+    const t = ratio * duration
+    audio.currentTime = t
+    setTime(t)
+  }
+
+  const fmt = (t: number) => {
+    if (!Number.isFinite(t)) return '0:00'
+    const m = Math.floor(t / 60)
+    const s = Math.floor(t % 60)
+    return `${m}:${s.toString().padStart(2, '0')}`
+  }
+
+  return (
+    <div ref={containerRef} className="media-audio-fill">
+      {visible ? (
+        <div className="ms-audio-editor">
+          <canvas
+            ref={canvasRef}
+            className="ms-audio-wave"
+            onClick={(e) => seekByRatio(e.clientX)}
+            role="slider"
+            aria-label="Audio waveform (click to seek)"
+          />
+          <div className="ms-audio-controls">
+            <button type="button" className="ms-audio-play" onClick={toggle} aria-label={playing ? 'Pause' : 'Play'}>
+              {playing ? '❚❚' : '▶'}
+            </button>
+            <span className="ms-audio-time">{fmt(time)}</span>
+            <input
+              type="range"
+              className="ms-audio-scrub"
+              min={0}
+              max={duration || 0}
+              step={0.1}
+              value={time}
+              onChange={scrub}
+              aria-label="Seek"
+            />
+            <span className="ms-audio-time">{fmt(duration)}</span>
+          </div>
+          {decodeError && <div className="ms-audio-err" role="status">waveform unavailable</div>}
+          <audio ref={audioRef} src={src} preload="metadata" />
+        </div>
+      ) : (
+        <span className="media-lazy-hint">▶ 音频</span>
+      )}
+    </div>
+  )
+}
+
 function MediaCardBody({ kind, nodeId, d }: {
   kind: MediaKind
   nodeId: string
@@ -357,11 +637,32 @@ function MediaCardBody({ kind, nodeId, d }: {
   const [broken, setBroken] = useState(false)
   useEffect(() => setBroken(false), [raw])
 
+  // Video/music running guard: if the server never writes a result, drop
+  // back to an error state so the user sees a clear "stuck" treatment
+  // instead of an infinite spinner. The refreshNode path has its own
+  // 120s timeout — this covers the agent-patch path (e.g. generate_video
+  // that timed out on the server).
+  const api = useMediaCanvas()
+  const startedAtRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (status !== 'running') { startedAtRef.current = null; return }
+    if (raw) return
+    if (startedAtRef.current == null) startedAtRef.current = Date.now()
+    const elapsed = Date.now() - (startedAtRef.current ?? Date.now())
+    const remaining = Math.max(0, 60_000 - elapsed)
+    const t = setTimeout(() => {
+      api.patchData(nodeId, { status: 'error' as const, errorMsg: 'Generation timed out — refresh to retry' })
+    }, remaining)
+    return () => clearTimeout(t)
+  }, [status, raw, nodeId, api])
+
   return (
     <div className={`media-card ms-media-${kind} ${raw ? 'has-result' : ''} status-${status}`}>
       <CornerDelete id={nodeId} />
 
-      {kind === 'image' && raw && !broken && (
+      {/* Hide the image during refresh so the overlay is visible.
+          When status returns to 'done' the new resultUrl will render here. */}
+      {kind === 'image' && raw && !broken && status !== 'running' && (
         <img
           className="media-fill media-img"
           src={src}
@@ -370,16 +671,16 @@ function MediaCardBody({ kind, nodeId, d }: {
           draggable={false}
         />
       )}
-      {kind === 'image' && (!raw || broken) && (
+      {kind === 'image' && (!raw || broken || status === 'running') && (
         <Placeholder
           Icon={Icon}
           error={broken || status === 'error'}
-          text={broken ? 'Image failed to load' : status === 'error' ? (d.errorMsg || 'Generation failed') : 'No image yet'}
+          text={broken ? 'Image failed to load' : status === 'error' ? (d.errorMsg || 'Generation failed') : status === 'running' ? 'Refreshing…' : 'No image yet'}
         />
       )}
 
       {kind === 'video' && raw && (
-        <video className="media-fill media-video" src={src} controls preload="metadata" playsInline />
+        <LazyVideo src={src} />
       )}
       {kind === 'video' && !raw && (
         <Placeholder
@@ -391,9 +692,7 @@ function MediaCardBody({ kind, nodeId, d }: {
 
       {kind === 'music' && (
         raw ? (
-          <div className="media-audio-fill">
-            <audio src={src} controls />
-          </div>
+          <LazyAudio src={src} />
         ) : (
           <Placeholder
             Icon={Icon}
@@ -448,7 +747,7 @@ function makeMediaNode(kind: MediaKind) {
     }
 
     const toolbar = useMemo<ToolbarItem[]>(() => {
-      const items = [
+      const items: ToolbarItem[] = [
         {
           id: 'expand', icon: <IconMaximize2 size={16} strokeWidth={1.75} />,
           label: raw ? 'Expand' : 'Expand (no result yet)', disabled: !raw,
@@ -459,17 +758,25 @@ function makeMediaNode(kind: MediaKind) {
           label: raw ? 'Download' : 'Download (no result yet)', disabled: !raw,
           onClick: download,
         },
-        {
-          id: 'delete', icon: <IconTrash2 size={16} strokeWidth={1.75} />,
-          label: 'Delete node', onClick: () => api.deleteNode(id),
-        },
       ]
+      // M2 — "存入素材库": register this card's media into the project library.
+      if (raw && api.saveToLibraryNode) {
+        items.push({
+          id: 'save', icon: <IconPlus size={16} strokeWidth={1.75} />,
+          label: translate(resolveLang(), 'node.saveToLibrary'),
+          onClick: () => api.saveToLibraryNode!(id),
+        })
+      }
+      items.push({
+        id: 'delete', icon: <IconTrash2 size={16} strokeWidth={1.75} />,
+        label: 'Delete node', onClick: () => api.deleteNode(id),
+      })
       return items
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [raw, id])
+    }, [raw, id, api.saveToLibraryNode])
 
     return (
-      <NodeShell id={id} kind={kind} status={status} title={title} toolbar={toolbar}>
+      <NodeShell id={id} kind={kind} status={status} title={title} toolbar={toolbar} selected={props.selected}>
         <MediaCardBody kind={kind} nodeId={id} d={d} />
         {lightboxSrc && (
           <Lightbox
@@ -525,11 +832,13 @@ function makeDocNode(kind: 'text' | 'note') {
     const [previewH, setPreviewH] = useState<number | null>(null)
     const defaultH = kind === 'note' ? 90 : 120
     const minH = kind === 'note' ? 64 : 84
-    const maxH = 1600
+    // Hard cap: never taller than 1.5× the smaller viewport dimension.
+    // (canvas.tsx maintains maxCardDimRef for this value.)
+    const maxH = Math.min(1600, api.cardW > 0 ? api.cardW * 3 : 1600)
     const shownH = previewH ?? storedH
 
     return (
-      <NodeShell id={id} kind={kind} status={status} title={title}>
+      <NodeShell id={id} kind={kind} status={status} title={title} selected={props.selected}>
         <div
           className={`canvas-node node-${kind} ms-drag-area${shownH ? ' is-fixed' : ''}`}
           style={shownH ? { height: shownH } : undefined}
@@ -537,7 +846,7 @@ function makeDocNode(kind: 'text' | 'note') {
           <CornerDelete id={id} />
           {d.prompt && status !== 'running' && <div className="ms-doc-prompt">{d.prompt}</div>}
           <textarea
-            className="ms-doc-editor"
+            className={`ms-doc-editor${value.trim() === '' ? ' is-empty' : ''}`}
             value={draft}
             placeholder={kind === 'note' ? 'Write a note…' : 'Script / text will appear here…'}
             rows={kind === 'note' ? 3 : 5}
@@ -546,6 +855,15 @@ function makeDocNode(kind: 'text' | 'note') {
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commit}
           />
+          {/* Empty-content warning: shown when the canonical content field
+              is missing/blank AND the user is not currently typing in the
+              textarea (avoid noise while they're fixing it themselves). */}
+          {value.trim() === '' && !editingRef.current && (
+            <div className="ms-doc-empty-warn" role="status">
+              <span className="ms-doc-empty-icon" aria-hidden>⚠</span>
+              <span className="ms-doc-empty-text">内容为空 — agent 尚未写入 {kind === 'note' ? 'data.content' : 'data.text'}</span>
+            </div>
+          )}
           {status === 'running' && (
             <div className="ms-doc-running"><IconLoader className="ms-spin" size={12} /> generating…</div>
           )}

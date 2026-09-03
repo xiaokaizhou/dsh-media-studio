@@ -89,6 +89,23 @@ export interface MediaCanvasApi {
   patchData(id: string, data: Record<string, unknown>): void
   /** Single-op fire-and-forget that always goes through the history + SSE. */
   post(ops: MsOp[]): void
+  /** Regenerate this node from its upstream content via the host tool. */
+  refreshNode(id: string): Promise<void>
+  /** M2 — open the "save this media card into the project library" dialog.
+   *  Absent when the card type has nothing to save or the host hides it. */
+  saveToLibraryNode?(id: string): void
+  /** Node ids that have at least one outgoing edge (source side). Rebuilt
+   *  once per server snapshot in canvas.tsx — never on viewport gestures —
+   *  so AddSideButton / RefreshSideButton can read connectivity without an
+   *  xyflow store selector subscription (which would re-run on every
+   *  pan/zoom tick). Stable Set references are returned so consumers only
+   *  re-render when the graph topology actually changes. */
+  edgesRight: ReadonlySet<string>
+  /** Node ids that have at least one incoming edge (target side). */
+  edgesLeft: ReadonlySet<string>
+  /** Node ids that have at least one upstream (incoming) edge. Equivalent
+   *  to `edgesLeft`, kept as a separate name for readability at call sites. */
+  hasUpstreamById: ReadonlySet<string>
 }
 
 export const MediaCanvasContext = createContext<MediaCanvasApi | null>(null)

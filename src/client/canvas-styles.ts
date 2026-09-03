@@ -1,4 +1,4 @@
-/* media-studio canvas styles — franklin-canvas-inspired card + editor look,
+/* media-studio canvas styles — card + editor look,
  * themed through DSH CSS vars (with local fallbacks so the canvas reads
  * identically when the vars are absent).
  *
@@ -6,9 +6,8 @@
  * helper that injects it into <head> exactly once per page (the DSH client
  * runtime cannot `require` a .css specifier — see tsdown.config notes).
  *
- * franklin-canvas ships `@xyflow/react/dist/style.css` at its entry; we can't
- * import it here, so the sheet re-implements the xyflow base layout rules it
- * needs (MIT) and then layers the media-studio theme on top.
+ * We re-implement the xyflow base layout rules we need (MIT) and then
+ * layer the media-studio theme on top.
  */
 export const MEDIA_STUDIO_CSS = String.raw`
 /* ────────────────────────────────────────────────────────────────
@@ -48,8 +47,27 @@ export const MEDIA_STUDIO_CSS = String.raw`
 .media-studio-canvas .react-flow__pane.draggable,
 .media-studio-canvas .react-flow__pane.dragging { cursor: grab; }
 .media-studio-canvas .react-flow__pane.dragging { cursor: grabbing; }
+/* xyflow v12 sets --xy-selection-background-color / --xy-selection-border on
+ * .react-flow itself; we layer the media-studio marquee tint on top via
+ * .react-flow__selection so the Ctrl/Cmd-drag rectangle reads against our
+ * panel background (and matches the accent ring used on selected cards).
+ * The dotted default border is too noisy against a dot-grid background.
+ *
+ * pointer-events: none is critical: the marquee is rendered after
+ * pointerdown + before pointerup, and the rect would otherwise swallow
+ * the move events (xyflow's pane listens on capture phase, but the rect
+ * sits on top of the pane), so without this the marquee would freeze in
+ * place the moment it appeared. We rely on xyflow's own pointermove
+ * capture handler on the pane — the rect is pure decoration. */
 .media-studio-canvas .react-flow__selection {
-  display: none;
+  background: color-mix(in srgb, var(--ms-accent, #7c83ff) 14%, transparent);
+  border: 1px solid color-mix(in srgb, #7c83ff 65%, transparent);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 20%, transparent);
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transform-origin: 0 0;
 }
 .media-studio-canvas .react-flow__edges {
   position: absolute;
@@ -69,14 +87,36 @@ export const MEDIA_STUDIO_CSS = String.raw`
   overflow: visible;
   pointer-events: none;
 }
+/* xyflow's style.css ships rules for .react-flow__connectionline
+ * (position: absolute; width/height 100%; z-index: 1001; overflow: visible)
+ * -- but media-studio re-implements the base sheet locally instead of loading
+ * xyflow's, so without this rule the live "drag to connect" preview svg
+ * collapses to a 300x150 inline-replaced element glued to the top-left of the
+ * pane. The path is drawn with viewport-space coordinates relative to the
+ * pane origin, so any other layout puts it offscreen (or under a node) and
+ * the drag appears to produce no line at all. */
+.media-studio-canvas svg.react-flow__connectionline {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1001;
+  overflow: visible;
+  pointer-events: none;
+}
+.media-studio-canvas .react-flow__connection { pointer-events: none; }
 .media-studio-canvas .react-flow__edge { pointer-events: all; cursor: pointer; }
 .media-studio-canvas .react-flow__edge-path { stroke-linecap: round; }
 .media-studio-canvas .react-flow__edge-textpointer { cursor: text; }
 .media-studio-canvas .react-flow__connection-path {
-  stroke: var(--ms-accent, #7c83ff);
+  stroke: var(--ms-edge-stroke, #7c83ff);
   stroke-width: 2;
   stroke-dasharray: 5 4;
   fill: none;
+  /* The drag-preview is overlaid on whatever the pane background is, so we
+   * give it a glow rather than risk disappearing into the gradient. The
+   * glow follows the same stroke color so it stays cohesive across themes. */
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--ms-edge-stroke, #7c83ff) 55%, transparent));
 }
 .media-studio-canvas .react-flow__nodes {
   position: absolute;
@@ -97,9 +137,19 @@ export const MEDIA_STUDIO_CSS = String.raw`
 }
 .media-studio-canvas .react-flow__node:focus,
 .media-studio-canvas .react-flow__node:focus-visible { outline: none; }
-.media-studio-canvas .react-flow__nodesselection,
+/* xyflow renders a per-node wrapper (the .react-flow__nodesselection layer)
+ * and a tinted rectangle (.react-flow__nodesselection-rect) for each node
+ * that falls inside the marquee while it is being dragged (so the user can
+ * see what is about to be selected). The rect inherits the same tint as the
+ * marquee background; we just bring it up to our z-index stack so it does
+ * not disappear under the cards. */
+.media-studio-canvas .react-flow__nodesselection {
+  z-index: 7;
+}
 .media-studio-canvas .react-flow__nodesselection-rect {
-  display: none;
+  background: color-mix(in srgb, var(--ms-accent, #7c83ff) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ms-accent, #7c83ff) 65%, transparent);
+  border-radius: var(--ms-radius, 12px);
 }
 .media-studio-canvas .react-flow__node-toolbar {
   position: absolute;
@@ -142,6 +192,21 @@ export const MEDIA_STUDIO_CSS = String.raw`
   border-radius: 10px;
   box-shadow: var(--ms-shadow-md);
 }
+/* MiniMapWrap always renders the <MiniMap> (so React's hook tree is stable
+ * across renders and we never trip invariant #310) but only shows it when the
+ * user has toggled the minimap on. Hide the slot without unmounting it. */
+.media-studio-canvas .ms-minimap-slot {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+.media-studio-canvas .ms-minimap-slot[data-on="false"] {
+  display: none;
+}
+.media-studio-canvas .ms-minimap-slot[data-on="false"] .react-flow__minimap {
+  display: none;
+}
 .media-studio-canvas .react-flow__minimap svg { display: block; }
 /* xyflow's own stylesheet colors minimap nodes/mask through class rules that
  * fall back to its :root palette; the canvas doesn't load that sheet, so
@@ -176,6 +241,13 @@ body:not([data-ds-dark-theme]) .media-studio-canvas .react-flow__minimap-mask {
   --ms-fg-faint: var(--dsw-alias-label-tertiary, rgba(255,255,255,0.42));
   --ms-accent: var(--dsw-alias-interactive-bg-hover-accent, #7c83ff);
   --ms-accent-soft: rgba(124, 131, 255, 0.14);
+  /* Full-opacity stroke for the live "drag to connect" preview line. We
+   * deliberately do NOT reuse --ms-accent here: in dark mode that alias
+   * resolves to white-with-24%-alpha (#ffffff3d), a *background* hover tint
+   * that becomes nearly invisible when used as a stroke. --ms-edge-stroke
+   * picks a saturated brand blue (deepseek-400 in dark / deepseek-500 in
+   * light) so the dashed preview line stays legible in both themes. */
+  --ms-edge-stroke: var(--dsw-alias-brand-primary-new-colorprimary-new-color, #7c83ff);
   --ms-border: var(--dsw-alias-border-l2, rgba(255,255,255,0.11));
   --ms-border-strong: var(--dsw-alias-border-l4, rgba(255,255,255,0.24));
   /* Floating surfaces (menus / pills / view bar) read the host's popover
@@ -218,6 +290,37 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 /* ────────────────────────────────────────────────────────────────
    3. Toolbar (add row + live indicator)
    ──────────────────────────────────────────────────────────────── */
+/* Vertical "add a node" capsule dock — left-middle of the canvas (top-row
+ * add buttons moved here; version/status badge moved up into the project bar). */
+.ms-fab-dock {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 18;
+  pointer-events: none;
+}
+.ms-fab-dock-btn {
+  pointer-events: auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ms-bg2);
+  color: var(--ms-accent);
+  border: 1px solid var(--ms-border-strong);
+  box-shadow: var(--ms-shadow-sm);
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.ms-fab-dock-btn:hover { background: var(--ms-card-hi); transform: translateY(-1px) scale(1.06); }
+.ms-fab-dock-btn:active { transform: scale(0.95); }
 .ms-toolbar {
   flex: none;
   display: flex;
@@ -430,6 +533,9 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   box-shadow: var(--ms-shadow-sm);
   transition: box-shadow 0.16s ease, border-color 0.16s ease;
 }
+.media-card.ms-media-music {
+  aspect-ratio: 16 / 9;
+}
 .react-flow__node:hover .media-card { border-color: var(--ms-border-strong); box-shadow: var(--ms-shadow-md); }
 .media-card.has-result { background: #0b0d10; }
 .media-card .media-fill {
@@ -441,18 +547,75 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 .media-img { object-fit: cover; }
 .media-video { object-fit: contain; background: #000; }
+.media-video-slot { background:#000; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+.media-video-slot .media-lazy-hint { color:rgba(255,255,255,0.6); font-size:15px; }
+.media-lazy-hint { pointer-events:none; user-select:none; }
+
 
 .media-audio-fill {
   position: absolute;
   inset: 0;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
-  padding: 18px;
+  padding: 14px;
   background: radial-gradient(120% 120% at 50% 20%, rgba(16,185,129,0.16), transparent 65%),
     var(--ms-card);
 }
-.media-audio-fill audio { width: 100%; }
+.media-audio-fill audio { display: none; }
+
+.ms-audio-editor {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+.ms-audio-wave {
+  width: 100%;
+  flex: 1;
+  min-height: 56px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--ms-border);
+  cursor: pointer;
+}
+.ms-audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ms-audio-play {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  border: 1px solid var(--ms-border-strong);
+  background: var(--ms-panel-soft);
+  color: var(--ms-fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+.ms-audio-play:hover { background: var(--ms-accent); color:#0b0d12; }
+.ms-audio-scrub {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--ms-accent);
+}
+.ms-audio-time {
+  font: 600 11px/1 ui-monospace, Menlo, monospace;
+  color: var(--ms-fg-faint);
+  min-width: 32px;
+  text-align: right;
+}
+.ms-audio-err {
+  font-size: 10.5px;
+  color: var(--ms-fg-faint);
+  text-align: center;
+}
 
 .ms-placeholder {
   position: absolute;
@@ -545,8 +708,53 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .canvas-node.is-fixed .ms-doc-editor {
   flex: 1 1 auto;
   min-height: 0;
+  /* Fill the container height instead of auto-expanding. The container has
+     overflow:hidden, so content that exceeds the card height scrolls
+     internally rather than stretching the node infinitely. */
+  height: 100%;
+  overflow-y: auto;
 }
 .ms-doc-editor::placeholder { color: var(--ms-fg-faint); }
+/* Empty-content hint: paints the textarea border red and slots a small
+   warning chip below it when the canonical content field is empty.
+   The agent's contract says text/note nodes must carry non-empty
+   data.text / data.content; this UI makes a missed write immediately
+   visible instead of leaving a blank card behind. */
+.ms-doc-editor.is-empty {
+  background:
+    repeating-linear-gradient(
+      45deg,
+      rgba(239,68,68,0.04) 0px,
+      rgba(239,68,68,0.04) 8px,
+      transparent 8px,
+      transparent 16px
+    );
+}
+.ms-doc-editor.is-empty:focus {
+  background: transparent;
+}
+.ms-doc-empty-warn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 12px 10px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  background: rgba(239,68,68,0.10);
+  border: 1px solid rgba(239,68,68,0.35);
+  color: rgba(252,165,165,0.95);
+  font-size: 10.5px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.ms-doc-empty-icon {
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.ms-doc-empty-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
 .ms-doc-running {
   display: inline-flex;
   align-items: center;
@@ -669,6 +877,44 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .canvas-card-wrap:hover .ms-add-side,
 .react-flow__node.selected .ms-add-side { opacity: 1; }
 .canvas-card-wrap:hover .ms-add-side.is-connected:hover { opacity: 1; }
+
+/* Refresh button — positioned at the bottom-center, half-poking below the
+ * card so it reads as a floating pill. 26px tall + 10px gap = bottom:-36px,
+ * matching the side "+" buttons' 36px offset. */
+.ms-refresh-btn {
+  position: absolute;
+  bottom: -36px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 12;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.32);
+  background: transparent;
+  color: var(--ms-accent, #7c83ff);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.16s ease, transform 0.16s ease, background 0.14s ease, border-color 0.14s ease;
+}
+.canvas-card-wrap:hover .ms-refresh-btn,
+.react-flow__node.selected .ms-refresh-btn {
+  opacity: 1;
+}
+.ms-refresh-btn:hover {
+  background: var(--ms-accent, #7c83ff);
+  color: #0c0e14;
+  border-color: transparent;
+  transform: translateX(-50%) scale(1.12);
+}
+.ms-refresh-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
 
 /* ────────────────────────────────────────────────────────────────
    9. Handles (visible on hover so drag-to-connect stays discoverable)
@@ -943,6 +1189,69 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .lightbox-download:hover { background: var(--ms-panel-soft); color: #fff; }
 
 body.media-studio-previewing { overflow: hidden; }
+
+/* ────────────────────────────────────────────────────────────────
+    14. Clear-canvas confirmation dialog
+    ──────────────────────────────────────────────────────────────── */
+.ms-clear-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  background: rgba(6, 7, 10, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: ms-fade-in 0.12s ease-out;
+}
+.ms-clear-confirm-dialog {
+  width: 340px;
+  padding: 20px 22px 18px;
+  background: var(--ms-panel);
+  border: 1px solid var(--ms-border-strong);
+  border-radius: 16px;
+  box-shadow: var(--ms-shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ms-clear-confirm-title {
+  font: 600 14px/1.3 system-ui, sans-serif;
+  color: var(--ms-fg);
+}
+.ms-clear-confirm-body {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ms-fg-dim);
+}
+.ms-clear-confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+.ms-btn-cancel,
+.ms-btn-danger {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font: 600 12.5px/1 system-ui, sans-serif;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.ms-btn-cancel {
+  background: transparent;
+  border: 1px solid var(--ms-border);
+  color: var(--ms-fg-dim);
+}
+.ms-btn-cancel:hover { background: var(--ms-panel-soft); color: var(--ms-fg); }
+.ms-btn-danger {
+  background: rgba(220, 38, 38, 0.15);
+  border: 1px solid rgba(220, 38, 38, 0.4);
+  color: #fca5a5;
+}
+.ms-btn-danger:hover { background: rgba(220, 38, 38, 0.28); color: #fecaca; }
 `
 
 let injected = false

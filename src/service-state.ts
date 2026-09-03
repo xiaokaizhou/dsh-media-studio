@@ -1,5 +1,5 @@
-import type { MediaStudioScope, MediaStudioSettingsShape } from './settings'
 import type { CanvasStore } from './canvas-store'
+import type { ProjectStore } from './project-store'
 import type { ServerResponse } from 'node:http'
 
 /**
@@ -13,20 +13,32 @@ import type { ServerResponse } from 'node:http'
  * erased), which silently disabled the whole plugin via fail-soft. A
  * module-level singleton sidesteps the Proxy entirely and is safe for a
  * single-instance plugin.
+ *
+ * After the multimodal refactor we no longer hold `ctx.llm`,
+ * `scope.getSettings()` for a mediaStudio namespace, or any media-provider
+ * configuration. The plugin's only persistent state is the canvas store
+ * + SSE-client registry.
  */
 export interface MediaStudioHandles {
-  scope: MediaStudioScope
-  getSettings(): MediaStudioSettingsShape
-  /** Resolved harness LLM reference (may be undefined if no adapter configured). */
-  llm: unknown
   /** Resolved absolute workspace directory. */
   workspaceRoot: string
+  /**
+   * Extra absolute roots the media-file proxy may serve from, on top of
+   * `workspaceRoot` (config `mediaRoots`, `~` already expanded). Optional so
+   * call sites that predate the setting keep compiling; an absent or empty
+   * list means "workspaceRoot only", i.e. the original behaviour.
+   */
+  mediaRoots?: string[]
   /** Canvas id every tool falls back to when none is supplied. */
   defaultCanvasId: string
   /** Server-side canvas state (atomic, persisted). */
   canvasStore: CanvasStore
   /** SSE client registry — the canvas tab's EventSource lands here. */
   sseClients: Set<ServerResponse>
+  /** Multi-project registry (added M0). Absent during transitional boots. */
+  projectStore?: ProjectStore
+  /** SSE client registry for project-level events (registry/open/delete). */
+  projectSseClients?: Set<ServerResponse>
 }
 
 let handles: MediaStudioHandles | null = null

@@ -1,4 +1,4 @@
-// Canvas — franklin-canvas-inspired editor tab for media-studio.
+// Canvas — media-studio editor tab.
 //
 // The render shape (nodes + edges) is server-authoritative: `useCanvasState`
 // subscribes to the host SSE stream; every agent `canvas_graph_patch` lands
@@ -6,8 +6,7 @@
 // local-optimistic + committed through POST /api/media-studio/canvas/patch,
 // which persists + broadcasts back (the same path the agent tools use).
 //
-// Interaction model ported from franklin-canvas:
-//
+// Interaction model:
 //   • Right-click / double-click on empty space → floating "add node" menu.
 //   • Drag a connection off a node and release on empty space → "add a
 //     connected node" menu at the cursor.
@@ -60,7 +59,11 @@ import {
   type OpenConnectOpts,
 } from './canvas-api'
 import { injectMediaStudioStyles } from './canvas-styles'
-import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn } from './icons'
+import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn, IconEraser, IconX } from './icons'
+import { apiRegisterAsset, type AssetKind } from './assets-api'
+import { resolveLang, translate } from './i18n'
+import { recordRevision, setController, latestRevision } from './revision-bus'
+import { subscribeFull, subscribeConn } from './canvas-bus'
 
 export interface CanvasProps {
   /** Canvas id the tab renders + subscribes to (shared with the tools). */
@@ -117,34 +120,100 @@ function restoreOps(target: MsSnapshot): MsOp[] {
 
 // ── Projection host-graph ↔ React Flow ───────────────────────────────────
 
+function projectNodeOne(n: SNode): FlowNode {
+  const isDoc = n.type === 'text' || n.type === 'note'
+  return {
+    id: n.id,
+    type: n.type,
+    position: n.position ?? { x: 0, y: 0 },
+    // Restrict drag origin to .ms-drag-area for text/note nodes so the
+    // resize handle (outside that element) never triggers a node drag.
+    ...(isDoc ? { dragHandle: '.ms-drag-area' } : {}),
+    data: {
+      kind: n.type,
+      label: n.label,
+      prompt: n.data.prompt,
+      model: n.data.model,
+      resultUrl: n.data.resultUrl,
+      status: n.data.status,
+      errorMsg: n.data.errorMsg,
+      text: n.data.text,
+      content: n.data.content,
+      // Text/note cards persist their user-resized height in data.height
+      // (updateNode). Carry it through the projection so an SSE snapshot —
+      // including the echo of the very patch that stored it — doesn't drop
+      // it and collapse the card back to its default size.
+      height: n.data.height,
+    },
+  }
+}
+
 function projectNodes(graph: SGraph): FlowNode[] {
-  return graph.nodes.map((n) => {
-    const isDoc = n.type === 'text' || n.type === 'note'
-    return {
-      id: n.id,
-      type: n.type,
-      position: n.position ?? { x: 0, y: 0 },
-      // Restrict drag origin to .ms-drag-area for text/note nodes so the
-      // resize handle (outside that element) never triggers a node drag.
-      ...(isDoc ? { dragHandle: '.ms-drag-area' } : {}),
-      data: {
-        kind: n.type,
-        label: n.label,
-        prompt: n.data.prompt,
-        model: n.data.model,
-        resultUrl: n.data.resultUrl,
-        status: n.data.status,
-        errorMsg: n.data.errorMsg,
-        text: n.data.text,
-        content: n.data.content,
-        // Text/note cards persist their user-resized height in data.height
-        // (updateNode). Carry it through the projection so an SSE snapshot —
-        // including the echo of the very patch that stored it — doesn't drop
-        // it and collapse the card back to its default size.
-        height: n.data.height,
-      },
+  return graph.nodes.map((n) => projectNodeOne(n))
+}
+
+/** Content token for a projected node — unchanged nodes keep their original
+ *  object reference so memoized card components skip re-rendering. */
+function projectedNodeToken(n: SNode): string {
+  const p = n.position
+  return JSON.stringify([n.id, n.type, n.label, p ? [p.x, p.y] : null, n.data])
+}
+
+/**
+ * Merge an incoming graph into the current flow nodes, **reusing** existing
+ * node objects whose content is unchanged. Per-version SSE updates then only
+ * re-render the cards that actually changed instead of remounting the whole
+ * canvas — the main source of UI-wide jank on large canvases.
+ */
+function mergeNodes(
+  prev: FlowNode[],
+  graph: SGraph,
+  tokenCache: Map<string, string>,
+): FlowNode[] {
+  if (prev.length === 0 || graph.nodes.length === 0) {
+    tokenCache.clear()
+    return projectNodes(graph)
+  }
+  const prevById = new Map(prev.map((n) => [n.id, n]))
+  const out: FlowNode[] = []
+  for (const n of graph.nodes) {
+    const existing = prevById.get(n.id)
+    const token = projectedNodeToken(n)
+    const cached = tokenCache.get(n.id)
+    if (existing && cached === token) {
+      out.push(existing)
+      continue
     }
-  })
+    const projected = projectNodeOne(n)
+    tokenCache.set(n.id, token)
+    out.push(projected)
+  }
+  // Drop tokens for ids that disappeared.
+  for (const id of [...tokenCache.keys()]) {
+    if (!prevById.has(id)) tokenCache.delete(id)
+  }
+  return out
+}
+
+function mergeEdges(prev: FlowEdge[], edges: SGraph['edges']): FlowEdge[] {
+  const byId = new Map(prev.map((e) => [e.id, e]))
+  const out: FlowEdge[] = []
+  for (const e of edges) {
+    const existing = byId.get(e.id)
+    if (existing && existing.source === e.source && existing.target === e.target) {
+      out.push(existing)
+    } else {
+      out.push({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        sourceHandle: `${e.source}-out`,
+        targetHandle: `${e.target}-in`,
+        type: 'flow',
+      })
+    }
+  }
+  return out
 }
 
 function projectEdges(graph: SGraph): FlowEdge[] {
@@ -228,8 +297,31 @@ function freeSlot(occupied: Array<{ x: number; y: number }>): { x: number; y: nu
   return { x: 60 + (occupied.length % 8) * 300, y: 60 + Math.floor(occupied.length / 8) * 300 }
 }
 
-// ── Custom edge (bezier gradient) ────────────────────────────────────────
+/**
+ * Content-fit height for text/note cards (used by the auto-arrange wand):
+ * title row + textarea scrollHeight + paddings, capped so cards never grow
+ * without bound. Returns null while the card isn't mounted yet.
+ */
+function estimateDocHeight(id: string, cardW: number): number | null {
+  let el: HTMLElement | null = null
+  try {
+    el = document.querySelector(`[data-ms-id="${CSS.escape(id)}"]`)
+  } catch { /* unqueryable id — skip */ }
+  if (!el) return null
+  const titleRow = el.querySelector('.ms-title-row') as HTMLElement | null
+  const editor = el.querySelector('.ms-doc-editor') as HTMLTextAreaElement | null
+  const warn = el.querySelector('.ms-doc-empty-warn') as HTMLElement | null
+  const titleH = titleRow?.offsetHeight ?? 30
+  const editorH = editor ? editor.scrollHeight : 0
+  const warnH = warn ? warn.offsetHeight + 6 : 0
+  const pad = 14
+  const minH = 104
+  const cap = Math.max(minH, Math.min(520, Math.round(cardW * 1.9)))
+  const raw = titleH + editorH + warnH + pad
+  return Math.max(minH, Math.min(cap, Math.round(raw)))
+}
 
+// ── Custom edge (bezier gradient) ────────────────────────────────────────
 function FlowEdgeView(props: EdgeProps) {
   const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, selected, style } = props
   const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
@@ -265,31 +357,16 @@ function useCanvasState(canvasId: string): { snap: MsSnapshot | null; conn: Conn
   const [snap, setSnap] = useState<MsSnapshot | null>(null)
   const [conn, setConn] = useState<ConnState>('connecting')
 
+  // Subscribe through the shared canvas-bus. CanvasView and LiveBadge both
+  // need this stream — opening two EventSources against the same endpoint
+  // doubled the server-side fan-out and the browser-side JSON parsing
+  // cost on every patch, and was a measurable source of UI jank from
+  // *opening* an empty canvas tab. The bus keeps a single connection open
+  // until the last subscriber unsubscribes.
   useEffect(() => {
-    const url = `/api/media-studio/canvas/sse?canvasId=${encodeURIComponent(canvasId)}`
-    let es: EventSource
-    try {
-      es = new EventSource(url)
-    } catch (err) {
-      console.error('[media-studio] failed to open EventSource:', err)
-      setConn('reconnecting')
-      return () => {}
-    }
-    es.addEventListener('open', () => setConn('open'))
-    es.addEventListener('canvas-patch', (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data)
-        if (data?.type === 'canvas-patch' && data.graph) {
-          setSnap({ graph: data.graph, version: data.version ?? 0 })
-          setConn('open')
-        }
-      } catch { /* ignore malformed */ }
-    })
-    es.addEventListener('error', () => {
-      console.warn('[media-studio] canvas SSE error, will retry')
-      setConn('reconnecting')
-    })
-    return () => es.close()
+    const offSnap = subscribeFull(canvasId, (s) => setSnap(s))
+    const offConn = subscribeConn(canvasId, setConn)
+    return () => { offSnap(); offConn() }
   }, [canvasId])
   return { snap, conn }
 }
@@ -321,19 +398,34 @@ function CanvasView({ canvasId }: CanvasProps) {
   const lastLocalPostRef = useRef(0)
   const didInitialFitRef = useRef(false)
   const lastPanTargetRef = useRef(0)
+  // M1 — per-project camera memory. When the tab opens a project whose
+  // viewport was persisted, restore it and briefly suppress the automatic
+  // "frame the content" fits so they don't fight the remembered camera.
+  const suppressAutoFitRef = useRef(false)
+  const previewingRef = useRef(false)
+  const nodeTokenCacheRef = useRef(new Map<string, string>())
+  const lastFitStructRef = useRef('')
+  const vpKey = `dsh-media-studio:viewport:${canvasId}`
 
-  // Adaptive card width from the pane width — big franklin cards that still
-  // fit the DSH sidebar.
+  // Adaptive card width from the pane width — big cards that still
+  // fit the DSH sidebar.  Node dims are hard-capped at 1.5× the smaller
+  // viewport dimension (updated reactively via a ref so we avoid a stale
+  // dependency cycle on the state setter).
   const [cardW, setCardW] = useState(240)
+  const maxCardDimRef = useRef(900)
   const measureRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     const el = measureRef.current?.parentElement ?? null
     if (!el) return
     const measure = () => {
       const w = el.clientWidth
+      const h = el.clientHeight
+      const vpMin = Math.min(w, h)
+      maxCardDimRef.current = Math.round(vpMin * 1.5)
       setCardW((prev) => {
         const target = Math.max(200, Math.min(280, w - 84))
-        return Math.abs(prev - target) > 1 ? target : prev
+        const capped = Math.min(target, maxCardDimRef.current)
+        return Math.abs(prev - capped) > 1 ? capped : prev
       })
     }
     measure()
@@ -341,6 +433,58 @@ function CanvasView({ canvasId }: CanvasProps) {
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
+
+  // ── Per-project viewport memory (M1) ────────────────────────────────────
+  // Restore the remembered camera on open (if any) and persist camera
+  // changes back, debounced, keyed by project/canvas id.
+  useEffect(() => {
+    suppressAutoFitRef.current = false
+    let raw: string | null = null
+    try {
+      raw = localStorage.getItem(vpKey)
+    } catch { /* ignore */ }
+    if (!raw) return
+    try {
+      const vp = JSON.parse(raw) as { x: number; y: number; zoom: number }
+      if (Number.isFinite(vp.x) && Number.isFinite(vp.y) && vp.zoom >= 0.2 && vp.zoom <= 2.5) {
+        suppressAutoFitRef.current = true
+        requestAnimationFrame(() => {
+          try { rf.setViewport({ x: vp.x, y: vp.y, zoom: vp.zoom }, { duration: 0 }) } catch { /* ignore */ }
+        })
+        // Let the opening snapshots land; after this window auto-fits resume.
+        const t = setTimeout(() => { suppressAutoFitRef.current = false }, 900)
+        return () => clearTimeout(t)
+      }
+    } catch { /* ignore */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vpKey])
+
+  // Viewport persistence — drives the per-project camera memory. We deliberately
+  // do NOT subscribe to `useFlowStore(s => s.transform)`: xyflow mutates that
+  // tuple on every gesture frame (during pan/zoom), which would re-render the
+  // entire CanvasView subtree — every NodeShell, every AddSideButton, the
+  // ViewBar, the FAB dock, the SSE effect, … — on every pan tick. With a
+  // touchpad / trackpad that fires ~120 events/sec, the canvas tab on screen
+  // was the dominant source of UI jank in the host shell.
+  //
+  // Instead, react to ReactFlow's `onMove` callback (fires only when the
+  // viewport actually settles after a user gesture or programmatic move) and
+  // debounce the localStorage write ourselves. The callback also gives us a
+  // direct handle to gate writes while the camera is mid-gesture.
+  const lastPersistedVpRef = useRef<[number, number, number] | null>(null)
+  const vpPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const onMoveViewport = useCallback((_event: unknown, viewport: { x: number; y: number; zoom: number }) => {
+    const { x, y, zoom } = viewport
+    const prev = lastPersistedVpRef.current
+    if (prev && prev[0] === x && prev[1] === y && prev[2] === zoom) return
+    lastPersistedVpRef.current = [x, y, zoom]
+    if (vpPersistTimerRef.current) clearTimeout(vpPersistTimerRef.current)
+    vpPersistTimerRef.current = setTimeout(() => {
+      try {
+        localStorage.setItem(vpKey, JSON.stringify({ x: Math.round(x), y: Math.round(y), zoom: Math.round(zoom * 100) / 100 }))
+      } catch { /* ignore */ }
+    }, 450)
+  }, [vpKey])
 
   // ── History (content snapshots, 500ms coalescing) ───────────────────────
   const appliedRef = useRef<MsSnapshot | null>(null)
@@ -386,6 +530,7 @@ function CanvasView({ canvasId }: CanvasProps) {
   /** Optimistic mutation + history snapshot + host commit (UI's one funnel). */
   const mutate = useCallback((ops: MsOp[], then?: () => void) => {
     if (ops.length === 0) { then?.(); return }
+    previewingRef.current = false // user is editing → leave playback preview
     const cur = appliedRef.current
     if (cur) queueHistory(cur)
     const next = applyLocalOps(nodesRef.current, edgesRef.current, ops)
@@ -409,18 +554,42 @@ function CanvasView({ canvasId }: CanvasProps) {
     }
     const prev = appliedRef.current
     const isFirst = prev === null
-    appliedRef.current = msSnapshotOf(snap.graph, snap.version)
-    if (!isFirst && graphToken(prev.graph) === graphToken(snap.graph)) return
+    // Version dedupe at the useEffect layer too — the SSE handler already
+    // dedupes incoming `snap` updates, but the same version can also be
+    // re-applied if a stale effect re-runs (React 18 strict mode, devtools
+    // re-mount, etc.). Skip the work entirely.
+    if (!isFirst && prev.version === snap.version) return
+    const nextSnap = msSnapshotOf(snap.graph, snap.version)
+    appliedRef.current = nextSnap
+    // Revision bus (M3b): record every accepted version for the history
+    // dropdown even while a playback preview is on screen. `nextSnap` is a
+    // fresh object never mutated afterwards — the bus stores it as-is
+    // (no second deep clone; deep clones on every patch were a jank source).
+    recordRevision(canvasId, nextSnap)
+    if (previewingRef.current) return // playback owns the screen for now
 
     if (!isFirst) queueHistory(prev)
-    setNodes(projectNodes(snap.graph))
-    setEdges(projectEdges(snap.graph))
+    // Reference-preserving merge: only cards whose content actually changed
+    // are replaced, so memoized node components skip re-renders and the
+    // whole canvas no longer remounts on every version tick.
+    setNodes((cur) => mergeNodes(cur, snap.graph, nodeTokenCacheRef.current))
+    setEdges((cur) => mergeEdges(cur, snap.graph.edges))
 
-    if (snap.version !== lastPanTargetRef.current) {
+    // Structural change → softly frame the new content. Purely data-level
+    // updates (status toggles while media streams in) keep the camera put.
+    const structToken =
+      snap.graph.nodes.map((n) => `${n.id}@${n.position?.x ?? 0},${n.position?.y ?? 0}`).sort().join('|')
+      + '#'
+      + snap.graph.edges.map((e) => `${e.source}->${e.target}`).sort().join('|')
+    if (snap.version !== lastPanTargetRef.current || structToken !== lastFitStructRef.current) {
       lastPanTargetRef.current = snap.version
+      lastFitStructRef.current = structToken
       // Softly frame agent-written content — never right after the user's own
-      // edit (they own the camera at that point).
-      if (Date.now() - lastLocalPostRef.current > 700) {
+      // edit (they own the camera at that point) nor during the opening
+      // viewport restore window.
+      if (suppressAutoFitRef.current) {
+        /* remembered camera owns the moment — no auto fit */
+      } else if (Date.now() - lastLocalPostRef.current > 700) {
         requestAnimationFrame(() => {
           try { rf.fitView({ padding: 0.18, duration: 220, maxZoom: 1 }) } catch { /* ignore */ }
         })
@@ -429,10 +598,36 @@ function CanvasView({ canvasId }: CanvasProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap])
 
-  // Initial fit on the first non-empty snapshot.
+  // Revision-bus controller (M3b): the top-bar version badge plays history by
+  // previewing a recorded snapshot locally (SSE echo is suppressed while a
+  // preview is on screen); calling with null exits back to the live canvas.
+  useEffect(() => {
+    setController(canvasId, (snapOrNull) => {
+      previewingRef.current = !!snapOrNull
+      if (snapOrNull) {
+        setNodes(projectNodes(snapOrNull.graph))
+        setEdges(projectEdges(snapOrNull.graph))
+      } else {
+        const latest = latestRevision(canvasId)
+        if (latest) {
+          setNodes(projectNodes(latest.snap.graph))
+          setEdges(projectEdges(latest.snap.graph))
+        }
+      }
+    })
+    return () => {
+      setController(canvasId, null)
+      previewingRef.current = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasId])
+
+  // Initial fit on the first non-empty snapshot (skipped when a remembered
+  // viewport is being restored).
   useEffect(() => {
     if (!snap || didInitialFitRef.current) return
     if (snap.graph.nodes.length === 0) return
+    if (suppressAutoFitRef.current) return
     didInitialFitRef.current = true
     requestAnimationFrame(() => {
       try { rf.fitView({ padding: 0.2, duration: 250 }) } catch { /* ignore */ }
@@ -441,7 +636,15 @@ function CanvasView({ canvasId }: CanvasProps) {
   }, [snap])
 
   // ── Gestures ────────────────────────────────────────────────────────────
+  // Only the resize-grip gesture may persist node heights. React Flow also
+  // fires 'dimensions' events on every auto-measure/layout pass (and after
+  // every SSE echo), so committing all of them would spam versions and lock
+  // doc cards into whatever height the transient measure produced — the
+  // "version/high rockets on restart" bug. We mark ids while ch.resizing is
+  // true and persist exactly the final height of that gesture.
+  const resizingIdsRef = useRef<Set<string>>(new Set())
   const onNodesChange = useCallback((changes: NodeChange[]) => {
+    previewingRef.current = false
     let draggingNow = false
     const commits: Array<{ id: string; position: { x: number; y: number } }> = []
     const dimCommits: Array<{ id: string; height: number }> = []
@@ -456,8 +659,13 @@ function CanvasView({ canvasId }: CanvasProps) {
       if (ch.type === 'select' && !draggingNow) {
         queueMicrotask(() => { interactingRef.current = false })
       }
-      if (ch.type === 'dimensions' && !ch.resizing && ch.dimensions) {
-        dimCommits.push({ id: ch.id, height: ch.dimensions.height })
+      if (ch.type === 'dimensions') {
+        if (ch.resizing) {
+          resizingIdsRef.current.add(ch.id)
+        } else if (ch.dimensions && resizingIdsRef.current.has(ch.id)) {
+          resizingIdsRef.current.delete(ch.id)
+          dimCommits.push({ id: ch.id, height: ch.dimensions.height })
+        }
       }
     }
     onNodesChangeBase(changes as never)
@@ -470,7 +678,7 @@ function CanvasView({ canvasId }: CanvasProps) {
     if (dimCommits.length > 0) {
       const cur = appliedRef.current
       if (cur) queueHistory(cur)
-      postLocal(dimCommits.map((c) => ({ op: 'updateNode', id: c.id, data: { height: c.height } })))
+      postLocal(dimCommits.map((c) => ({ op: 'updateNode', id: c.id, data: { height: Math.round(c.height) } })))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onNodesChangeBase, postLocal, queueHistory])
@@ -682,11 +890,29 @@ function CanvasView({ canvasId }: CanvasProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutate, nextId, rf])
 
-  // Auto-arrange: columns by edge depth (franklin's view-bar wand).
+  // Auto-arrange: columns by edge depth (view-bar wand). Also
+  // auto-wraps text/note cards to their content (capped) before layout, so
+  // the result reads like a tidy storyboard instead of overgrown boxes.
   const autoArrange = useCallback(() => {
+    previewingRef.current = false
     const flowNodes = rf.getNodes()
     const flowEdges = rf.getEdges()
     if (flowNodes.length === 0) return
+
+    // ── doc height auto-fit (text/note) ────────────────────────────────
+    const estHeights = new Map<string, number>()
+    const heightOps: MsOp[] = []
+    for (const n of flowNodes) {
+      if (n.type !== 'text' && n.type !== 'note') continue
+      const h = estimateDocHeight(n.id, cardW)
+      if (!h) continue
+      const current = n.measured?.height ?? (n.data as { height?: unknown }).height
+      if (typeof current !== 'number' || Math.abs(current - h) > 4) {
+        estHeights.set(n.id, h)
+        heightOps.push({ op: 'updateNode', id: n.id, data: { height: h } })
+      }
+    }
+
     const inMap = new Map<string, string[]>()
     const outMap = new Map<string, string[]>()
     for (const e of flowEdges) {
@@ -723,38 +949,129 @@ function CanvasView({ canvasId }: CanvasProps) {
       let y = 60
       for (const id of ids) {
         const n = flowNodes.find((x) => x.id === id)
-        const h = n?.measured?.height ?? 160
+        const est = estHeights.get(id)
+        const h = est ?? n?.measured?.height ?? 160
         moves.push({ op: 'moveNode', id, position: { x: 60 + d * colPitch, y } })
         y += h + 44
       }
     }
-    const cur = appliedRef.current
-    if (cur) queueHistory(cur)
-    postLocal(moves)
+    if (moves.length + heightOps.length === 0) return
+    // Optimistic local apply (like every other user op): the canvas moves
+    // immediately instead of waiting for the SSE echo — and any failure
+    // surfaces in the console instead of silently "doing nothing".
+    try {
+      mutate([...heightOps, ...moves])
+    } catch (e) {
+      console.error('[media-studio] autoArrange failed:', (e as Error).message)
+      return
+    }
     setTimeout(() => { try { rf.fitView({ padding: 0.15, duration: 360 }) } catch { /* ignore */ } }, 140)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rf, cardW, postLocal, queueHistory])
+  }, [rf, cardW, mutate])
+
+  // ── Save-to-library dialog (M2) ─────────────────────────────────────────
+  const [saveDlg, setSaveDlg] = useState<{ id: string; type: NodeKind; label: string } | null>(null)
+  const openSaveToLibrary = useCallback((id: string) => {
+    const n = nodesRef.current.find((x) => x.id === id)
+    if (!n) return
+    const t = n.type as NodeKind
+    if (t !== 'image' && t !== 'video' && t !== 'music') return
+    setSaveDlg({ id, type: t, label: (n.data as { label?: string }).label ?? '' })
+  }, [])
+
+  // ── Connectivity maps ───────────────────────────────────────────────────
+  // Rebuild once per edges reference change (which, thanks to mergeEdges'
+  // reference-preserving merge above, only happens on actual SSE graph
+  // updates — never on viewport gestures). Stable Set refs are shipped to
+  // AddSideButton / RefreshSideButton through the canvas context so they
+  // skip the per-gesture `useStore(s => s.edges.some(...))` selector that
+  // was the dominant source of UI jank when the canvas tab was on screen.
+  const connMaps = useMemo(() => {
+    const right = new Set<string>()
+    const left = new Set<string>()
+    for (const e of edges) {
+      right.add(e.source)
+      left.add(e.target)
+    }
+    return { right, left }
+  }, [edges])
 
   // ── API for node components ─────────────────────────────────────────────
   const api = useMemo(() => ({
     canvasId,
     cardW,
     openConnectMenu,
+    saveToLibraryNode: openSaveToLibrary,
     deleteNode: (id: string) => mutate([{ op: 'deleteNode', id }]),
     renameNode: (id: string, label: string) => mutate([{ op: 'renameNode', id, label }]),
     patchData: (id: string, data: Record<string, unknown>) => mutate([{ op: 'updateNode', id, data }]),
     post: postLocal,
+    edgesRight: connMaps.right,
+    edgesLeft: connMaps.left,
+    hasUpstreamById: connMaps.left,
+    refreshNode: async (id: string) => {
+      // Optimistically set status to 'running' immediately so the user sees
+      // feedback before the (potentially long) generation completes. The SSE
+      // broadcast from the server will later reconcile the final state.
+      mutate([{ op: 'updateNode', id, data: { status: 'running' as const } }])
+
+      // Safety net: if the server never responds (hang, network issue) the
+      // SSE 'done'/'error' broadcast will still update the node — but if
+      // SSE is also broken we need a client-side timeout to avoid the
+      // node being stuck on 'running' forever. 120 s is well above normal
+      // generation latency (10–60 s for images, up to 90 s for video).
+      const timeoutHandle = setTimeout(() => {
+        console.warn('[media-studio] refreshNode: timeout, forcing status=idle')
+        mutate([{ op: 'updateNode', id, data: { status: 'idle' as const, errorMsg: 'Refresh timed out' } }])
+      }, 120_000)
+
+      try {
+        const res = await fetch('/api/media-studio/canvas/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ canvasId, nodeId: id }),
+        })
+        clearTimeout(timeoutHandle)
+        if (!res.ok) {
+          const txt = await res.text().catch(() => '')
+          console.error('[media-studio] refresh failed:', res.status, txt)
+          mutate([{ op: 'updateNode', id, data: { status: 'idle' as const, errorMsg: txt } }])
+          return
+        }
+        const json = await res.json()
+        if (!json.ok) {
+          // Server reported a known failure (no upstream, not-supported, etc.)
+          // — surface it and skip the 'wait for SSE' path.
+          mutate([{ op: 'updateNode', id, data: { status: 'error' as const, errorMsg: json.message || json.code || 'Refresh failed' } }])
+          return
+        }
+        // SSE will reconcile the final state (done + resultUrl).
+      } catch (e) {
+        clearTimeout(timeoutHandle)
+        console.error('[media-studio] refresh error:', (e as Error).message)
+        mutate([{ op: 'updateNode', id, data: { status: 'error' as const, errorMsg: (e as Error).message } }])
+      }
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [canvasId, cardW, openConnectMenu, mutate, postLocal])
+  }), [canvasId, cardW, openConnectMenu, mutate, postLocal, connMaps])
+
+  // ── Clear-canvas confirmation ───────────────────────────────────────────
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
+  const doClearCanvas = useCallback(() => {
+    previewingRef.current = false
+    if (nodesRef.current.length === 0) return
+    const cur = appliedRef.current
+    if (cur) queueHistory(cur)
+    // Local-optimistic clear — no history push on the SSE ack so we don't
+    // double-record the empty state. SSE will reconcile anyway.
+    setNodes([])
+    setEdges([])
+    appliedRef.current = null
+    postLocal(nodesRef.current.map((n) => ({ op: 'deleteNode' as const, id: n.id })))
+  }, [queueHistory, postLocal])
 
   return (
     <div className="media-studio-canvas" style={{ width: '100%', height: '100%' }}>
-      <Toolbar
-        onAdd={onToolbarAdd}
-        version={snap?.version ?? 0}
-        conn={conn}
-        count={nodes.length}
-      />
       <div
         className="ms-stage"
         ref={measureRef}
@@ -773,6 +1090,7 @@ function CanvasView({ canvasId }: CanvasProps) {
             onConnectEnd={onConnectEnd}
             onPaneContextMenu={onPaneContextMenu}
             onDoubleClick={onPaneDoubleClick}
+            onMove={onMoveViewport}
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
             defaultEdgeOptions={{ type: 'flow' }}
@@ -787,7 +1105,17 @@ function CanvasView({ canvasId }: CanvasProps) {
             zoomOnPinch
             zoomActivationKeyCode={['Meta', 'Control']}
             panOnDrag
+            // Box / marquee selection — parity. Bare drag
+            // pans the viewport; holding Cmd (Mac) / Ctrl (Win) while
+            // dragging on empty pane starts a box selection. Shift + click
+            // adds nodes to the existing selection (xyflow default
+            // multiSelectionKeyCode). selectNodesOnDrag={false} prevents the
+            // click-drag-on-card gesture from also being interpreted as a
+            // node-drag-AND-select — we want only the explicit marquee path
+            // to change selection state, so the Ctrl-drag feedback stays
+            // unambiguous.
             selectionOnDrag={false}
+            selectionKeyCode={['Meta', 'Control']}
             selectNodesOnDrag={false}
             deleteKeyCode={null as never}
             style={{ background: 'transparent' }}
@@ -803,15 +1131,77 @@ function CanvasView({ canvasId }: CanvasProps) {
 
           {nodes.length === 0 && <EmptyHint conn={conn} />}
 
+          {/* Vertical "add a node" capsule dock — left-middle of the canvas. */}
+          <div className="ms-fab-dock" role="toolbar" aria-label="Add a node">
+            {CREATE_ORDER.map((kind) => {
+              const meta = NODE_CATALOG.find((m) => m.type === kind)!
+              const Icon = meta.Icon
+              return (
+                <button
+                  key={kind}
+                  type="button"
+                  className="ms-fab-dock-btn"
+                  onClick={() => onToolbarAdd(kind)}
+                  title={`${meta.label} · ${meta.desc}`}
+                  aria-label={`Add ${meta.label} node`}
+                >
+                  <Icon size={17} strokeWidth={1.8} />
+                </button>
+              )
+            })}
+          </div>
+
           {menu && <CreateMenu menu={menu} onClose={dismissMenu} onPick={onPickCreate} />}
 
           <ViewBar
             autoArrange={autoArrange}
             minimapOn={prefs.minimap}
             onToggleMinimap={toggleMinimap}
+            onClearCanvas={() => setClearConfirmOpen(true)}
           />
+
+          {clearConfirmOpen && (
+            <div className="ms-clear-confirm-backdrop" onClick={() => setClearConfirmOpen(false)}>
+              <div
+                className="ms-clear-confirm-dialog"
+                role="alertdialog"
+                aria-modal="true"
+                aria-label="Clear canvas"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="ms-clear-confirm-title">Clear canvas?</div>
+                <div className="ms-clear-confirm-body">
+                  This will delete all nodes and edges. This action cannot be undone.
+                </div>
+                <div className="ms-clear-confirm-actions">
+                  <button
+                    type="button"
+                    className="ms-btn-cancel"
+                    onClick={() => setClearConfirmOpen(false)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="ms-btn-danger"
+                    onClick={() => {
+                      setClearConfirmOpen(false)
+                      doClearCanvas()
+                    }}
+                  >
+                    Clear all
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </MediaCanvasContext.Provider>
       </div>
+
+      {saveDlg && createPortal(
+        <SaveToLibraryDialog canvasId={canvasId} node={saveDlg} onClose={() => setSaveDlg(null)} />,
+        document.body,
+      )}
     </div>
   )
 }
@@ -850,49 +1240,88 @@ function usePrefsVersion(): number {
 
 function MiniMapWrap() {
   usePrefsVersion()
+  // Only mount the <MiniMap> when the user has toggled it on. MiniMap brings
+  // a continuous maintenance cost (its internal `useStore` subscriptions to
+  // viewport/nodes/edges fire on every store dispatch, plus d3-zoom attached
+  // to its SVG, plus an SVG with one `<g>` per node) — keeping it mounted
+  // while hidden was the dominant source of UI jank just from *opening* the
+  // canvas tab. The wrapper itself only uses stable hooks
+  // (useState/useEffect from usePrefsVersion) so toggling does not change
+  // the hook order of THIS component.
   if (!prefs.minimap) return null
-  return <MiniMap pannable zoomable nodeStrokeWidth={1} />
+  return (
+    <div className="ms-minimap-slot" data-on="true" aria-hidden={false}>
+      <MiniMap pannable zoomable nodeStrokeWidth={1} />
+    </div>
+  )
 }
 
-// ── Toolbar ──────────────────────────────────────────────────────────────
+// ── Save-to-library dialog (M2) ───────────────────────────────────────────
 
-function Toolbar({ onAdd, version, conn, count }: {
-  onAdd: (k: NodeKind) => void
-  version: number
-  conn: ConnState
-  count: number
+const SAVE_KIND_ORDER: AssetKind[] = ['character', 'scene', 'audio', 'clip']
+
+function SaveToLibraryDialog({ canvasId, node, onClose }: {
+  canvasId: string
+  node: { id: string; type: NodeKind; label: string }
+  onClose: () => void
 }) {
-  return (
-    <div className="ms-toolbar">
-      <ul className="ms-add-row" aria-label="Add a node">
-        {CREATE_ORDER.map((kind) => {
-          const meta = NODE_CATALOG.find((m) => m.type === kind)!
-          const Icon = meta.Icon
-          return (
-            <li key={kind}>
-              <button
-                type="button"
-                className="ms-add-btn"
-                onClick={() => onAdd(kind)}
-                title={`${meta.label} · ${meta.desc}`}
-                aria-label={`Add ${meta.label} node`}
-              >
-                <Icon size={14} strokeWidth={1.75} />
-                <span>{meta.label}</span>
-              </button>
-            </li>
-          )
-        })}
-      </ul>
-      <span className="ms-toolbar-spacer" />
-      <span
-        className={`ms-live ${conn === 'open' ? 'is-open' : conn === 'reconnecting' ? 'is-reconnecting' : ''}`}
-        title={`v${version} · ${count} nodes · SSE ${conn}`}
-      >
-        <span className="ms-live-dot" />
-        {count > 0 ? `v${version} · live` : 'empty'}
-      </span>
-    </div>
+  const lang = resolveLang()
+  const t = (key: string, vars?: Record<string, string | number>) => translate(lang, key, vars)
+  const defaultKind: AssetKind = node.type === 'video' ? 'clip' : node.type === 'music' ? 'audio' : 'scene'
+  const [kind, setKind] = useState<AssetKind>(defaultKind)
+  const [name, setName] = useState(node.label)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const submit = async () => {
+    setBusy(true)
+    setErr(null)
+    const trimmed = name.trim()
+    const res = await apiRegisterAsset(canvasId, node.id, kind, trimmed || undefined)
+    setBusy(false)
+    if (res.ok) onClose()
+    else setErr(res.error)
+  }
+
+  return createPortal(
+    <div className="ms-menu-backdrop" onClick={onClose}>
+      <div className="ms-pb-dialog" role="dialog" aria-modal="true" aria-label={t('save.title')} onClick={(e) => e.stopPropagation()}>
+        <div className="ms-pb-dialog-head">
+          <span>{t('save.title')}</span>
+          <button type="button" className="ms-pb-icon-btn" onClick={onClose} aria-label={t('common.close')}>
+            <IconX size={13} />
+          </button>
+        </div>
+        <div className="ms-pb-dialog-body">
+          <div className="ms-pb-muted">{t('save.hint')}</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+            {SAVE_KIND_ORDER.map((k) => (
+              <label key={k} className="ms-pb-radio" style={{ padding: '3px 2px' }}>
+                <input type="radio" name="asset-kind" checked={kind === k} onChange={() => setKind(k)} />
+                <span>{t(`asset.kind.${k}`)}</span>
+              </label>
+            ))}
+          </div>
+          <input
+            className="ms-pb-input"
+            value={name}
+            placeholder={t('save.name.placeholder')}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !busy) void submit()
+            }}
+          />
+          {err && <div className="ms-pb-err">{err}</div>}
+        </div>
+        <div className="ms-pb-dialog-actions">
+          <button type="button" className="ms-btn-cancel" onClick={onClose} disabled={busy}>{t('common.cancel')}</button>
+          <button type="button" className="ms-btn-primary" onClick={() => void submit()} disabled={busy}>
+            {busy ? t('common.loading') : t('save.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -970,18 +1399,16 @@ function CreateMenu({ menu, onClose, onPick }: {
   )
 }
 
-// ── View bar (auto-arrange / minimap / fit / zoom) ───────────────────────
+// ── View bar (auto-arrange / minimap / fit / zoom / clear) ──────────────────
 
-function ViewBar({ autoArrange, minimapOn, onToggleMinimap }: {
+function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
   autoArrange: () => void
   minimapOn: boolean
   onToggleMinimap: () => void
+  onClearCanvas: () => void
 }) {
   const rf = useReactFlow()
-  // Live zoom % (the same subscription franklin's view bar uses).
-  const zoom = useFlowStore((s) => s.transform[2])
   const doFit = () => { try { rf.fitView({ padding: 0.18, duration: 260 }) } catch { /* ignore */ } }
-  const setZ = (z: number) => { try { rf.zoomTo(z, { duration: 180 }) } catch { /* ignore */ } }
 
   return (
     <div className="ms-view-bar" role="toolbar" aria-label="Canvas view controls">
@@ -1007,6 +1434,33 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap }: {
         <IconMaximize2 size={14} strokeWidth={1.8} />
       </button>
       <span className="ms-view-bar-divider" aria-hidden />
+      <ZoomControls />
+      <span className="ms-view-bar-divider" aria-hidden />
+      <button
+        type="button"
+        className="ms-view-bar-btn"
+        onClick={onClearCanvas}
+        title="Clear canvas"
+        aria-label="Clear canvas"
+      >
+        <IconEraser size={14} strokeWidth={1.8} />
+      </button>
+    </div>
+  )
+}
+
+// ZoomControls: -/+/% buttons. Lives in its own component so the surrounding
+// ViewBar (and the whole CanvasView tree) does not re-render on every pan/
+// zoom gesture — only this small island updates with the zoom number. Without
+// the split, the `useFlowStore(s => s.transform[2])` selector lives at the
+// ViewBar level and triggers a full tree re-render every gesture tick.
+function ZoomControls() {
+  const rf = useReactFlow()
+  const zoom = useFlowStore((s) => s.transform[2])
+  const setZ = (z: number) => { try { rf.zoomTo(z, { duration: 180 }) } catch { /* ignore */ } }
+  const pct = Math.round((zoom ?? 1) * 100)
+  return (
+    <>
       <button
         type="button"
         className="ms-view-bar-btn"
@@ -1023,7 +1477,7 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap }: {
         title="Zoom to 100%"
         aria-label="Zoom 100%"
       >
-        {Math.round((zoom ?? 1) * 100)}%
+        {pct}%
       </button>
       <button
         type="button"
@@ -1034,7 +1488,7 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap }: {
       >
         <IconZoomIn size={15} strokeWidth={2} />
       </button>
-    </div>
+    </>
   )
 }
 

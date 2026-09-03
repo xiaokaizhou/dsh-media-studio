@@ -117,7 +117,7 @@ describe('CanvasStore — deletion cascade', () => {
 describe('CanvasStore — lint feedback', () => {
   it('reports lint pass on a clean connect', () => {
     const r1 = store.apply('main', [
-      { op: 'addNode', type: 'text', label: 'A' },
+      { op: 'addNode', type: 'text', label: 'A', data: { text: 'A content' } },
       { op: 'addNode', type: 'image', label: 'B' },
     ])
     const [a, b] = r1.graph.nodes.map((n) => n.id)

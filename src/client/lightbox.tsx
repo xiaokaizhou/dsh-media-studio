@@ -1,5 +1,5 @@
 // Fullscreen preview for a finished media node (image / video / voice).
-// franklin-canvas-style lightbox: dark backdrop, centered media, meta row
+// Dark backdrop, centered media, meta row
 // (prompt · model · created), prev/next among sibling nodes of the same kind,
 // and a download button. Rendered through a portal into document.body.
 

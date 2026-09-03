@@ -1,7 +1,7 @@
 // Minimal stroke icon set for the media-studio canvas UI.
 //
-// Geometry mirrors Lucide (ISC) at 24×24 viewBox so it reads the same as
-// franklin-canvas's icons without pulling a dependency into the client
+// Geometry is based on Lucide (ISC) at 24×24 viewBox so it reads the same as
+// standard icon sets without pulling a dependency into the client
 // bundle (the DSH client loader resolves only react / react-dom; everything
 // else is inlined into lib/client.js). Icons inherit currentColor.
 
@@ -206,4 +206,22 @@ export const IconLoader = makeIcon(
     <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
   </>,
   'Loading',
+)
+
+export const IconRefreshCw = makeIcon(
+  <>
+    <polyline points="23 4 23 10 17 10" />
+    <polyline points="1 20 1 14 7 14" />
+    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+  </>,
+  'Refresh',
+)
+
+export const IconEraser = makeIcon(
+  <>
+    <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+    <path d="M22 21H7" />
+    <path d="m5 11 9 9" />
+  </>,
+  'Clear',
 )

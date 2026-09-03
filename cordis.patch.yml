@@ -1,8 +1,16 @@
-# dsh-media-studio bundle layer: register the host plugin as a bundle row.
-# This file is the `dsh.bundle.patch` layer (see package.json#dsh.bundle.patch).
-# Layer semantics: a YAML array of row verbs; `insert` adds plugin rows to the
-# composed config. A row's `id` must be unique within the layer stack; `name`
-# resolves the plugin module through the installed package (package.json#main).
+# dsh-media-studio bundle layer — registers the host plugin as a bundle row.
+#
+# After the multimodal refactor this plugin owns FOUR canvas-only tools
+# (canvas_graph_view / canvas_graph_patch / canvas_auto_arrange /
+# canvas_refresh_node) plus the canvas HTTP/SSE routes. LLM-facing tools
+# (generate_text / generate_image / generate_video / generate_tts /
+# generate_music) and the `llm-multimodal` settings namespace live in the
+# sibling `dsh-llm-multimodal` plugin.
+#
+# Layer semantics: a YAML array of row verbs; `insert` adds plugin rows to
+# the composed config. A row's `id` must be unique within the layer stack;
+# `name` resolves the plugin module through the installed package
+# (package.json#main).
 - insert:
     # `id`: stable row identifier used by later layers to override this row.
     - id: dsh-media-studio
@@ -10,8 +18,6 @@
       name: dsh-media-studio
       config:
         # Where canvas snapshots, generated media, and the SSE journal land.
-        workspaceRoot: '~/.franklin/media-studio'
+        workspaceRoot: '~/.media-studio'
         # Canvas id every session is bound to unless it overrides.
         defaultCanvasId: 'main'
-        # Append every canvas/media tool result to the session log.
-        logToolCalls: true

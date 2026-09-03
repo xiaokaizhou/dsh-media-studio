@@ -243,6 +243,31 @@ export class CanvasStore {
     return { graph: cloneGraph(cv.graph), version: cv.version }
   }
 
+  /**
+   * Non-mutating snapshot read. Unlike `snapshot()` this never lazily creates
+   * an in-memory canvas entry for an unknown id — used by project-level scans
+   * (deletion dependents analysis) where calling `canvasOf` would pollute the
+   * map with empty states for projects that merely exist in the registry.
+   * Returns null when the canvas has no in-memory state yet.
+   */
+  peek(canvasId: string): CanvasSnapshot | null {
+    const cv = this.canvases.get(`${this.workspaceRoot}\0${canvasId}`)
+    return cv ? { graph: cloneGraph(cv.graph), version: cv.version } : null
+  }
+
+  /** Drop a canvas from the in-memory map (used when its owning project is
+   *  deleted). The persisted file is handled by the caller (trash/permanent). */
+  evictCanvas(canvasId: string): void {
+    const key = `${this.workspaceRoot}\0${canvasId}`
+    const existed = this.canvases.delete(key)
+    if (existed) this.broadcast?.(canvasId, { version: 0, graph: { nodes: [], edges: [] }, patch: [] })
+  }
+
+  /** Absolute path of the persisted file for a canvas id (for move/remove). */
+  canvasFilePath(canvasId: string): string {
+    return join(this.workspaceRoot, 'canvases', `${canvasId}.json`)
+  }
+
   /** Bind a session id to this canvas (for SSE scoping). */
   bindSession(canvasId: string, sessionId: string): void {
     const cv = this.canvasOf(canvasId)
@@ -256,7 +281,14 @@ export class CanvasStore {
     return [...this.canvasOf(canvasId).boundSessions]
   }
 
-  /** Restore every persisted canvas from disk into the in-memory map. */
+  /** Restore every persisted canvas from disk into the in-memory map.
+   *
+   * Safety guard: only reload if the disk version is strictly newer than the
+   * in-memory version. This prevents a late-running restore() from clobbering
+   * in-memory state that was modified by patches applied after boot. It also
+   * enables safe re-invocation (e.g. from a file watcher) without losing
+   * uncommitted work.
+   */
   async restore(): Promise<void> {
     const dir = join(this.workspaceRoot, 'canvases')
     let entries: string[] = []
@@ -270,9 +302,14 @@ export class CanvasStore {
         const raw = JSON.parse(await readFile(join(dir, file), 'utf8'))
         const canvasId = file.slice(0, -'.json'.length)
         const cv = this.canvasOf(canvasId)
-        cv.graph = { nodes: raw.nodes ?? [], edges: raw.edges ?? [] }
-        cv.version = typeof raw.version === 'number' ? raw.version : 0
-      } catch { /* corrupt file — leave the empty canvas */ }
+        const diskVersion = typeof raw.version === 'number' ? raw.version : 0
+        // Only reload when disk is ahead — prevents restoring stale data
+        // over a more recent in-memory state.
+        if (diskVersion > cv.version) {
+          cv.graph = { nodes: raw.nodes ?? [], edges: raw.edges ?? [] }
+          cv.version = diskVersion
+        }
+      } catch { /* corrupt file — leave the current in-memory canvas */ }
     }
   }
 
@@ -284,10 +321,9 @@ export class CanvasStore {
       await writeFile(dest, JSON.stringify({ nodes: cv.graph.nodes, edges: cv.graph.edges, version: cv.version }, null, 2), 'utf8')
     } catch (e) {
       // Persistence failure is non-fatal: in-memory state is still
-      // source of truth, the next op retries the write. We swallow the
-      // error rather than log so tests that clean up the workspace dir
-      // before the voided persist() promise resolves don't print noise.
-      void e
+      // source of truth, the next op retries the write. Log rather than
+      // swallow so disk-write errors are visible in diagnostics.
+      console.warn(`[media-studio] persist failed for canvas "${canvasId}": ${(e as Error).message}`)
     }
   }
 }
@@ -303,6 +339,12 @@ function cloneGraph(g: CanvasGraph): CanvasGraph {
 
 /** Apply one op to `graph` in place; return an error string or null. */
 function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
+  // Guard: op.op is required and must be a known string. Missing or unknown
+  // op codes are hard errors — silent no-ops would let malformed patches
+  // increment the version while doing nothing, which is exactly the bug
+  // that made the canvas appear empty while the tool reported success.
+  const rawOp = (op as { op?: unknown }).op
+  if (typeof rawOp !== 'string') return `invalid op: missing or non-string "op" field (got ${JSON.stringify(rawOp)})`
   switch (op.op) {
     case 'addNode': {
       if (!NEW_NODE_KINDS.has(op.type)) return `unknown node type "${op.type}" (allowed: ${[...NEW_NODE_KINDS].join(', ')})`
@@ -385,7 +427,13 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
 
 /** Cheap post-write lint — flags orphan refs, duplicate ids, and dangling
  *  edges. Not a full graph validator; just the rules the agent needs to
- *  understand when a patch was rejected. */
+ *  understand when a patch was rejected.
+ *
+ *  Also emits *warnings* (not errors) for Text/Note nodes whose canonical
+ *  content field is empty. The graph is still accepted — we don't want to
+ *  break the "create empty placeholder then fill later" two-step pattern —
+ *  but the issue shows up in the tool response so the agent (and humans
+ *  reading the rendered card) can act on it. */
 function lintGraph(g: CanvasGraph): string[] {
   const issues: string[] = []
   const ids = new Set<string>()
@@ -400,6 +448,22 @@ function lintGraph(g: CanvasGraph): string[] {
   // Self-loop warning (not fatal)
   for (const e of g.edges) {
     if (e.source === e.target) issues.push(`warn: edge "${e.id}" is a self-loop`)
+  }
+  // Data-content warnings for document-style nodes. Surface the issue
+  // without blocking the patch — agents that build placeholders first then
+  // updateNode later are still allowed to.
+  for (const n of g.nodes) {
+    if (n.type === 'text') {
+      const t = (n.data as Record<string, unknown>).text
+      if (typeof t !== 'string' || t.trim() === '') {
+        issues.push(`warn: text node "${n.id}" has empty data.text — agent should follow up with updateNode(id, {text: ...})`)
+      }
+    } else if (n.type === 'note') {
+      const c = (n.data as Record<string, unknown>).content
+      if (typeof c !== 'string' || c.trim() === '') {
+        issues.push(`warn: note node "${n.id}" has empty data.content — agent should follow up with updateNode(id, {content: ...})`)
+      }
+    }
   }
   return issues
 }
