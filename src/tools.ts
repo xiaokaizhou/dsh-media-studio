@@ -4,6 +4,85 @@ import { CanvasStore, type CanvasOp, type CanvasSnapshot, type CanvasNode } from
 import { join } from 'node:path'
 import { getMediaStudioHandles } from './service-state'
 import { prepareVideoForCanvas } from './video-cover'
+import { registerCanvasAsset, type AssetKind } from './asset-store'
+
+/** Map a canvas node type to the asset-library kind for auto-registration.
+ *  Canvas `music` nodes hold audio → 'audio' in the library. */
+export function assetKindForNodeType(nodeType: CanvasNode['type']): AssetKind | null {
+  switch (nodeType) {
+    case 'image': return 'character'  // default; project callers can override
+    case 'video': return 'clip'
+    case 'music': return 'audio'
+    default: return null
+  }
+}
+
+/** Walk a batch of patch ops and pick out newly-added or updated media nodes
+ *  (image / video / music) that carry a `resultUrl`. Text / note nodes never
+ *  hold media so we skip them. `postNodes` is the canvas graph after the
+ *  patch has been applied — we read from it because `updateNode` only sends
+ *  the changed fields. */
+export function collectMediaNodesFromOps(
+  ops: CanvasOp[],
+  postNodes: CanvasNode[],
+): { nodeId: string; nodeType: CanvasNode['type'] }[] {
+  const out: { nodeId: string; nodeType: CanvasNode['type'] }[] = []
+  for (const op of ops) {
+    if (op.op === 'addNode') {
+      if (op.data?.resultUrl && (op.type === 'image' || op.type === 'video' || op.type === 'music')) {
+        const nodeId = op.nodeId || ''
+        if (nodeId) out.push({ nodeId, nodeType: op.type })
+      }
+    } else if (op.op === 'updateNode') {
+      const merged = postNodes.find((n) => n.id === op.id)
+      if (merged && merged.data?.resultUrl && (merged.type === 'image' || merged.type === 'video' || merged.type === 'music')) {
+        out.push({ nodeId: merged.id, nodeType: merged.type })
+      }
+    } else if (op.op === 'batchAddMedia') {
+      for (const item of op.items) {
+        const nodeId = item.nodeId || ''
+        if (nodeId && (item.kind === 'image' || item.kind === 'video' || item.kind === 'audio')) {
+          const nodeType: CanvasNode['type'] = item.kind === 'audio' ? 'music' : item.kind
+          out.push({ nodeId, nodeType })
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** Try to auto-register a newly-patched node's media into the project asset
+ *  library. Returns null on success (or if no registration was needed), or
+ *  a `warn:`-prefixed advisory string on failure — the same shape the lint
+ *  pass already uses in `issues`, so the agent sees one unified list. Never
+ *  throws — a failed auto-register must not break the canvas patch the agent
+ *  just applied. */
+async function tryAutoRegisterAsset(
+  projectId: string,
+  sourcePath: string | undefined,
+  nodeId: string,
+  nodeType: CanvasNode['type'],
+): Promise<string | null> {
+  const kind = assetKindForNodeType(nodeType)
+  if (!kind) return null
+  const mst = getMediaStudioHandles()
+  try {
+    await registerCanvasAsset({
+      wsRoot: mst.workspaceRoot,
+      roots: mst.mediaRoots ?? [],
+      canvasStore: mst.canvasStore,
+      projectId,
+      sourcePath,
+      canvasNodeId: nodeId,
+      kind,
+    })
+    return null
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return `node "${nodeId}" (${nodeType}) has resultUrl but auto-register failed: ${msg}. ` +
+      `Call POST /api/media-studio/assets/register with {projectId, kind, canvasNodeId} to link it.`
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -322,23 +401,56 @@ export function registerCanvasPatchTool(ctx: Context): void {
             issues: { type: 'array', items: { type: 'string' } },
           },
         },
-        render: (_args, value) => [{
-          type: 'text' as const,
-          text: `applied ${(value as { applied: number }).applied} ops → version ${(value as { version: number }).version}; lint: ${(value as { lintOk: boolean }).lintOk ? 'pass' : 'warnings'}`,
-        }],
+        render: (_args, value) => {
+          const v = value as { applied: number; version: number; lintOk: boolean; issues: string[] }
+          const advisoryCount = v.issues.filter((s) => s.startsWith('warn:')).length
+          const advisorySuffix = advisoryCount > 0
+            ? `; ${advisoryCount} media registration advisory(ies)`
+            : ''
+          return [{
+            type: 'text' as const,
+            text: `applied ${v.applied} ops → version ${v.version}; lint: ${v.lintOk ? 'pass' : 'warnings'}${advisorySuffix}`,
+          }]
+        },
       },
       async execute(args) {
-        const store = getMediaStudioHandles().canvasStore
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
         const canvasId = args.canvasId?.trim() || resolveCanvasId()
         const ops = Array.isArray(args.ops) ? (args.ops as unknown as CanvasOp[]) : []
         if (ops.length === 0) throw new Error('canvas_graph_patch: ops must be a non-empty array')
         if (ops.length > 60) throw new Error(`canvas_graph_patch: batch too large (${ops.length} ops, max 60)`)
         const result = store.apply(canvasId, ops)
+
+        // Auto-register any newly-patched media nodes (image/video/music with
+        // a resultUrl) into the project asset library. Best-effort: failures
+        // surface as `warn:` lines appended to the same `issues` array the
+        // lint pass uses, so the agent gets one unified diagnostics list and
+        // sees exactly what didn't make it into the library.
+        const issues = [...result.issues]
+        const projectStore = mst.projectStore
+        const projectId = projectStore?.activeCanvasId?.() ?? null
+        const sourcePath = (() => {
+          if (!projectId || !projectStore) return undefined
+          const snap = projectStore.snapshot?.()
+          if (!snap) return undefined
+          const meta = snap.projects.find((p) => p.id === projectId)
+          return meta?.sourcePath
+        })()
+        if (projectId) {
+          const postSnap = store.snapshot(canvasId)
+          const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
+          for (const { nodeId, nodeType } of mediaNodes) {
+            const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
+            if (adv) issues.push(adv)
+          }
+        }
+
         return {
           applied: result.patch.length,
           version: result.version,
           lintOk: result.lintOk,
-          issues: result.issues,
+          issues,
         }
       },
     }),
