@@ -156,6 +156,12 @@ export function mediaSrc(raw?: string): string {
     // Absolute POSIX path written by a host tool.
     return `/api/media-studio/media-file?path=${encodeURIComponent(raw)}`
   }
+  if (raw.startsWith('projects/')) {
+    // Project-relative path under workspaceRoot (e.g. projects/<id>/assets/.../foo.png).
+    // Resolved against workspaceRoot by the media-file proxy, so no extra
+    // permissioning is required here.
+    return `/api/media-studio/media-file?path=${encodeURIComponent(raw)}`
+  }
   return raw
 }
 

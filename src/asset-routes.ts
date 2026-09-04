@@ -80,7 +80,9 @@ export function registerAssetRoutes(ctx: Context): () => void {
           const url = new URL(req.url ?? '/', 'http://x')
           const pid = url.searchParams.get('projectId') ?? ''
           if (!pid) { json(res, 400, { ok: false, error: 'projectId is required' }); return }
-          const assets = await listAssets(handles().workspaceRoot, pid)
+          const h = handles()
+          const src = h.projectStore?.resolveSourcePath(pid)
+          const assets = await listAssets(h.workspaceRoot, pid, src)
           json(res, 200, { ok: true, projectId: pid, assets })
         } catch (e) {
           json(res, 500, { ok: false, error: (e as Error).message })
@@ -103,11 +105,13 @@ export function registerAssetRoutes(ctx: Context): () => void {
           if (!pid || !nodeId) { json(res, 400, { ok: false, error: 'projectId and canvasNodeId are required' }); return }
           if (!kind) { json(res, 400, { ok: false, error: `kind must be one of: ${ASSET_KINDS.join(', ')}` }); return }
           const h = handles()
+          const src = h.projectStore?.resolveSourcePath(pid)
           const r = await registerCanvasAsset({
             wsRoot: h.workspaceRoot,
             roots: h.mediaRoots ?? [],
             canvasStore: h.canvasStore,
             projectId: pid,
+            sourcePath: src,
             canvasNodeId: nodeId,
             kind,
             name: typeof body.name === 'string' ? body.name : undefined,
@@ -133,10 +137,11 @@ export function registerAssetRoutes(ctx: Context): () => void {
           const aid = String(body.assetId ?? '').trim()
           if (!pid || !aid) { json(res, 400, { ok: false, error: 'projectId and assetId are required' }); return }
           const h = handles()
+          const src = h.projectStore?.resolveSourcePath(pid)
           const patch: { name?: string; tags?: string[] } = {}
           if (body.name !== undefined) patch.name = String(body.name)
           if (Array.isArray(body.tags)) patch.tags = (body.tags as unknown[]).map((x) => String(x)).slice(0, 12)
-          const asset = await updateAssetMeta(h.workspaceRoot, pid, aid, patch)
+          const asset = await updateAssetMeta(h.workspaceRoot, pid, aid, patch, src)
           broadcastAssetEvent(pid, [aid], 'updated')
           json(res, 200, { ok: true, asset })
         } catch (e) {
@@ -182,7 +187,8 @@ export function registerAssetRoutes(ctx: Context): () => void {
           const cascadeRaw = String(body.cascade ?? 'cancel')
           const cascade = cascadeRaw === 'break-refs' || cascadeRaw === 'migrate-shared' ? cascadeRaw : 'cancel'
           const h = handles()
-          const result = await deleteAsset(h.workspaceRoot, h.canvasStore, pid, aid, cascade, projectIds())
+          const src = h.projectStore?.resolveSourcePath(pid)
+          const result = await deleteAsset(h.workspaceRoot, h.canvasStore, pid, aid, cascade, projectIds(), src)
           broadcastAssetEvent(pid, [aid], 'deleted')
           json(res, 200, { ok: true, result })
         } catch (e) {
@@ -205,7 +211,9 @@ export function registerAssetRoutes(ctx: Context): () => void {
           const target = String(body.targetProjectId ?? '').trim()
           if (!pid || !aid || !target) { json(res, 400, { ok: false, error: 'projectId, assetId and targetProjectId are required' }); return }
           const h = handles()
-          const r = await copyAssetToProject(h.workspaceRoot, pid, aid, target)
+          const srcPath = h.projectStore?.resolveSourcePath(pid)
+          const tgtPath = h.projectStore?.resolveSourcePath(target)
+          const r = await copyAssetToProject(h.workspaceRoot, pid, aid, target, srcPath, tgtPath)
           broadcastAssetEvent(target, [r.asset.id], r.created ? 'copied' : 'updated')
           json(res, r.created ? 201 : 200, { ok: true, created: r.created, asset: r.asset })
         } catch (e) {
@@ -227,7 +235,8 @@ export function registerAssetRoutes(ctx: Context): () => void {
           const aid = String(body.assetId ?? '').trim()
           if (!pid || !aid) { json(res, 400, { ok: false, error: 'projectId and assetId are required' }); return }
           const h = handles()
-          const r = await syncAssetFromCanvas(h.workspaceRoot, h.mediaRoots ?? [], h.canvasStore, pid, aid)
+          const src = h.projectStore?.resolveSourcePath(pid)
+          const r = await syncAssetFromCanvas(h.workspaceRoot, h.mediaRoots ?? [], h.canvasStore, pid, aid, src)
           if (r.changed) broadcastAssetEvent(pid, [aid], 'synced')
           json(res, 200, { ok: true, changed: r.changed, asset: r.asset })
         } catch (e) {

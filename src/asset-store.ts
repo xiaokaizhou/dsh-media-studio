@@ -87,6 +87,16 @@ const INDEX_VERSION = 1
 export function projectAssetRoot(wsRoot: string, projectId: string): string {
   return join(wsRoot, 'projects', projectId, 'assets')
 }
+
+/**
+ * Like `projectAssetRoot` but honors a project-supplied source path so assets
+ * live in the user-owned project directory rather than the media-studio
+ * workspace. Pass `undefined` to fall back to the legacy wsRoot layout
+ * (used by projects that pre-date the sourcePath migration).
+ */
+export function projectAssetRootAt(sourcePath: string | undefined, wsRoot: string, projectId: string): string {
+  return sourcePath ? join(sourcePath, 'assets') : projectAssetRoot(wsRoot, projectId)
+}
 export function sharedAssetRoot(wsRoot: string): string {
   return join(wsRoot, 'shared-assets')
 }
@@ -97,21 +107,23 @@ export function newAssetFileName(assetId: string, ext: string): string {
   return `${assetId}.${ext}`
 }
 
-/** Read <root>/index.json; never throws — absent/corrupt returns empty. */
-export async function loadAssetIndex(root: string): Promise<AssetIndexFile> {
+/** Read <root>/<indexFile>; never throws — absent/corrupt returns empty.
+ *  Default index file name is `index.json`; the source-path variant uses
+ *  `.index.json` (hidden) so user-visible asset dirs stay clean. */
+export async function loadAssetIndex(root: string, indexFile: string = 'index.json'): Promise<AssetIndexFile> {
   try {
-    const raw = await readFile(join(root, 'index.json'), 'utf8')
+    const raw = await readFile(join(root, indexFile), 'utf8')
     const parsed = JSON.parse(raw) as AssetIndexFile
     if (parsed && Array.isArray(parsed.assets)) return { version: INDEX_VERSION, assets: parsed.assets }
   } catch { /* absent/corrupt — empty below */ }
   return { version: INDEX_VERSION, assets: [] }
 }
 
-/** Write <root>/index.json (creates root). Never rejects — logs only. */
-export async function writeAssetIndex(root: string, index: AssetIndexFile): Promise<void> {
+/** Write <root>/<indexFile> (creates root). Never rejects — logs only. */
+export async function writeAssetIndex(root: string, index: AssetIndexFile, indexFile: string = 'index.json'): Promise<void> {
   try {
     await mkdir(root, { recursive: true })
-    await writeFile(join(root, 'index.json'), JSON.stringify(index, null, 2), 'utf8')
+    await writeFile(join(root, indexFile), JSON.stringify(index, null, 2), 'utf8')
   } catch (e) {
     console.warn(`[media-studio] writeAssetIndex(${root}) failed: ${(e as Error).message}`)
   }
@@ -124,10 +136,15 @@ export function validateAssetName(name: string): string | null {
   return null
 }
 
-/** List assets of a project (or of the shared root with id "__shared"). */
-export async function listAssets(wsRoot: string, projectId: string): Promise<Asset[]> {
-  const root = projectId === '__shared' ? sharedAssetRoot(wsRoot) : projectAssetRoot(wsRoot, projectId)
-  const index = await loadAssetIndex(root)
+/** List assets of a project (or of the shared root with id "__shared").
+ *  Honors `sourcePath` for per-project lookup; the shared root stays
+ *  inside the workspace regardless of sourcePath. */
+export async function listAssets(wsRoot: string, projectId: string, sourcePath?: string): Promise<Asset[]> {
+  const root = projectId === '__shared'
+    ? sharedAssetRoot(wsRoot)
+    : projectAssetRootAt(sourcePath, wsRoot, projectId)
+  const indexFile = projectId === '__shared' ? 'index.json' : (sourcePath ? '.index.json' : 'index.json')
+  const index = await loadAssetIndex(root, indexFile)
   return index.assets
 }
 
@@ -217,6 +234,9 @@ export interface RegisterInput {
   canvasStore: CanvasStore
   /** Owning project (its canvas must hold `canvasNodeId`). */
   projectId: string
+  /** Project sourcePath; when set, assets land under `<sourcePath>/assets/`
+   *  with a hidden `.index.json` instead of the legacy wsRoot layout. */
+  sourcePath?: string
   canvasNodeId: string
   kind: AssetKind
   name?: string
@@ -232,8 +252,9 @@ export async function registerCanvasAsset(input: RegisterInput): Promise<{ asset
   const raw = (node.data as { resultUrl?: unknown }).resultUrl
   if (typeof raw !== 'string' || !raw) throw new Error('register: node has no resultUrl (nothing to save)')
 
-  const root = projectAssetRoot(input.wsRoot, input.projectId)
-  const index = await loadAssetIndex(root)
+  const root = projectAssetRootAt(input.sourcePath, input.wsRoot, input.projectId)
+  const indexFile = input.sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(root, indexFile)
   const existing = index.assets.find(
     (a) => a.origin?.type === 'canvas' && (a.origin as { canvasNodeId?: string }).canvasNodeId === input.canvasNodeId,
   )
@@ -261,7 +282,7 @@ export async function registerCanvasAsset(input: RegisterInput): Promise<{ asset
     updatedAt: now,
   }
   index.assets.push(asset)
-  await writeAssetIndex(root, index)
+  await writeAssetIndex(root, index, indexFile)
   return { asset, created: true }
 }
 
@@ -271,9 +292,11 @@ export async function updateAssetMeta(
   projectId: string,
   assetId: string,
   patch: { name?: string; tags?: string[] },
+  sourcePath?: string,
 ): Promise<Asset> {
-  const root = projectAssetRoot(wsRoot, projectId)
-  const index = await loadAssetIndex(root)
+  const root = projectAssetRootAt(sourcePath, wsRoot, projectId)
+  const indexFile = sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(root, indexFile)
   const a = index.assets.find((x) => x.id === assetId)
   if (!a) throw new Error(`asset "${assetId}" not found in project "${projectId}"`)
   if (patch.name !== undefined) {
@@ -365,9 +388,11 @@ export async function deleteAsset(
   assetId: string,
   cascade: 'cancel' | 'break-refs' | 'migrate-shared',
   projectIds: string[],
+  sourcePath?: string,
 ): Promise<{ deleted: boolean; brokenNodes: number; migrated: boolean }> {
-  const root = projectAssetRoot(wsRoot, ownerProjectId)
-  const index = await loadAssetIndex(root)
+  const root = projectAssetRootAt(sourcePath, wsRoot, ownerProjectId)
+  const indexFile = sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(root, indexFile)
   const a = index.assets.find((x) => x.id === assetId)
   if (!a) throw new Error(`asset "${assetId}" not found in project "${ownerProjectId}"`)
 
@@ -404,7 +429,7 @@ export async function deleteAsset(
     await rm(join(root, ASSET_CATEGORY_DIR[a.kind], a.file), { force: true })
   }
   index.assets = index.assets.filter((x) => x.id !== assetId)
-  await writeAssetIndex(root, index)
+  await writeAssetIndex(root, index, indexFile)
   return { deleted: true, brokenNodes, migrated }
 }
 
@@ -415,15 +440,19 @@ export async function copyAssetToProject(
   sourceProjectId: string,
   assetId: string,
   targetProjectId: string,
+  sourcePath?: string,
+  targetSourcePath?: string,
 ): Promise<{ asset: Asset; created: boolean }> {
   if (sourceProjectId === targetProjectId) throw new Error('copyAsset: source and target project are the same')
-  const srcRoot = projectAssetRoot(wsRoot, sourceProjectId)
-  const srcIndex = await loadAssetIndex(srcRoot)
+  const srcRoot = projectAssetRootAt(sourcePath, wsRoot, sourceProjectId)
+  const srcIndexFile = sourcePath ? '.index.json' : 'index.json'
+  const srcIndex = await loadAssetIndex(srcRoot, srcIndexFile)
   const src = srcIndex.assets.find((x) => x.id === assetId)
   if (!src) throw new Error(`asset "${assetId}" not found in project "${sourceProjectId}"`)
 
-  const dstRoot = projectAssetRoot(wsRoot, targetProjectId)
-  const dstIndex = await loadAssetIndex(dstRoot)
+  const dstRoot = projectAssetRootAt(targetSourcePath, wsRoot, targetProjectId)
+  const dstIndexFile = targetSourcePath ? '.index.json' : 'index.json'
+  const dstIndex = await loadAssetIndex(dstRoot, dstIndexFile)
   const existing = dstIndex.assets.find(
     (x) => x.copyOf?.projectId === sourceProjectId && x.copyOf?.assetId === assetId,
   )
@@ -449,7 +478,7 @@ export async function copyAssetToProject(
     updatedAt: now,
   }
   dstIndex.assets.push(asset)
-  await writeAssetIndex(dstRoot, dstIndex)
+  await writeAssetIndex(dstRoot, dstIndex, dstIndexFile)
   return { asset, created: true }
 }
 
@@ -464,9 +493,11 @@ export async function syncAssetFromCanvas(
   canvasStore: CanvasStore,
   projectId: string,
   assetId: string,
+  sourcePath?: string,
 ): Promise<{ asset: Asset; changed: boolean }> {
-  const root = projectAssetRoot(wsRoot, projectId)
-  const index = await loadAssetIndex(root)
+  const root = projectAssetRootAt(sourcePath, wsRoot, projectId)
+  const indexFile = sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(root, indexFile)
   const a = index.assets.find((x) => x.id === assetId)
   if (!a || a.origin?.type !== 'canvas' || !a.origin.canvasNodeId) {
     throw new Error('syncAsset: asset was not registered from a canvas node')

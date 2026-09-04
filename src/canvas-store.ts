@@ -119,10 +119,27 @@ export class CanvasStore {
   private canvases = new Map<string, CanvasState>()
   private workspaceRoot: string
   private broadcast?: CanvasBroadcast
+  /** canvasId → absolute sourcePath; undefined falls back to legacy layout. */
+  private canvasSourcePaths = new Map<string, string>()
 
   constructor(workspaceRoot: string, opts?: { broadcast?: CanvasBroadcast }) {
     this.workspaceRoot = workspaceRoot
     this.broadcast = opts?.broadcast
+  }
+
+  /** Register/refresh the sourcePath for a canvas. Called by the ProjectStore
+   *  on boot, create, rename, and open so the canvas store knows where to
+   *  persist without the caller threading sourcePath through every op. */
+  setCanvasSourcePath(canvasId: string, sourcePath: string | undefined): void {
+    if (sourcePath) this.canvasSourcePaths.set(canvasId, sourcePath)
+    else this.canvasSourcePaths.delete(canvasId)
+  }
+
+  /** Snapshot the (canvasId → sourcePath) map for restore() / diagnostics. */
+  allSourcePaths(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const [k, v] of this.canvasSourcePaths) out[k] = v
+    return out
   }
 
   /** Resolve one canvas (lazily created if absent). Key includes the workspace
@@ -162,7 +179,7 @@ export class CanvasStore {
     cv.version += 1
     // Persist on the same thread so a frontend crash before SSE delivery
     // does not roll the canvas back.
-    void this.persist(canvasId, cv)
+    void this.persist(canvasId, cv, this.canvasSourcePaths.get(canvasId))
 
     // Push the new graph to every connected SSE client (the canvas tab
     // subscribes here). Centralized in `apply` so the agent's
@@ -260,12 +277,16 @@ export class CanvasStore {
   evictCanvas(canvasId: string): void {
     const key = `${this.workspaceRoot}\0${canvasId}`
     const existed = this.canvases.delete(key)
+    this.canvasSourcePaths.delete(canvasId)
     if (existed) this.broadcast?.(canvasId, { version: 0, graph: { nodes: [], edges: [] }, patch: [] })
   }
 
-  /** Absolute path of the persisted file for a canvas id (for move/remove). */
-  canvasFilePath(canvasId: string): string {
-    return join(this.workspaceRoot, 'canvases', `${canvasId}.json`)
+  /** Absolute path of the persisted file for a canvas id (for move/remove).
+   *  Honors `sourcePath` when the project carrying the canvas lives in a
+   *  user-owned directory — falls back to the legacy `<wsRoot>/canvases/<id>`
+   *  layout when no sourcePath is available. */
+  canvasFilePath(canvasId: string, sourcePath?: string): string {
+    return sourcePath ? join(sourcePath, '.canvas.json') : join(this.workspaceRoot, 'canvases', `${canvasId}.json`)
   }
 
   /** Bind a session id to this canvas (for SSE scoping). */
@@ -288,36 +309,87 @@ export class CanvasStore {
    * in-memory state that was modified by patches applied after boot. It also
    * enables safe re-invocation (e.g. from a file watcher) without losing
    * uncommitted work.
+   *
+   * Reads from BOTH the new layout (`.canvas.json` at a project sourcePath)
+   * and the legacy layout (`<wsRoot>/canvases/<id>.json`) so projects
+   * without a sourcePath still boot cleanly.
    */
-  async restore(): Promise<void> {
-    const dir = join(this.workspaceRoot, 'canvases')
-    let entries: string[] = []
+  async restore(sourcePaths: Record<string, string> = {}): Promise<void> {
+    const fs = await import('node:fs/promises')
+    console.log(`[media-studio] restore() called with sourcePaths keys=${Object.keys(sourcePaths).join(',')} workspaceRoot=${this.workspaceRoot}`)
+
+    // Legacy layout: <wsRoot>/canvases/<id>.json
+    const legacyDir = join(this.workspaceRoot, 'canvases')
+    const legacyIds = new Set<string>()
     try {
-      const fs = await import('node:fs/promises')
-      entries = await fs.readdir(dir)
-    } catch { return /* dir absent on first run */ }
-    for (const file of entries) {
-      if (!file.endsWith('.json')) continue
+      for (const file of await fs.readdir(legacyDir)) {
+        if (!file.endsWith('.json')) continue
+        try {
+          const raw = JSON.parse(await readFile(join(legacyDir, file), 'utf8'))
+          const canvasId = file.slice(0, -'.json'.length)
+          legacyIds.add(canvasId)
+          this.maybeReload(canvasId, raw)
+        } catch { /* corrupt file — leave the current in-memory canvas */ }
+      }
+    } catch { /* legacy dir absent — fine, this is the normal post-migration state */ }
+
+    // New layout: each registered project's .canvas.json under its sourcePath.
+    for (const [canvasId, sourcePath] of Object.entries(sourcePaths)) {
       try {
-        const raw = JSON.parse(await readFile(join(dir, file), 'utf8'))
-        const canvasId = file.slice(0, -'.json'.length)
-        const cv = this.canvasOf(canvasId)
-        const diskVersion = typeof raw.version === 'number' ? raw.version : 0
-        // Only reload when disk is ahead — prevents restoring stale data
-        // over a more recent in-memory state.
-        if (diskVersion > cv.version) {
-          cv.graph = { nodes: raw.nodes ?? [], edges: raw.edges ?? [] }
-          cv.version = diskVersion
-        }
-      } catch { /* corrupt file — leave the current in-memory canvas */ }
+        const raw = JSON.parse(await readFile(join(sourcePath, '.canvas.json'), 'utf8'))
+        this.maybeReload(canvasId, raw)
+      } catch { /* missing or corrupt — skip */ }
     }
   }
 
-  private async persist(canvasId: string, cv: CanvasState): Promise<void> {
-    const dir = join(this.workspaceRoot, 'canvases')
-    const dest = join(dir, `${canvasId}.json`)
+  /** Internal: reload iff disk version is strictly newer than the in-memory
+   *  version. Splits out of restore() to keep both layouts legible. */
+  private maybeReload(canvasId: string, raw: { version?: unknown; nodes?: unknown; edges?: unknown }): void {
+    const cv = this.canvasOf(canvasId)
+    const diskVersion = typeof raw.version === 'number' ? raw.version : 0
+    console.log(`[media-studio] maybeReload(${canvasId}): inMem=${cv.version} disk=${diskVersion} diskNodes=${Array.isArray(raw.nodes) ? raw.nodes.length : '?'}`)
+    if (diskVersion > cv.version) {
+      cv.graph = { nodes: (raw.nodes as CanvasNode[]) ?? [], edges: (raw.edges as CanvasEdge[]) ?? [] }
+      cv.version = diskVersion
+      console.log(`[media-studio] maybeReload(${canvasId}): APPLIED, now ${cv.graph.nodes.length} nodes`)
+    }
+  }
+
+  /** Migrate resultUrl paths in a canvas so they reference a new project id.
+   *
+   * When a project is re-registered under a different id (e.g. a legacy
+   * canvas promoted to a sourcePath project with a new id), every node's
+   * `resultUrl` that matches the old id must be rewritten to the new one
+   * so the media-file proxy can resolve it. Returns true when any url was
+   * actually rewritten; false means the canvas was already up to date.
+   * When `sourcePath` is provided the in-memory change is also persisted
+   * to disk immediately. */
+  async migrateProjectId(canvasId: string, fromId: string, toId: string, sourcePath?: string): Promise<boolean> {
+    if (fromId === toId) return false
+    const cv = this.canvasOf(canvasId)
+    let changed = false
+    for (const n of cv.graph.nodes) {
+      const url = (n.data as Record<string, unknown>).resultUrl as string | undefined
+      if (typeof url !== 'string' || !url.startsWith(`projects/${fromId}/`)) continue
+      ;(n.data as Record<string, unknown>).resultUrl = url.replace(
+        `projects/${fromId}/`,
+        `projects/${toId}/`,
+      )
+      changed = true
+    }
+    if (changed) {
+      console.log(`[media-studio] migrateProjectId(${canvasId}): ${fromId} → ${toId}, updated resultUrl on some nodes`)
+      // Await persist so the on-disk file stays in sync — callers must
+      // await this method to guarantee the migration is durable.
+      await this.persist(canvasId, cv, sourcePath)
+    }
+    return changed
+  }
+
+  private async persist(canvasId: string, cv: CanvasState, sourcePath?: string): Promise<void> {
+    const dest = this.canvasFilePath(canvasId, sourcePath)
     try {
-      await mkdir(dir, { recursive: true })
+      await mkdir(dirname(dest), { recursive: true })
       await writeFile(dest, JSON.stringify({ nodes: cv.graph.nodes, edges: cv.graph.edges, version: cv.version }, null, 2), 'utf8')
     } catch (e) {
       // Persistence failure is non-fatal: in-memory state is still

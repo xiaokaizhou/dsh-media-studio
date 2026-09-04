@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
+import { writeFileSync } from 'node:fs'
 // Type-only import — pulls in `@deepseek-ai/dsh-llm/lib/types/index.d.ts`
 // which declares `module '@deepseek-ai/cordis'` so `ctx.llm` is in scope.
 //
@@ -177,4 +178,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
   ctx.logger?.info?.(
     '[media-studio] registered canvas_graph_view + canvas_graph_patch + canvas_auto_arrange + canvas_refresh_node + /api/media-studio/canvas/{sse,state,patch,refresh} + /api/media-studio/projects*',
   )
+  // TEMP: confirm lib freshness end-to-end
+  try { writeFileSync('/tmp/dsh-media-studio-apply.txt', 'apply() ran at ' + new Date().toISOString()) } catch (e) { ctx.logger?.error?.('marker write failed: ' + (e as Error).message) }
 }

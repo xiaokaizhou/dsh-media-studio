@@ -94,8 +94,13 @@ export function registerSearchRoutes(ctx: Context): () => void {
             json(res, 400, { ok: false, error: 'no active project to receive the reference' })
             return
           }
-          const asset = await resolveAsset(h.workspaceRoot, assetProjectId, assetId)
-          const { nodeId, refCount } = addSoftRefToCanvas(h.canvasStore, canvasId, h.workspaceRoot, assetProjectId, asset)
+          // Honor the owning project's sourcePath so the resolved media
+          // path points at the user's project directory instead of the
+          // legacy wsRoot layout.
+          const ownerMeta = ps.snapshot().projects.find((p) => p.id === assetProjectId)
+          const ownerSourcePath = ownerMeta?.sourcePath
+          const asset = await resolveAsset(h.workspaceRoot, assetProjectId, assetId, ownerSourcePath)
+          const { nodeId, refCount } = addSoftRefToCanvas(h.canvasStore, canvasId, h.workspaceRoot, assetProjectId, asset, ownerSourcePath)
           json(res, 200, {
             ok: true,
             nodeId,

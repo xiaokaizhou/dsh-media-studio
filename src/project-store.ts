@@ -47,6 +47,13 @@ export interface ProjectMeta {
   createdAt: string
   updatedAt: string
   lastOpenedAt: string
+  /**
+   * Absolute path to the user-owned project directory. Canvas data
+   * (`.canvas.json`), asset index (`assets/.index.json`), and asset files
+   * (`assets/<kind>/<file>`) all live under here. media-studio itself only
+   * stores the registry (`projects.json`) plus trash / shared-assets.
+   */
+  sourcePath?: string
   /** True for projects auto-created from pre-upgrade canvases/*.json files. */
   legacy?: boolean
 }
@@ -237,6 +244,10 @@ export class ProjectStore {
           createdAt: now,
           updatedAt: now,
           lastOpenedAt: now,
+          // Legacy upgrade path: park under <wsRoot>/projects/<id> so existing
+          // data still resolves; users can later promote a project to a real
+          // source path via the rename/attach flow.
+          sourcePath: join(this.wsRoot, 'projects', id),
           legacy: true,
         }
       }
@@ -248,9 +259,16 @@ export class ProjectStore {
       }
     }
 
+    // Sync the canvas store's per-canvas sourcePath table before restore, so
+    // a project with `sourcePath` reads `.canvas.json` from its own directory.
+    for (const meta of Object.values(this.registry.projects)) {
+      this.canvasStore.setCanvasSourcePath(meta.id, meta.sourcePath)
+    }
     // Make sure every persisted canvas is in memory before any dependents
-    // scan runs (restore is version-guarded, so re-invocation is safe).
-    await this.canvasStore.restore()
+    // scan runs. Pass the full sourcePath map so sourcePath projects'
+    // .canvas.json files are picked up — without this, DSH restart loses
+    // every sourcePath project's canvas state.
+    await this.canvasStore.restore(this.allSourcePaths())
   }
 
   private registryPath(): string {
@@ -259,7 +277,7 @@ export class ProjectStore {
 
   // ── project operations (all serialized) ─────────────────────────────────
 
-  async createProject(name?: string): Promise<ProjectMeta> {
+  async createProject(name?: string, sourcePath?: string): Promise<ProjectMeta> {
     return this.serial(async () => {
       await this.readyPromise
       const trimmed = name?.trim() ?? ''
@@ -273,9 +291,14 @@ export class ProjectStore {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         lastOpenedAt: new Date().toISOString(),
+        sourcePath: typeof sourcePath === 'string' && sourcePath.trim() ? sourcePath.trim() : undefined,
       }
       await this.ensureProjectTemplate(meta.id)
+      await this.ensureProjectAgentsMd(meta)
       this.registry.projects[meta.id] = meta
+      // Tell the canvas store where this project's canvas lives so subsequent
+      // patches persist to the right file (sourcePath vs legacy layout).
+      this.canvasStore.setCanvasSourcePath(meta.id, meta.sourcePath)
       await this.setActiveLocked(meta.id)
       this.emit({ type: 'registry-changed' })
       return { ...meta }
@@ -287,11 +310,50 @@ export class ProjectStore {
       await this.readyPromise
       const meta = this.registry.projects[id]
       if (!meta) throw new Error(`openProject: project "${id}" not found`)
+      // Side effect: seed AGENTS.md on first open (covers legacy upgrades
+      // and projects created without a sourcePath at the time).
+      await this.ensureProjectAgentsMd(meta)
       meta.lastOpenedAt = new Date().toISOString()
       await this.setActiveLocked(id)
+      // Restore the canvas from disk so the in-memory state matches the
+      // persisted .canvas.json even when DSH was restarted or the canvas
+      // was never loaded (e.g. a project opened after boot). Without this,
+      // openProject would return a live canvas snapshot with 0 nodes.
+      await this.canvasStore.restore(this.canvasStore.allSourcePaths())
+      // Migrate stale resultUrl project ids: when a project was re-registered
+      // under a new id (e.g. legacy canvas promoted to a sourcePath project),
+      // every node's resultUrl that still points to the old id must be
+      // rewritten so the media-file proxy can resolve it.
+      await this._migrateCanvasProjectIds(id)
       this.emit({ type: 'project-open', projectId: id, name: meta.name, registry: this.snapshot() })
       return { ...meta }
     })
+  }
+
+  /** Scan the in-memory canvas for resultUrl values whose project id is no
+   *  longer in the registry; rewrite them to the current project id so the
+   *  media proxy can resolve them. Skips when ids match or no stale refs
+   *  are found. Awaits each migrateProjectId call so the on-disk .canvas.json
+   *  is updated before openProject returns. */
+  private async _migrateCanvasProjectIds(canvasId: string): Promise<void> {
+    try {
+      const snap = this.canvasStore.snapshot(canvasId)
+      const registeredIds = new Set(Object.keys(this.registry.projects))
+      const staleIds = new Set<string>()
+      for (const n of snap.graph.nodes) {
+        const url = (n.data as Record<string, unknown>).resultUrl as string | undefined
+        if (typeof url !== 'string') continue
+        const m = /^projects\/([a-z][\w-]+-[\w-]+)\//.exec(url)
+        if (!m) continue
+        const pid = m[1]
+        if (registeredIds.has(pid)) continue
+        staleIds.add(pid)
+      }
+      const src = this.registry.projects[canvasId]?.sourcePath
+      for (const oldId of staleIds) {
+        await this.canvasStore.migrateProjectId(canvasId, oldId, canvasId, src)
+      }
+    } catch { /* non-fatal — canvas may not be loaded yet */ }
   }
 
   async renameProject(id: string, name: string): Promise<ProjectMeta> {
@@ -301,12 +363,71 @@ export class ProjectStore {
       if (!meta) throw new Error(`renameProject: project "${id}" not found`)
       const err = validateProjectName(name)
       if (err) throw new Error(`renameProject rejected: ${err}`)
-      meta.name = name.trim()
+      const trimmed = name.trim()
+
+      // When the project owns a user-directory sourcePath (every project
+      // created from a folder picker has one, and so does a legacy upgrade
+      // once promoted), rename the directory on disk too — the on-disk
+      // folder name is the project's user-visible identity and the spec
+      // asks for the two to stay in lock-step.
+      //
+      // Edge cases handled:
+      //   • No sourcePath (legacy entry that was never promoted) — nothing
+      //     to rename on disk; the registry's sourcePath field is left as-is.
+      //   • New name equals the current basename — pure metadata update.
+      //   • Target directory already exists on disk — refuse rather than
+      //     overwrite, so an unrelated folder can't be silently clobbered.
+      //   • rename(2) fails (permissions, source missing) — surface the
+      //     error verbatim; the registry stays unchanged so the UI shows
+      //     the failure and the on-disk state is still consistent.
+      //   • Source path equals wsRoot/projects/<id> (legacy pre-upgrade
+      //     layout where sourcePath was synthesised by boot()) — that
+      //     directory is media-studio-owned and we DON'T touch it; only
+      //     the in-memory name changes.
+      let nextSourcePath = meta.sourcePath
+      const previousSourcePath = meta.sourcePath
+      if (meta.sourcePath && !this.isManagedLegacySourcePath(meta.id, meta.sourcePath)) {
+        const parent = dirname(meta.sourcePath)
+        const currentBase = meta.sourcePath.split(/[\\/]/).pop() ?? ''
+        const next = join(parent, trimmed)
+        if (next !== meta.sourcePath) {
+          try {
+            const { stat, rename: fsRename } = await import('node:fs/promises')
+            try {
+              await stat(next)
+              throw new Error(`renameProject rejected: a folder already exists at "${next}"`)
+            } catch (e) {
+              if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+            }
+            await fsRename(meta.sourcePath, next)
+            nextSourcePath = next
+          } catch (e) {
+            throw new Error(`renameProject: failed to rename project folder "${meta.sourcePath}" → "${next}": ${(e as Error).message}`)
+          }
+        }
+      }
+
+      meta.name = trimmed
       meta.updatedAt = new Date().toISOString()
+      if (nextSourcePath !== previousSourcePath) meta.sourcePath = nextSourcePath
       await this.persistRegistry()
+      // Re-thread the canvas store so subsequent reads/writes hit the new
+      // directory. The .canvas.json file follows the rename automatically;
+      // we only have to update the lookup table.
+      if (nextSourcePath !== previousSourcePath) {
+        this.canvasStore.setCanvasSourcePath(meta.id, nextSourcePath)
+      }
       this.emit({ type: 'registry-changed' })
       return { ...meta }
     })
+  }
+
+  /** True when a project's sourcePath was synthesised by boot() (legacy
+   *  upgrade, `join(wsRoot, 'projects', id)`) and therefore belongs to
+   *  media-studio's own workspace. Renames must leave such directories
+   *  alone — they aren't user-owned. */
+  private isManagedLegacySourcePath(id: string, sourcePath: string): boolean {
+    return sourcePath === join(this.wsRoot, 'projects', id)
   }
 
   /** Dependency preflight used by both the REST endpoint and deleteProject.
@@ -460,26 +581,78 @@ export class ProjectStore {
     return `未命名项目 ${n}`
   }
 
-  /** Create the four asset category dirs + an empty index for a project. */
+  /** Create the four asset category dirs + an empty index for a project.
+   *  Honors `sourcePath` so per-project assets live under the user's project
+   *  directory instead of the media-studio workspace. */
   private async ensureProjectTemplate(projectId: string): Promise<void> {
-    const root = this.projectAssetRoot(projectId)
+    const meta = this.registry.projects[projectId]
+    const root = this.resolveAssetRoot(projectId, meta?.sourcePath)
     try {
       for (const kind of ASSET_KINDS) {
         await mkdir(join(root, ASSET_CATEGORY_DIR[kind]), { recursive: true })
       }
-      const indexPath = join(root, 'index.json')
+      const indexPath = join(root, '.index.json')
       try {
         await readFile(indexPath, 'utf8')
       } catch {
-        await writeAssetIndex(root, { version: 1, assets: [] })
+        await writeAssetIndex(root, { version: 1, assets: [] }, '.index.json')
       }
     } catch (e) {
       console.warn(`[media-studio] ensureProjectTemplate(${projectId}) failed: ${(e as Error).message}`)
     }
   }
 
-  private projectAssetRoot(projectId: string): string {
-    return join(this.wsRoot, 'projects', projectId, 'assets')
+  /** Write a starter AGENTS.md into the project root when one is missing.
+   *  The file is owned by the user; media-studio only seeds it on first
+   *  project-create / project-open so subsequent agents have project
+   *  context without having to ask. */
+  async ensureProjectAgentsMd(meta: ProjectMeta): Promise<void> {
+    const root = meta.sourcePath
+    if (!root) return
+    const dest = join(root, 'AGENTS.md')
+    try {
+      await readFile(dest, 'utf8')
+      return /* already present — never clobber user edits */
+    } catch {
+      // fall through and seed
+    }
+    try {
+      await mkdir(root, { recursive: true })
+      await writeFile(dest, renderAgentsMd(meta), 'utf8')
+    } catch (e) {
+      console.warn(`[media-studio] seed AGENTS.md at ${dest} failed: ${(e as Error).message}`)
+    }
+  }
+
+  /** Resolve the on-disk assets directory for a project. Honors `sourcePath`
+   *  when present; falls back to the legacy `<wsRoot>/projects/<id>/assets`
+   *  layout for pre-upgrade entries that have no `sourcePath` recorded. */
+  resolveAssetRoot(projectId: string, sourcePath?: string): string {
+    return sourcePath ? join(sourcePath, 'assets') : join(this.wsRoot, 'projects', projectId, 'assets')
+  }
+
+  /** Read-side helper used by the asset-store + dependents scanner. Honors the
+   *  project's sourcePath so a single source of truth applies everywhere. */
+  projectAssetRoot(projectId: string): string {
+    return this.resolveAssetRoot(projectId, this.registry.projects[projectId]?.sourcePath)
+  }
+
+  /** Public: the absolute sourcePath for a project, or undefined when the
+   *  project uses the legacy wsRoot layout. Used by asset-routes to thread
+   *  the sourcePath through to asset-store helpers. */
+  resolveSourcePath(projectId: string): string | undefined {
+    return this.registry.projects[projectId]?.sourcePath
+  }
+
+  /** Snapshot of every registered project's sourcePath for the media-file
+   *  proxy's per-project rewrite table. Projects without a sourcePath are
+   *  omitted so the proxy falls back to the wsRoot + mediaRoots check. */
+  allSourcePaths(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const meta of Object.values(this.registry.projects)) {
+      if (meta.sourcePath) out[meta.id] = meta.sourcePath
+    }
+    return out
   }
 
   private sharedAssetRoot(): string {
@@ -487,8 +660,22 @@ export class ProjectStore {
   }
 
   private async disposeProjectAssets(projectId: string, mode: DeleteMode): Promise<void> {
-    const dir = dirname(this.projectAssetRoot(projectId)) // projects/<id>
-    await this.disposeFile(dir, mode)
+    const meta = this.registry.projects[projectId]
+    const root = this.projectAssetRoot(projectId)
+    // With sourcePath the project root is the USER's directory; we must
+    // never delete the directory itself, only the media-studio-owned bits
+    // under it (assets/ + .canvas.json + AGENTS.md). Without sourcePath
+    // we fall back to the legacy whole-dir delete so existing trash
+    // behaviour is preserved.
+    if (meta?.sourcePath) {
+      await this.disposeFile(root, mode) // assets/
+      await this.disposeFile(join(meta.sourcePath, '.canvas.json'), mode)
+      // AGENTS.md is user-editable and may be the only marker they kept
+      // about the deletion, so leave it in place for reference.
+    } else {
+      const dir = dirname(root) // <wsRoot>/projects/<id>
+      await this.disposeFile(dir, mode)
+    }
   }
 
   private async disposeFile(target: string, mode: DeleteMode): Promise<void> {
@@ -605,4 +792,46 @@ export class ProjectStore {
     }
     return brokenNodes
   }
+}
+
+// ── AGENTS.md seed ──────────────────────────────────────────────────────────
+
+/** Render the starter AGENTS.md for a freshly-registered project. The user
+ *  owns the file; media-studio only seeds it on first create/open so
+ *  subsequent agents can read project context without prompting. */
+function renderAgentsMd(meta: ProjectMeta): string {
+  const root = meta.sourcePath ?? '<unset>'
+  return `# ${meta.name} · media-studio 项目代理说明
+
+本目录已注册到 media-studio 项目表 (id: \`${meta.id}\`)。media-studio 只保留注册表索引 (\`~/.media-studio/projects.json\`) 与 trash / shared-assets；本项目的内容都归你所有。
+
+## 项目布局
+
+- 画布：\`./.canvas.json\` (隐藏文件，由 media-studio 维护；请勿手改)
+- 资产索引：\`./assets/.index.json\` (隐藏文件，由 media-studio 维护；请勿手改)
+- 资产文件：\`./assets/{characters,scenes,clips,audio}/<file>\` (不隐藏，agent 可直接读写)
+
+## 与 media-studio 的协作
+
+| 需求 | API |
+|---|---|
+| 把画布上的某个节点正式入库 | \`POST /api/media-studio/assets/register\` \`{projectId, canvasNodeId, kind, name?}\` |
+| 把画布节点最新结果同步到入库文件 | \`POST /api/media-studio/assets/sync-file\` \`{projectId, assetId}\` |
+| 改资产名 / 标签 | \`POST /api/media-studio/assets/update\` \`{projectId, assetId, name?, tags?}\` |
+| 跨项目复制资产 | \`POST /api/media-studio/assets/copy\` \`{projectId, assetId, targetProjectId}\` |
+| 看当前注册表 | \`GET /api/media-studio/projects\` |
+| 创建/打开/删除项目 | \`POST /api/media-studio/projects/{create,open,delete}\` |
+| 订阅注册表变更 | \`EventSource('/api/media-studio/projects/sse')\` |
+
+## 项目内资产约定
+
+- 资产文件名 = \`<assetId>.<ext>\`，与 \`assets/.index.json\` 的 \`file\` 字段保持一致
+- assetId 形如 \`a-<base36-time>-<hex>\`，由 media-studio 生成
+- 引用另一个项目的资产时，节点 \`data.assetRef = { projectId, assetId }\`，本地不复制文件
+
+## 客户端引用约定
+
+- 画布节点的 \`data.resultUrl\` 用**项目内相对路径** \`assets/<kind>/<file>\`，浏览器经 \`/api/media-studio/media-file\` 自动解析
+- 节点状态字段 \`data.status\` 必填 \`done\` / \`running\` / \`error\`，否则 UI 显示为"无媒体"
+`
 }

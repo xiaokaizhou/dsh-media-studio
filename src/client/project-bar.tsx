@@ -18,6 +18,7 @@ import {
   apiFetchDependents,
   apiOpenFolder,
   apiOpenProject,
+  apiPickFolder,
   apiRenameProject,
   fetchProjects,
   subscribeProjects,
@@ -25,7 +26,8 @@ import {
   type ProjectMetaAPI,
   type RegistryAPI,
 } from './projects-api'
-import { resolveLang, storeLang, translate, type Lang } from './i18n'
+import { type LocaleSource } from './i18n'
+import { useI18n } from './use-i18n-hook'
 import { IconPlus, IconTrash2, IconX } from './icons'
 import AssetLibraryPanel from './asset-panel'
 import GlobalSearch from './global-search'
@@ -55,21 +57,6 @@ function ClockIcon({ size = 12 }: { size?: number }) {
       <path d="M12 6v6l4 2" />
     </svg>
   )
-}
-
-// ── i18n react binding ─────────────────────────────────────────────────────
-
-function useI18n(): { lang: Lang; t: (key: string, vars?: Record<string, string | number>) => string; switchLang: (l: Lang) => void } {
-  const [lang, setLang] = useState<Lang>(resolveLang())
-  const t = useCallback(
-    (key: string, vars?: Record<string, string | number>) => translate(lang, key, vars),
-    [lang],
-  )
-  const switchLang = useCallback((next: Lang) => {
-    storeLang(next)
-    setLang(next)
-  }, [])
-  return { lang, t, switchLang }
 }
 
 // ── shared bits ────────────────────────────────────────────────────────────
@@ -106,6 +93,11 @@ export interface ProjectAppProps {
   fallbackCanvasId?: string
   /** Creates the <Canvas> element for the active project id. */
   renderCanvas: (canvasId: string) => ReactNode
+  /** Host LocaleSource (DSH Settings → Language). When provided the UI
+   *  subscribes to it and switches language in lock-step with the rest of
+   *  the DSH chrome; when omitted the bar falls back to its own
+   *  localStorage override (used by tests / standalone previews). */
+  locale?: LocaleSource | null
 }
 
 // ── Live canvas badge (version · state) for the top bar ──────────────────────
@@ -347,7 +339,7 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-menu-item:hover:not(:disabled) { background:var(--ms-panel-soft); color:var(--ms-fg); }
 .ms-pb-menu-item:disabled { opacity:0.4; cursor:not-allowed; }
 .ms-pb-menu-item svg { color:var(--ms-accent); flex:none; }
-.ms-pb-item-new { color:var(--ms-fg); font-weight:600; }
+.ms-pb-item-new { color:var(--ms-fg-dim); font-weight:inherit; }
 .ms-pb-sub-arrow { margin-left:auto; color:var(--ms-fg-faint); font-size:14px; line-height:1; }
 .ms-pb-back { color:var(--ms-fg-faint); font-weight:600; }
 .ms-pb-sep { height:1px; margin:6px 4px; background:var(--ms-border); }
@@ -440,7 +432,11 @@ function injectProjectBarStyles(): void {
 
 export default function ProjectApp(props: ProjectAppProps): ReactNode {
   const fallbackCanvasId = props.fallbackCanvasId ?? 'main'
-  const { lang, t, switchLang } = useI18n()
+  // The host LocaleSource (DSH Settings → Language) drives the active
+  // language; when absent we fall back to the localStorage override in
+  // useI18n. The legacy zh/en footer buttons were removed — switching is
+  // now done at the DSH level only.
+  const { t } = useI18n(props.locale ?? null)
 
   useEffect(() => {
     injectProjectBarStyles()
@@ -475,15 +471,11 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
     }
   }, [])
 
-  // Manual refresh: re-fetch the registry on demand (useful when the
-  // disabled state looks stuck — e.g. SSE dropped while the user was
-  // afk, or fetchProjects was racy with mount). Surface via the menu
-  // so the user can recover without reloading the whole tab.
-  const refreshRegistry = useCallback(() => {
-    void fetchProjects().then((res) => {
-      if (res.ok) setRegistry({ activeId: res.data.activeId, recent: res.data.recent, projects: res.data.projects })
-    })
-  }, [])
+  // Manual refresh entry removed: the project SSE stream (registry-changed
+  // / project-open / project-deleted events) is the authoritative source
+  // and pushes every host mutation the moment it lands, so a "reload now"
+  // affordance no longer earns its keep. Reconnecting to the stream on
+  // resume / tab focus is handled by the EventSource itself.
 
   // Close popups on Escape.
   useEffect(() => {
@@ -569,85 +561,20 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
     return res.ok
   }, [applyRegistry])
 
-  const pickFolder = useCallback(async (): Promise<FileList | null | undefined> => {
-    // undefined = both pickers unavailable, caller should fall back to
-    //   manual path input (tier 3).
-    // null = user cancelled (AbortError / explicit cancel).
-    // FileList = success, has at least one entry.
-    // 1) File System Access API (Chrome 86+ / Edge).
-    try {
-      const w = window as unknown as { showDirectoryPicker?: () => Promise<{ values: () => AsyncIterable<{ kind: string; getFile: () => Promise<File> }> }> }
-      if (typeof w.showDirectoryPicker === 'function') {
-        const handle = await w.showDirectoryPicker()
-        const files: File[] = []
-        for await (const entry of handle.values()) {
-          if (entry.kind === 'file') files.push(await entry.getFile())
-        }
-        // Fabricate a FileList-like object so the caller's `webkitRelativePath` lookup works.
-        return Object.assign(document.createElement('input'), { files }) as unknown as FileList
-      }
-    } catch (e) {
-      if (e instanceof DOMException && e.name === 'AbortError') return null
-      // showDirectoryPicker isn't available or threw — try the fallback.
-    }
-    // 2) <input webkitdirectory> (Safari + older Chrome + Hermes embedded webview).
-    return new Promise((resolve) => {
-      const input = document.createElement('input')
-      input.type = 'file'
-      ;(input as unknown as Record<string, unknown>).webkitdirectory = ''
-      input.setAttribute('directory', '')
-      input.style.display = 'none'
-      let settled = false
-      const finish = (result: FileList | null | undefined) => {
-        if (settled) return
-        settled = true
-        document.body.removeChild(input)
-        resolve(result)
-      }
-      input.onchange = () => finish(input.files && input.files.length ? input.files : null)
-      // Some browsers (Firefox) fire cancel on Escape inside the picker.
-      ;(input as unknown as { oncancel?: () => void }).oncancel = () => finish(null)
-      document.body.appendChild(input)
-      input.click()
-      // 60s hard timeout: if nothing happens (Hermes embedded view silently
-      // dropping the dialog), bail to tier 3 manual path input.
-      setTimeout(() => finish(undefined), 60_000)
-    })
-  }, [])
+  // Browser-side folder pickers (File System Access API / webkitdirectory)
+  // and the tier-3 absolute-path prompt were removed: they only produce a
+  // webkitRelativePath, not an absolute path, so they cannot mint a real
+  // `sourcePath` for the registered project. The sole entry point is the
+  // host-side NSOpenPanel below (handlePickNative), which returns a real
+  // POSIX path via osascript.
 
-const [pathPromptOpen, setPathPromptOpen] = useState(false)
-
-const handleOpenFolder = useCallback(async () => {
-    // Three-tier folder picker:
-    //   1) File System Access API showDirectoryPicker (Chrome 86+ / Edge)
-    //   2) <input webkitdirectory> fallback (Firefox, older Chrome, Hermes
-    //      embedded Chromium, etc.)
-    //   3) Manual absolute-path text input (last-resort — Hermes desktop's
-    //      embedded webview may block both pickers above)
-    // Tier 1 + 2 only return folder metadata in-browser; tier 3 accepts the
-    // path string the user types. None of these upload files anywhere —
-    // they only return a folder name to register as a project.
-    setMenuOpen(false)
-
-    // Tier 1 + 2: try the in-browser picker.
-    const files = await pickFolder()
-    if (files && files.length) {
-      const folderName = files[0].webkitRelativePath.split('/')[0] || `project-${Date.now().toString(36)}`
-      await commitOpen(folderName)
-      return
-    }
-    if (files === null) {
-      // Tier 1 + 2 threw a real error (user cancel signal); don't ask again.
-      return
-    }
-    // Tier 3: fallback path prompt.
-    setPathPromptOpen(true)
-  }, [applyRegistry])
-
-  const commitOpen = useCallback(async (folderName: string) => {
+  // commitOpen keeps the shared "create a project from a folder" path that
+  // the native picker hands us; the picker returns an absolute path so the
+  // project is registered with a real sourcePath.
+  const commitOpen = useCallback(async (folderName: string, sourcePath?: string) => {
     setBusy(true)
     try {
-      const res = await apiOpenFolder(folderName)
+      const res = await apiOpenFolder(folderName, sourcePath)
       if (res.ok) applyRegistry(res.data.registry)
       else console.warn('[media-studio] open-folder failed:', res.error)
     } finally {
@@ -655,12 +582,27 @@ const handleOpenFolder = useCallback(async () => {
     }
   }, [applyRegistry])
 
-  const submitPathPrompt = useCallback(async (rawPath: string) => {
-    const trimmed = rawPath.trim()
-    if (!trimmed) return
-    const tail = trimmed.split('/').filter(Boolean).pop() || trimmed
-    setPathPromptOpen(false)
-    await commitOpen(tail)
+  // Native macOS folder picker via host-side osascript. Returns the absolute
+  // path the user picked (e.g. /Users/x/Movies/douyin-viral-drama) — no
+  // file contents are uploaded; we just register that directory as the
+  // project's sourcePath.
+  const handlePickNative = useCallback(async () => {
+    setMenuOpen(false)
+    setBusy(true)
+    try {
+      const res = await apiPickFolder()
+      if (!res.ok) {
+        console.warn('[media-studio] pick-folder failed:', res.error)
+        return
+      }
+      if (res.data.canceled) return
+      const absPath = res.data.path
+      if (!absPath) return
+      const tail = absPath.split('/').filter(Boolean).pop() || absPath
+      await commitOpen(tail, absPath)
+    } finally {
+      setBusy(false)
+    }
   }, [commitOpen])
 
   // Delete-dialog internals (dependency analysis lives here).
@@ -697,7 +639,17 @@ const handleOpenFolder = useCallback(async () => {
     }
 
     return (
-      <div className="ms-pb-dialog" role="alertdialog" aria-modal="true" aria-label={t('dlg.delete.title')}>
+      <div
+        className="ms-pb-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label={t('dlg.delete.title')}
+        // Stop pointer events from bubbling to the backdrop so focusing the
+        // permanent-delete checkbox / cascade radios / clicking any label
+        // doesn't tear the dialog down before the user has picked a choice.
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="ms-pb-dialog-head">
           <span>{t('dlg.delete.title')}</span>
           <button type="button" className="ms-pb-icon-btn" onClick={() => setDialog(null)} aria-label={t('common.close')}>
@@ -787,7 +739,16 @@ const handleOpenFolder = useCallback(async () => {
       }
     }
     return (
-      <div className="ms-pb-dialog" role="dialog" aria-modal="true" aria-label={t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}>
+      <div
+        className="ms-pb-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}
+        // Stop pointer events from bubbling to the backdrop so focusing the
+        // input (or clicking anywhere inside the dialog) doesn't dismiss it.
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="ms-pb-dialog-head">
           <span>{t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}</span>
           <button type="button" className="ms-pb-icon-btn" onClick={() => setDialog(null)} aria-label={t('common.close')}>
@@ -834,10 +795,10 @@ const handleOpenFolder = useCallback(async () => {
             </span>
             <span className="ms-pb-row-actions" onClick={(e) => e.stopPropagation()}>
               {p.legacy && <span className="ms-pb-chip">{t('project.legacy')}</span>}
-              <button type="button" className="ms-pb-icon-btn" title={t('project.rename')} onClick={() => setDialog({ kind: 'rename', projectId: p.id, name: p.name })}>
+              <button type="button" className="ms-pb-icon-btn" title={t('project.rename')} onClick={() => { setMenuOpen(false); setDialog({ kind: 'rename', projectId: p.id, name: p.name }) }}>
                 <PencilIcon />
               </button>
-              <button type="button" className="ms-pb-icon-btn is-danger" title={t('project.delete')} onClick={() => setDialog({ kind: 'delete', projectId: p.id, name: p.name })}>
+              <button type="button" className="ms-pb-icon-btn is-danger" title={t('project.delete')} onClick={() => { setMenuOpen(false); setDialog({ kind: 'delete', projectId: p.id, name: p.name }) }}>
                 <IconTrash2 size={12} />
               </button>
             </span>
@@ -860,8 +821,8 @@ const handleOpenFolder = useCallback(async () => {
             <span className="ms-pb-caret">▾</span>
           </button>
           {activeProject ? (
-            <span className="ms-pb-cur" title={`${t('project.current')}: ${activeProject.name}`}>
-              {t('project.current')}: {activeProject.name}
+            <span className="ms-pb-cur" title={activeProject.name}>
+              {activeProject.name}
             </span>
           ) : (
             <span className="ms-pb-cur ms-pb-muted">{t('project.open.empty')}</span>
@@ -887,14 +848,18 @@ const handleOpenFolder = useCallback(async () => {
           >
             {view === 'home' ? (
               <>
-                <button type="button" role="menuitem" className="ms-pb-menu-item ms-pb-item-new" onClick={() => setDialog({ kind: 'new' })}>
+                <button type="button" role="menuitem" className="ms-pb-menu-item ms-pb-item-new" onClick={() => { setMenuOpen(false); setDialog({ kind: 'new' }) }}>
                   <IconPlus size={13} />
                   <span>{t('project.new')}</span>
                 </button>
-                <button type="button" role="menuitem" className="ms-pb-menu-item" onClick={() => handleOpenFolder()}>
+                {/* The only "open a folder" entry — the in-browser File System
+                    Access / webkitdirectory picker was removed because it
+                    neither produces an absolute path nor maps cleanly to the
+                    native macOS chooser; the user reaches the project root
+                    exclusively through the host-side NSOpenPanel below. */}
+                <button type="button" role="menuitem" className="ms-pb-menu-item" onClick={() => handlePickNative()}>
                   <FolderIcon size={13} />
-                  <span>{t('project.open')}</span>
-                  <span className="ms-pb-sub-arrow">›</span>
+                  <span>{t('project.open.local')}</span>
                 </button>
                 <button type="button" role="menuitem" className="ms-pb-menu-item" onClick={() => setView('recent')} disabled={recentItems.length === 0}>
                   <ClockIcon size={13} />
@@ -916,25 +881,15 @@ const handleOpenFolder = useCallback(async () => {
                   <span>{t('project.library')}</span>
                 </button>
                 <div className="ms-pb-sep" />
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="ms-pb-menu-item"
-                  onClick={() => { refreshRegistry(); setMenuOpen(false) }}
-                >
-                  <span style={{ fontSize: 13, lineHeight: 1 }}>↻</span>
-                  <span>{t('project.refresh')}</span>
-                </button>
-                <div className="ms-pb-sep" />
                 <div className="ms-pb-section-label">{t('project.current')}</div>
                 {activeProject ? (
                   <div className="ms-pb-project-row is-active" onClick={() => setMenuOpen(false)}>
                     <span className="ms-pb-row-name">{activeProject.name}</span>
                     <span className="ms-pb-row-actions" onClick={(e) => e.stopPropagation()}>
-                      <button type="button" className="ms-pb-icon-btn" title={t('project.rename')} onClick={() => setDialog({ kind: 'rename', projectId: activeProject.id, name: activeProject.name })}>
+                      <button type="button" className="ms-pb-icon-btn" title={t('project.rename')} onClick={() => { setMenuOpen(false); setDialog({ kind: 'rename', projectId: activeProject.id, name: activeProject.name }) }}>
                         <PencilIcon />
                       </button>
-                      <button type="button" className="ms-pb-icon-btn is-danger" title={t('project.delete')} onClick={() => setDialog({ kind: 'delete', projectId: activeProject.id, name: activeProject.name })}>
+                      <button type="button" className="ms-pb-icon-btn is-danger" title={t('project.delete')} onClick={() => { setMenuOpen(false); setDialog({ kind: 'delete', projectId: activeProject.id, name: activeProject.name }) }}>
                         <IconTrash2 size={12} />
                       </button>
                     </span>
@@ -942,14 +897,6 @@ const handleOpenFolder = useCallback(async () => {
                 ) : (
                   <div className="ms-pb-empty">{t('project.open.empty')}</div>
                 )}
-                <div className="ms-pb-sep" />
-                <div className="ms-pb-lang-row">
-                  <span className="ms-pb-section-label">{t('project.lang')}</span>
-                  <div className="ms-pb-lang-btns">
-                    <button type="button" className={lang === 'zh' ? 'is-on' : ''} onClick={() => switchLang('zh')}>中文</button>
-                    <button type="button" className={lang === 'en' ? 'is-on' : ''} onClick={() => switchLang('en')}>EN</button>
-                  </div>
-                </div>
               </>
             ) : (
               <>
@@ -966,6 +913,11 @@ const handleOpenFolder = useCallback(async () => {
       )}
 
       {dialog && createPortal(
+        // Backdrop: clicking the dim layer closes the dialog; clicks on the
+        // dialog itself (including any input/checkbox/radio inside it) must
+        // NOT bubble up here, otherwise typing in the rename input or ticking
+        // the permanent-delete checkbox would tear the dialog down. Each
+        // dialog body stops propagation at its own root below.
         <div className="ms-menu-backdrop" onClick={() => !busy && setDialog(null)}>
           {dialog.kind === 'delete' ? (
             <DeleteDialogContent target={dialog} />
@@ -979,58 +931,6 @@ const handleOpenFolder = useCallback(async () => {
       {libraryOpen && activeId && (
         <AssetLibraryPanel projectId={activeId} registry={registry} onClose={() => setLibraryOpen(false)} />
       )}
-
-      {pathPromptOpen && <PathPromptDialog onSubmit={submitPathPrompt} onClose={() => setPathPromptOpen(false)} busy={busy} />}
-    </div>
-  )
-}
-
-/** Tier-3 fallback: when neither File System Access API nor webkitdirectory
- *  surfaces a working dialog (Hermes desktop's embedded webview drops both),
- *  show a text input so the user can paste the absolute folder path.
- *  Nothing is uploaded — the path string is just used to derive a project
- *  name for registration. */
-function PathPromptDialog({ onSubmit, onClose, busy }: { onSubmit: (path: string) => Promise<void> | void; onClose: () => void; busy: boolean }) {
-  const [val, setVal] = useState('')
-  const inputRef = useRef<HTMLInputElement | null>(null)
-  useEffect(() => { inputRef.current?.focus() }, [])
-  return (
-    <div className="ms-menu-backdrop" onClick={() => !busy && onClose()}>
-      <div className="ms-pb-dialog" role="dialog" aria-modal="true" aria-label="输入文件夹路径" onClick={(e) => e.stopPropagation()}>
-        <div className="ms-pb-dialog-head">
-          <span>输入文件夹路径</span>
-          <button type="button" className="ms-pb-icon-btn" onClick={onClose} aria-label="关闭">
-            <IconX size={13} />
-          </button>
-        </div>
-        <div className="ms-pb-dialog-body">
-          <div className="ms-pb-muted" style={{ fontSize: 12 }}>
-            浏览器无法弹出系统选目录对话框,请直接粘贴本地文件夹的绝对路径(例如 <code>/Users/xiao/Movies/douyin-viral-drama</code>)。
-          </div>
-          <input
-            ref={inputRef}
-            type="text"
-            value={val}
-            onChange={(e) => setVal(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void onSubmit(val) }}
-            placeholder="/path/to/folder"
-            style={{
-              padding: '8px 10px',
-              borderRadius: 8,
-              border: '1px solid var(--ms-border-strong)',
-              background: 'var(--ms-surface, transparent)',
-              color: 'var(--ms-fg)',
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              fontSize: 12,
-              outline: 'none',
-            }}
-          />
-        </div>
-        <div className="ms-pb-dialog-actions">
-          <button type="button" className="ms-btn-cancel" onClick={onClose} disabled={busy}>取消</button>
-          <button type="button" className="ms-btn-primary" onClick={() => void onSubmit(val)} disabled={busy || !val.trim()}>确定</button>
-        </div>
-      </div>
     </div>
   )
 }

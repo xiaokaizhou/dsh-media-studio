@@ -97,13 +97,32 @@ function isUnderRoot(target: string, root: string): boolean {
  * admin opted into (typically the project folder an agent writes generated
  * media to). Everything else is refused — a relative `path` query still
  * resolves against `workspaceRoot`, so `../../../etc/passwd` stays a 403.
+ *
+ * When `projectRoots` is provided, a `requested` of the form
+ * `projects/<id>/<rest>` is rewritten to `<root>/<rest>` (where `<root>` is
+ * the project's sourcePath from `projectRoots`). This is how the canvas
+ * client can keep using the existing `projects/<id>/assets/<kind>/<file>`
+ * URL convention while the bytes themselves live inside the user's project
+ * directory instead of the workspace.
  */
 export function resolveMediaTarget(
   requested: string,
   workspaceRoot: string,
   mediaRoots: readonly string[] = [],
+  projectRoots: Record<string, string> = {},
 ): { ok: true; target: string } | { ok: false } {
   const wsRoot = resolve(workspaceRoot)
+  // Per-project rewrite: projects/<id>/assets/<rest> → <sourcePath>/assets/<rest>
+  const projMatch = /^projects\/([^/]+)\/(.+)$/.exec(requested)
+  if (projMatch) {
+    const [, projId, rest] = projMatch
+    const sourcePath = projectRoots[projId]
+    if (sourcePath) {
+      const target = resolve(sourcePath, rest)
+      if (isUnderRoot(target, sourcePath)) return { ok: true, target }
+      return { ok: false }
+    }
+  }
   const target = resolve(wsRoot, requested)
   const roots = [wsRoot, ...mediaRoots.filter((r) => typeof r === 'string' && r.trim() !== '')]
   return roots.some((r) => isUnderRoot(target, r)) ? { ok: true, target } : { ok: false }
@@ -238,7 +257,8 @@ export function registerCanvasRoutes(ctx: Context): () => void {
         return
       }
       const handles = getMediaStudioHandles()
-      const resolved = resolveMediaTarget(requested, handles.workspaceRoot, handles.mediaRoots ?? [])
+      const projectRoots = handles.projectStore?.allSourcePaths?.() ?? {}
+      const resolved = resolveMediaTarget(requested, handles.workspaceRoot, handles.mediaRoots ?? [], projectRoots)
       if (!resolved.ok) {
         res.writeHead(403, { 'Content-Type': 'application/json' })
         res.end('{"ok":false,"error":"forbidden: path is outside workspaceRoot and every configured mediaRoots entry"}')

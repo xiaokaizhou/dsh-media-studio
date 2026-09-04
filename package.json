@@ -61,7 +61,8 @@
     },
     "client": {
       "inject": [
-        "betterSidebar"
+        "betterSidebar",
+        "locale"
       ],
       "platform": "web"
     }

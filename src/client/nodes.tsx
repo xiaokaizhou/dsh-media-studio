@@ -418,12 +418,69 @@ function useInViewOnce(): { containerRef: (el: HTMLDivElement | null) => void; v
   return { containerRef: setEl, visible }
 }
 
-function LazyVideo({ src }: { src: string }) {
+function LazyVideo({ src, poster }: { src: string; poster?: string | null }) {
   const { containerRef, visible } = useInViewOnce()
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const [started, setStarted] = useState(false)
+  const [posterFailed, setPosterFailed] = useState(false)
+
+  // Before the FIRST click the card contains ONLY the poster <img> + a play
+  // badge — no <video> element at all. This sidesteps Safari's unreliable
+  // <video poster> attribute AND its stacking of overlay layers above a
+  // <video> element; the poster is rendered exactly like a plain image card,
+  // which works in every browser. The video mounts on first click (then native
+  // controls take over).
+  const showPoster = !started && !posterFailed && !!poster
+
+  // Start playback once the video mounts after the click (the click itself is
+  // the user gesture, so autoplay policy allows play() right after).
+  useEffect(() => {
+    if (!started) return
+    const v = videoRef.current
+    if (!v) return
+    v.play().catch(() => { /* autoplay rejected — native controls still usable */ })
+  }, [started])
+
   return (
-    <div ref={containerRef} className="media-fill media-video-slot" title="▶ 播放">
+    <div
+      ref={containerRef}
+      className="media-fill media-video-slot"
+      title="▶ 播放"
+      onClick={() => { if (!started) setStarted(true) }}
+    >
       {visible ? (
-        <video className="media-fill media-video" src={src} controls preload="metadata" playsInline />
+        <>
+          {showPoster && (
+            <img
+              className="media-video-poster"
+              src={poster || undefined}
+              alt=""
+              draggable={false}
+              onError={() => {
+                setPosterFailed(true)
+                console.warn('[media-studio] video poster failed to load:', poster)
+              }}
+            />
+          )}
+          {!started && (
+            <div className="media-video-play-btn" aria-hidden="true">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                <circle cx="14" cy="14" r="13" fill="rgba(0,0,0,0.55)" stroke="rgba(255,255,255,0.7)" strokeWidth="1.5" />
+                <path d="M11 9.5l7 4.5-7 4.5V9.5z" fill="white" />
+              </svg>
+            </div>
+          )}
+          {started && (
+            <video
+              ref={videoRef}
+              className="media-fill media-video"
+              src={src}
+              controls
+              autoPlay
+              playsInline
+            />
+          )}
+        </>
       ) : (
         <span className="media-lazy-hint">▶</span>
       )}
@@ -442,23 +499,61 @@ function LazyAudio({ src }: { src: string }) {
   const [duration, setDuration] = useState(0)
   const [decoded, setDecoded] = useState(false)
   const [decodeError, setDecodeError] = useState<string | null>(null)
+  // While the user drags the scrub bar / waveform, `timeupdate` must not
+  // write `time` back (it would fight the thumb mid-drag).
+  const scrubbingRef = useRef(false)
+  // Active pointer drag on the waveform canvas (for seek-by-drag).
+  const waveDragRef = useRef<{ pointerId: number } | null>(null)
+  // Track which src we decoded — regenerating a node produces a new
+  // resultUrl → new src on the same component; stale peaks must not survive.
+  const decodedSrcRef = useRef<string | null>(null)
 
+  // Playback state is driven by the <audio> element's own events so the UI
+  // can never desync from the browser (autoplay-policy rejection, buffering,
+  // external pause, ended…). `scrubbingRef` gates timeupdate during a drag.
   useEffect(() => {
     if (!visible || !src) return
     const audio = audioRef.current
     if (!audio) return
     const onMeta = () => setDuration(audio.duration || 0)
-    const onTime = () => setTime(audio.currentTime || 0)
+    const onTime = () => {
+      if (scrubbingRef.current) return
+      setTime(audio.currentTime || 0)
+    }
+    const onPlay = () => setPlaying(true)
+    const onPause = () => setPlaying(false)
     const onEnd = () => setPlaying(false)
     audio.addEventListener('loadedmetadata', onMeta)
+    audio.addEventListener('durationchange', onMeta)
     audio.addEventListener('timeupdate', onTime)
+    audio.addEventListener('play', onPlay)
+    audio.addEventListener('playing', onPlay)
+    audio.addEventListener('pause', onPause)
     audio.addEventListener('ended', onEnd)
     return () => {
       audio.removeEventListener('loadedmetadata', onMeta)
+      audio.removeEventListener('durationchange', onMeta)
       audio.removeEventListener('timeupdate', onTime)
+      audio.removeEventListener('play', onPlay)
+      audio.removeEventListener('playing', onPlay)
+      audio.removeEventListener('pause', onPause)
       audio.removeEventListener('ended', onEnd)
     }
   }, [visible, src])
+
+  // Reset transport + decode state when the underlying file changes (a
+  // refresh regenerates the node → new resultUrl → new src on this very
+  // component instance).
+  useEffect(() => {
+    if (decodedSrcRef.current === src) return
+    decodedSrcRef.current = src
+    peaksRef.current = null
+    setDecoded(false)
+    setTime(0)
+    setDuration(0)
+    setPlaying(false)
+    setDecodeError(null)
+  }, [src])
 
   // WebAudio decode → peaks for real waveform.
   useEffect(() => {
@@ -533,8 +628,23 @@ function LazyAudio({ src }: { src: string }) {
     const mid = cssH / 2
     const dur = duration || 1
     const playedRatio = Math.min(1, Math.max(0, time / dur))
+    // Low-level audio (ambience beds, quiet VO) has raw linear peaks far
+    // below full scale (e.g. ~0.01–0.05), which would otherwise render as a
+    // near-flat 2px strip with no visible waveform. Apply a display-only
+    // gain so the tallest bar reaches ~92% of the canvas while preserving
+    // relative dynamics; loud/regular audio (max peak ≥ 0.1 ≈ −20 dBFS)
+    // is left untouched (gain = 1).
+    let maxPeak = 0
     for (let i = 0; i < bars; i += 1) {
-      const peak = peaks[i] ?? 0
+      const p = peaks[i] ?? 0
+      if (p > maxPeak) maxPeak = p
+    }
+    let displayGain = 1
+    if (maxPeak > 0 && maxPeak < 0.1) {
+      displayGain = Math.min(0.92 / maxPeak, 64) // cap: don't blow up near-silence noise
+    }
+    for (let i = 0; i < bars; i += 1) {
+      const peak = Math.min(1, (peaks[i] ?? 0) * displayGain)
       const h = Math.max(2, peak * (cssH * 0.92))
       const x = i * bw + 1
       const w = Math.max(1, bw - 2)
@@ -545,36 +655,104 @@ function LazyAudio({ src }: { src: string }) {
     }
   }, [decoded, time, duration, visible])
 
-  const toggle = () => {
+  const toggle = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation()
     const audio = audioRef.current
     if (!audio) return
     if (audio.paused) {
-      audio.play().catch(() => { /* user gesture missing or media error */ })
-      setPlaying(true)
+      // `playing` is driven by the audio element's own events ('play' /
+      // 'playing'), so a rejected play() (autoplay policy, missing media)
+      // can never leave the UI claiming to be playing.
+      const p = audio.play()
+      if (p) p.catch(() => { /* state stays false — no 'playing' event */ })
     } else {
-      audio.pause()
-      setPlaying(false)
+      audio.pause() // 'pause' event → setPlaying(false)
     }
+  }
+
+  const scrubTo = (t: number) => {
+    const audio = audioRef.current
+    if (!audio || !Number.isFinite(t)) return
+    const dur = audio.duration || duration || 0
+    const clamped = Math.max(0, Math.min(t, dur || t))
+    audio.currentTime = clamped
+    setTime(clamped)
   }
 
   const scrub = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const t = Number(e.target.value)
-    const audio = audioRef.current
-    if (audio && Number.isFinite(t)) {
-      audio.currentTime = t
-      setTime(t)
-    }
+    scrubTo(Number(e.target.value))
   }
 
-  const seekByRatio = (clientX: number) => {
+  const seekAtClientX = (clientX: number) => {
     const canvas = canvasRef.current
     const audio = audioRef.current
-    if (!canvas || !audio || !duration) return
+    if (!canvas || !audio) return
     const r = canvas.getBoundingClientRect()
+    if (r.width <= 0) return
+    const dur = audio.duration || duration || 0
+    if (!dur) return
     const ratio = Math.min(1, Math.max(0, (clientX - r.left) / r.width))
-    const t = ratio * duration
-    audio.currentTime = t
-    setTime(t)
+    scrubTo(ratio * dur)
+  }
+
+  // ── Waveform pointer drag-to-seek ──────────────────────────────────────
+  // `.nodrag` keeps xyflow's node drag from hijacking the gesture; pointer
+  // capture keeps the seek working even when the cursor leaves the canvas
+  // mid-drag. `scrubbingRef` gates timeupdate so the playhead doesn't fight
+  // the user's finger during the drag.
+  const onWavePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!e.isPrimary) return
+    e.stopPropagation()
+    scrubbingRef.current = true
+    waveDragRef.current = { pointerId: e.pointerId }
+    const canvas = canvasRef.current
+    if (canvas) { try { canvas.setPointerCapture(e.pointerId) } catch { /* already captured */ } }
+    seekAtClientX(e.clientX)
+  }
+
+  const onWavePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = waveDragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    e.stopPropagation()
+    seekAtClientX(e.clientX)
+  }
+
+  const endWaveDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = waveDragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    waveDragRef.current = null
+    scrubbingRef.current = false
+    const canvas = canvasRef.current
+    if (canvas) { try { canvas.releasePointerCapture(e.pointerId) } catch { /* ignore */ } }
+  }
+
+  // Keyboard seeking: the canvas is a real slider control (tabIndex 0).
+  const onWaveKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    const audio = audioRef.current
+    if (!audio) return
+    const dur = audio.duration || duration || 0
+    const cur = audio.currentTime || 0
+    const step = e.shiftKey ? 10 : 1
+    let next: number | null = null
+    if (e.key === 'ArrowRight') next = cur + step
+    else if (e.key === 'ArrowLeft') next = cur - step
+    else if (e.key === 'Home') next = 0
+    else if (e.key === 'End') next = dur
+    if (next === null) return
+    e.preventDefault()
+    e.stopPropagation()
+    scrubTo(next)
+  }
+
+  // Scrub-bar drag lock: suppress timeupdate while the thumb is being
+  // dragged so a still-playing track can't yank it back mid-scrub.
+  const onScrubPointerDown = (e: React.PointerEvent<HTMLInputElement>) => {
+    if (!e.isPrimary) return
+    scrubbingRef.current = true
+  }
+  const endScrub = (e: React.PointerEvent<HTMLInputElement>) => {
+    scrubbingRef.current = false
+    scrubTo(Number(e.currentTarget.value))
   }
 
   const fmt = (t: number) => {
@@ -590,24 +768,38 @@ function LazyAudio({ src }: { src: string }) {
         <div className="ms-audio-editor">
           <canvas
             ref={canvasRef}
-            className="ms-audio-wave"
-            onClick={(e) => seekByRatio(e.clientX)}
+            className="ms-audio-wave nodrag"
+            onPointerDown={onWavePointerDown}
+            onPointerMove={onWavePointerMove}
+            onPointerUp={endWaveDrag}
+            onPointerCancel={endWaveDrag}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={onWaveKeyDown}
             role="slider"
-            aria-label="Audio waveform (click to seek)"
+            aria-label="Audio waveform"
+            aria-valuemin={0}
+            aria-valuemax={Math.round((duration || 0) * 1000) / 1000}
+            aria-valuenow={Math.round(time * 1000) / 1000}
+            aria-valuetext={`${fmt(time)} of ${fmt(duration)}`}
+            tabIndex={0}
           />
           <div className="ms-audio-controls">
-            <button type="button" className="ms-audio-play" onClick={toggle} aria-label={playing ? 'Pause' : 'Play'}>
+            <button type="button" className="ms-audio-play nodrag" onClick={toggle} aria-label={playing ? 'Pause' : 'Play'}>
               {playing ? '❚❚' : '▶'}
             </button>
             <span className="ms-audio-time">{fmt(time)}</span>
             <input
               type="range"
-              className="ms-audio-scrub"
+              className="ms-audio-scrub nodrag"
               min={0}
               max={duration || 0}
               step={0.1}
               value={time}
               onChange={scrub}
+              onPointerDown={onScrubPointerDown}
+              onPointerUp={endScrub}
+              onPointerCancel={endScrub}
               aria-label="Seek"
             />
             <span className="ms-audio-time">{fmt(duration)}</span>
@@ -680,7 +872,7 @@ function MediaCardBody({ kind, nodeId, d }: {
       )}
 
       {kind === 'video' && raw && (
-        <LazyVideo src={src} />
+        <LazyVideo src={src} poster={d.poster ? mediaSrc(d.poster as string) : null} />
       )}
       {kind === 'video' && !raw && (
         <Placeholder

@@ -1,14 +1,34 @@
 // Minimal zh/en i18n for the media-studio UI chrome.
 //
-// Language resolution: localStorage `dsh-media-studio:lang` override wins,
-// else the browser language (zh-* → zh, otherwise en). Components subscribe
-// through useI18n() so a runtime switch (project menu footer) re-renders.
+// Language resolution when wired to the host:
+//   1) The DSH-wide `ctx.locale` service (Settings → Language row) is the
+//      preferred source — that's the only switch a user can ever need, since
+//      one DSH session is shared across tabs.
+//   2) When running outside dsh-web (tests / standalone), useI18n() falls back
+//      to a per-plugin localStorage key and the browser language, so a smoke
+//      page can still render without ctx.locale mounted.
 //
 // Keys are added as features land; M4 sweeps the remaining legacy strings
 // (add-node catalog, view bar, node menus) into this table so the whole UI
 // chrome is covered.
 
 export type Lang = 'zh' | 'en'
+
+/** Shape the host's `ctx.locale` service exposes to the consumer. The
+ *  concrete type is `LocaleRuntime` (see @deepseek-ai/dsh-client-locale),
+ *  but the project entry avoids a hard import so the client bundle stays
+ *  external to the locale module. */
+export interface LocaleSource {
+  getSnapshot(): { active: string; revision: number }
+  subscribe(fn: () => void): () => void
+  translate(ns: string, key: string, vars?: Record<string, string | number>): string
+  register(
+    ns: string,
+    dicts: Record<Lang, Record<string, string>>,
+  ): () => void
+}
+
+export const LOCALE_NS = 'media-studio'
 
 const STORAGE_KEY = 'dsh-media-studio:lang'
 
@@ -20,6 +40,7 @@ const DICT = {
     'project.open': '打开',
     'project.open.title': '打开项目',
     'project.open.empty': '还没有任何项目',
+    'project.open.local': '打开本地',
     'project.recent': '最近打开',
     'project.recent.title': '最近打开',
     'project.recent.empty': '暂无最近打开记录',
@@ -125,6 +146,7 @@ const DICT = {
     'project.open': 'Open',
     'project.open.title': 'Open Project',
     'project.open.empty': 'No projects yet',
+    'project.open.local': 'Open local folder…',
     'project.recent': 'Recent',
     'project.recent.title': 'Recent Projects',
     'project.recent.empty': 'No recent projects',
@@ -245,14 +267,40 @@ export function storeLang(lang: Lang): void {
   } catch { /* ignore */ }
 }
 
-/** Translate a key with optional {placeholders}. Safe fallback to the key. */
+/** Normalize an arbitrary locale id (zh-CN / en-US / ...) to the shipped
+ *  zh|en pair. Anything not starting with `zh` falls back to `en`. */
+export function normalizeLang(id: string | undefined | null): Lang {
+  if (typeof id !== 'string') return 'zh'
+  return /^zh\b/i.test(id) ? 'zh' : 'en'
+}
+
+/** Direct translation lookup used when no LocaleSource is available
+ *  (tests / standalone previews). Identical signature to the host's
+ *  LocaleRuntime.translate() so call sites can pick at runtime. */
 export function translate(lang: Lang, key: string, vars?: Record<string, string | number>): string {
   const table = DICT[lang] as Record<string, string>
-  let s = table[key] ?? (DICT.zh as Record<string, string>)[key] ?? key
+  let s = table[key] ?? (DICT.en as Record<string, string>)[key] ?? key
   if (vars) {
     for (const [k, v] of Object.entries(vars)) {
       s = s.replaceAll(`{${k}}`, String(v))
     }
   }
   return s
+}
+
+/** Register the media-studio dictionaries into a host LocaleSource under
+ *  the {@link LOCALE_NS} namespace. Safe to call multiple times (the
+ *  LocaleRuntime rejects duplicates); the disposer is returned for
+ *  ctx.effect wiring. The fallback path (no LocaleSource) is a no-op. */
+export function registerLocaleDictionaries(source: LocaleSource | undefined | null): () => void {
+  if (!source) return () => {}
+  try {
+    return source.register(LOCALE_NS, { zh: DICT.zh as Record<string, string>, en: DICT.en as Record<string, string> })
+  } catch (e) {
+    // Duplicate (ns, locale) is the only realistic failure here — we keep
+    // the dictionaries on the first call; second callers stay silent rather
+    // than tearing the page down at boot.
+    console.warn('[media-studio] registerLocaleDictionaries failed:', (e as Error).message)
+    return () => {}
+  }
 }

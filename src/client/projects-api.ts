@@ -10,6 +10,8 @@ export interface ProjectMetaAPI {
   createdAt: string
   updatedAt: string
   lastOpenedAt: string
+  /** Absolute path to the user's project directory; absent for legacy entries. */
+  sourcePath?: string
   legacy?: boolean
 }
 
@@ -52,12 +54,12 @@ export function fetchProjects(): Promise<ApiResult<RegistryAPI & { recentLimit?:
   return requestJson('/api/media-studio/projects')
 }
 
-export function apiCreateProject(name?: string): Promise<ApiResult<{ project: ProjectMetaAPI; registry: RegistryAPI }>> {
-  return requestJson('/api/media-studio/projects/create', { method: 'POST', body: JSON.stringify({ name: name ?? '' }) })
+export function apiCreateProject(name?: string, sourcePath?: string): Promise<ApiResult<{ project: ProjectMetaAPI; registry: RegistryAPI }>> {
+  return requestJson('/api/media-studio/projects/create', { method: 'POST', body: JSON.stringify({ name: name ?? '', sourcePath }) })
 }
 
-export function apiOpenFolder(folderName: string): Promise<ApiResult<{ project: ProjectMetaAPI; registry: RegistryAPI }>> {
-  return requestJson('/api/media-studio/projects/open-folder', { method: 'POST', body: JSON.stringify({ folderName }) })
+export function apiOpenFolder(folderName: string, sourcePath?: string): Promise<ApiResult<{ project: ProjectMetaAPI; registry: RegistryAPI }>> {
+  return requestJson('/api/media-studio/projects/open-folder', { method: 'POST', body: JSON.stringify({ folderName, sourcePath }) })
 }
 
 export function apiPickFolder(): Promise<ApiResult<{ canceled: boolean; path: string | null }>> {

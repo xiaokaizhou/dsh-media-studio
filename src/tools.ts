@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { CanvasStore, type CanvasOp, type CanvasSnapshot, type CanvasNode } from './canvas-store'
 import { join } from 'node:path'
 import { getMediaStudioHandles } from './service-state'
+import { prepareVideoForCanvas } from './video-cover'
 
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -98,7 +99,7 @@ async function callMultimodal(
   name: string,
   args: Record<string, unknown>,
   signal: AbortSignal,
-): Promise<{ ok: boolean; url?: string; model?: string; code?: string; message?: string }> {
+): Promise<{ ok: boolean; url?: string; model?: string; coverUrl?: string; code?: string; message?: string }> {
   try {
     // The tool shape, per dsh-tools, is `{ name, arguments, signal, callId }`.
     // For our purposes the harness mints a callId; we just pass our signal.
@@ -110,10 +111,14 @@ async function callMultimodal(
       signal,
     })
     const out = (exec as { value?: unknown; isError?: boolean })?.value ?? exec
-    const v = out as { success?: boolean; videoUrl?: string; url?: string; model?: string; message?: string }
+    // `coverUrl` is set by `dsh-llm-multimodal/generate_video` when the
+    // provider response carries a sibling image — media-studio's video-cover
+    // pipeline uses it to embed the first frame into the MP4 so project
+    // directories stay clean (no sibling .thumb.jpg).
+    const v = out as { success?: boolean; videoUrl?: string; url?: string; model?: string; message?: string; coverUrl?: string }
     if (v && v.success) {
       const url = v.videoUrl || v.url
-      return { ok: true, url, model: v.model }
+      return { ok: true, url, model: v.model, coverUrl: v.coverUrl }
     }
     return { ok: false, code: 'multimodal-failed', message: v?.message || JSON.stringify(out).slice(0, 200) }
   } catch (e) {
@@ -154,6 +159,10 @@ export async function executeNodeRefresh(
   try {
     let resultUrl: string | undefined
     let newPrompt: string
+    /** Video-only: optional poster path produced by prepareVideoForCanvas
+     *  (provider-cover embed success means poster stays null and the
+     *  attached_pic stream paints itself; extract success sets it). */
+    let videoPoster: string | null = null
 
     if (kind === 'image') {
       newPrompt = basePrompt
@@ -174,7 +183,20 @@ export async function executeNodeRefresh(
         model: (node.data.model as string | undefined) || undefined,
       }, signal)
       if (!r.ok || !r.url) return { ok: false, code: r.code || 'video-failed', message: r.message || 'no url', kind }
-      resultUrl = r.url
+      // prepareVideoForCanvas may rewrite r.url to a local copy under
+      // web-jobs/ AND optionally attach (or extract) a poster. Failures are
+      // non-fatal — we always fall back to the provider URL.
+      const wsRoot = getMediaStudioHandles().workspaceRoot
+      const prepared = await prepareVideoForCanvas(r.url, {
+        wsRoot,
+        // Prefer the typed `coverUrl` field returned by dsh-llm-multimodal;
+        // `providerExtras` is a belt-and-suspenders fallback for providers
+        // that stuff the cover URL into an unmodeled JSON field.
+        coverUrl: r.coverUrl,
+        providerExtras: r,
+      })
+      resultUrl = prepared.url
+      videoPoster = prepared.poster
     } else if (kind === 'music') {
       newPrompt = context || '(no upstream text content)'
       const r = await callMultimodal(ctx, 'generate_music', {
@@ -194,6 +216,7 @@ export async function executeNodeRefresh(
         status: 'done' as const,
         resultUrl,
         prompt: newPrompt,
+        ...(kind === 'video' && videoPoster ? { poster: videoPoster } : {}),
         ...(kind === 'music' ? { text: newPrompt } : {}),
       },
     }

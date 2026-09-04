@@ -26,6 +26,7 @@ import {
   type AssetKind,
   loadAssetIndex,
   projectAssetRoot,
+  projectAssetRootAt,
 } from './asset-store'
 import type { ProjectMeta } from './project-store'
 
@@ -73,9 +74,11 @@ export function nodeTypeForAssetKind(kind: AssetKind): 'image' | 'music' | 'vide
   return 'image'
 }
 
-/** Absolute media-file path of a library asset (proxy-servable). */
-export function assetMediaPath(wsRoot: string, projectId: string, a: Asset): string {
-  return join(projectAssetRoot(wsRoot, projectId), ASSET_CATEGORY_DIR[a.kind], a.file)
+/** Absolute media-file path of a library asset (proxy-servable).
+ *  Honors `sourcePath` so source-path projects' assets resolve to their
+ *  user-owned directory instead of the media-studio workspace. */
+export function assetMediaPath(wsRoot: string, projectId: string, sourcePath: string | undefined, a: Asset): string {
+  return join(projectAssetRootAt(sourcePath, wsRoot, projectId), ASSET_CATEGORY_DIR[a.kind], a.file)
 }
 
 const KIND_LABEL_ORDER: Record<string, number> = { character: 0, scene: 1, audio: 2, clip: 3, image: 4, music: 5, video: 6 }
@@ -165,7 +168,7 @@ export async function runSearch(input: RunSearchInput): Promise<SearchResult> {
   const nodeScores: Array<{ item: SearchItem; score: number; ownerId: string }> = []
 
   for (const p of input.projects) {
-    const index = await loadAssetIndex(projectAssetRoot(input.wsRoot, p.id))
+    const index = await loadAssetIndex(projectAssetRootAt(p.sourcePath, input.wsRoot, p.id))
     for (const a of index.assets) {
       const score = scoreAsset(q, a)
       if (score <= 0) continue
@@ -188,7 +191,7 @@ export async function runSearch(input: RunSearchInput): Promise<SearchResult> {
           prompt: (a.origin as { prompt?: string } | undefined)?.prompt,
           bytes: a.bytes,
           updatedAt: a.updatedAt,
-          srcRaw: assetMediaPath(input.wsRoot, p.id, a),
+          srcRaw: assetMediaPath(input.wsRoot, p.id, p.sourcePath, a),
           alreadyRefCount: relCount,
         },
       })
@@ -271,10 +274,11 @@ export function addSoftRefToCanvas(
   wsRoot: string,
   ownerProjectId: string,
   asset: Asset,
+  ownerSourcePath?: string,
 ): { nodeId: string; refCount: number } {
   const nodeId = `ref-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
   const nodeType = nodeTypeForAssetKind(asset.kind)
-  const mediaPath = assetMediaPath(wsRoot, ownerProjectId, asset)
+  const mediaPath = assetMediaPath(wsRoot, ownerProjectId, ownerSourcePath, asset)
   canvasStore.apply(canvasId, [
     {
       op: 'addNode',
@@ -302,9 +306,15 @@ export function addSoftRefToCanvas(
   return { nodeId, refCount }
 }
 
-/** Resolve an asset by owner+id (throws when missing). */
-export async function resolveAsset(wsRoot: string, ownerProjectId: string, assetId: string): Promise<Asset> {
-  const index = await loadAssetIndex(projectAssetRoot(wsRoot, ownerProjectId))
+/** Resolve an asset by owner+id (throws when missing). Honors the project's
+ *  sourcePath so assets in user-owned project directories resolve correctly. */
+export async function resolveAsset(
+  wsRoot: string,
+  ownerProjectId: string,
+  assetId: string,
+  sourcePath?: string,
+): Promise<Asset> {
+  const index = await loadAssetIndex(projectAssetRootAt(sourcePath, wsRoot, ownerProjectId))
   const a = index.assets.find((x) => x.id === assetId)
   if (!a) throw new Error(`asset "${assetId}" not found in project "${ownerProjectId}"`)
   return a

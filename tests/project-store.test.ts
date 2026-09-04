@@ -148,14 +148,70 @@ describe('create / rename / recent', () => {
     expect(store.snapshot().recent[0]).toBe(a.id)
   })
 
-  it('rename only touches the name — id and file layout stay stable', async () => {
+  it('rename only touches the name when the project has no user sourcePath', async () => {
+    // Pure-registry rename: a project created without a `sourcePath` (the
+    // default for `createProject(name)` — no folder picked) only changes
+    // its display name. id stays stable, the on-disk layout under
+    // `<wsRoot>/projects/<id>` is not touched.
     await makeStore()
     const p = await store.createProject('旧名')
+    expect(p.sourcePath).toBeUndefined()
     const renamed = await store.renameProject(p.id, '新名·重制版')
     expect(renamed.id).toBe(p.id)
+    expect(renamed.name).toBe('新名·重制版')
     expect(store.snapshot().projects.find((x) => x.id === p.id)?.name).toBe('新名·重制版')
     await expect(store.renameProject(p.id, 'bad/name')).rejects.toThrow('may not contain')
     await expect(store.renameProject(p.id, '  ')).rejects.toThrow()
+  })
+
+  it('rename renames the user-owned sourcePath folder and updates the registry', async () => {
+    // Folder-owned project: a project created with a real sourcePath (the
+    // native picker path) renames both the display name and the directory
+    // itself, then threads the new path through the registry + the canvas
+    // store. References don't break because the project id is immutable.
+    const tmp = await mkdtemp(join(tmpdir(), 'media-studio-rename-'))
+    const before = join(tmp, 'old-name')
+    await mkdir(before, { recursive: true })
+    await writeFile(join(before, 'AGENTS.md'), '# old\n', 'utf8')
+    await writeFile(join(before, '.canvas.json'), '{"version":0,"nodes":[],"edges":[]}', 'utf8')
+    await makeStore()
+    const p = await store.createProject('旧名', before)
+    expect(p.sourcePath).toBe(before)
+    const renamed = await store.renameProject(p.id, '新名·重制版')
+    expect(renamed.id).toBe(p.id)
+    expect(renamed.name).toBe('新名·重制版')
+    const after = join(tmp, '新名·重制版')
+    expect(renamed.sourcePath).toBe(after)
+    // Old directory is gone, new directory is real.
+    const { stat } = await import('node:fs/promises')
+    await expect(stat(before)).rejects.toThrow(/ENOENT/)
+    const afterStat = await stat(after)
+    expect(afterStat.isDirectory()).toBe(true)
+    // Files moved with the folder.
+    expect((await readdir(after)).sort()).toEqual(['.canvas.json', 'AGENTS.md'].sort())
+    // Registry on disk reflects the new path.
+    const raw = JSON.parse(await readFile(join(wsRoot, 'projects.json'), 'utf8'))
+    expect(raw.projects[p.id].sourcePath).toBe(after)
+    // Renaming again to the same name is a no-op on disk.
+    const twice = await store.renameProject(p.id, '新名·重制版')
+    expect(twice.sourcePath).toBe(after)
+  })
+
+  it('rename refuses when the target folder name is already taken on disk', async () => {
+    // Two siblings, one already on disk: renaming the first to the second's
+    // name must reject rather than overwrite.
+    const tmp = await mkdtemp(join(tmpdir(), 'media-studio-rename-clash-'))
+    const aDir = join(tmp, 'a')
+    const bDir = join(tmp, 'b')
+    await mkdir(aDir, { recursive: true })
+    await mkdir(bDir, { recursive: true })
+    await makeStore()
+    const a = await store.createProject('A', aDir)
+    const b = await store.createProject('B', bDir)
+    await expect(store.renameProject(a.id, 'b')).rejects.toThrow(/already exists/)
+    // Registry untouched.
+    expect(store.snapshot().projects.find((x) => x.id === a.id)?.sourcePath).toBe(aDir)
+    expect(b.id).toBeDefined()
   })
 })
 

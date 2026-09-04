@@ -139,6 +139,11 @@ function projectNodeOne(n: SNode): FlowNode {
       errorMsg: n.data.errorMsg,
       text: n.data.text,
       content: n.data.content,
+      // Video covers: server's prepareVideoForCanvas stores the poster
+      // (external first-frame JPG) in data.poster. Without carrying it here
+      // the client never receives it and every poster-rendering path (video
+      // poster attr, CSS background, <img> overlay) silently does nothing.
+      poster: n.data.poster,
       // Text/note cards persist their user-resized height in data.height
       // (updateNode). Carry it through the projection so an SSE snapshot —
       // including the echo of the very patch that stored it — doesn't drop
@@ -363,8 +368,35 @@ function useCanvasState(canvasId: string): { snap: MsSnapshot | null; conn: Conn
   // cost on every patch, and was a measurable source of UI jank from
   // *opening* an empty canvas tab. The bus keeps a single connection open
   // until the last subscriber unsubscribes.
+  //
+  // DIAG (remove after #300 rootcause): rate-limit the bus callback. A
+  // runaway setSnap (>20 within any 200ms window) is the React #300
+  // fingerprint; logging the burst count + first/last version lets us tell
+  // "fast legitimate patches" from "setSnap loop".
   useEffect(() => {
-    const offSnap = subscribeFull(canvasId, (s) => setSnap(s))
+    let burstCount = 0
+    let burstWindowStart = 0
+    let burstFirstVer: number | undefined
+    let burstLastVer: number | undefined
+    const offSnap = subscribeFull(canvasId, (s) => {
+      const now = performance.now()
+      if (now - burstWindowStart > 200) {
+        if (burstCount > 20) {
+          console.error(
+            '[media-studio diag] setSnap burst: count=%d window=200ms firstVersion=%s lastVersion=%s canvasId=%s',
+            burstCount, burstFirstVer, burstLastVer, canvasId,
+          )
+        }
+        burstWindowStart = now
+        burstCount = 0
+        burstFirstVer = undefined
+        burstLastVer = undefined
+      }
+      burstCount += 1
+      burstFirstVer ??= s.version
+      burstLastVer = s.version
+      setSnap(s)
+    })
     const offConn = subscribeConn(canvasId, setConn)
     return () => { offSnap(); offConn() }
   }, [canvasId])
@@ -530,6 +562,9 @@ function CanvasView({ canvasId }: CanvasProps) {
   /** Optimistic mutation + history snapshot + host commit (UI's one funnel). */
   const mutate = useCallback((ops: MsOp[], then?: () => void) => {
     if (ops.length === 0) { then?.(); return }
+    // DIAG (remove after #300 rootcause): trace each mutation so a loop where
+    // the canvas keeps applying ops on top of itself becomes visible.
+    console.debug('[media-studio diag] mutate: ops=%o', ops.map((o) => o.op))
     previewingRef.current = false // user is editing → leave playback preview
     const cur = appliedRef.current
     if (cur) queueHistory(cur)
@@ -542,8 +577,22 @@ function CanvasView({ canvasId }: CanvasProps) {
 
   // ── Reconcile from the SSE snapshot ─────────────────────────────────────
   useEffect(() => {
+    // DIAG (remove after #300 rootcause): trace every reconcile so a
+    // runaway loop is localizable. `entered` / `skipped` lets us tell whether
+    // the effect ran vs returned early — together with the burst counter in
+    // useCanvasState we can pinpoint which stage is re-firing.
+    if (snap) {
+      const prev = appliedRef.current
+      console.debug(
+        '[media-studio diag] reconcile enter: version=%s prevVersion=%s interacting=%s restoring=%s',
+        snap.version, prev?.version, interactingRef.current, restoringRef.current,
+      )
+    }
     if (!snap) return
-    if (interactingRef.current) return
+    if (interactingRef.current) {
+      console.debug('[media-studio diag] reconcile skipped: interacting')
+      return
+    }
     if (restoringRef.current) {
       // The restore (undo/redo) patch ack: adopt silently, no history push.
       restoringRef.current = false
@@ -558,7 +607,10 @@ function CanvasView({ canvasId }: CanvasProps) {
     // dedupes incoming `snap` updates, but the same version can also be
     // re-applied if a stale effect re-runs (React 18 strict mode, devtools
     // re-mount, etc.). Skip the work entirely.
-    if (!isFirst && prev.version === snap.version) return
+    if (!isFirst && prev.version === snap.version) {
+      console.debug('[media-studio diag] reconcile skipped: same version', snap.version)
+      return
+    }
     const nextSnap = msSnapshotOf(snap.graph, snap.version)
     appliedRef.current = nextSnap
     // Revision bus (M3b): record every accepted version for the history
@@ -595,6 +647,7 @@ function CanvasView({ canvasId }: CanvasProps) {
         })
       }
     }
+    console.debug('[media-studio diag] reconcile exit: version=%s nodesApplied=1 edgesApplied=1', snap.version)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap])
 

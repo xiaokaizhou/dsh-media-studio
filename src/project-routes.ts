@@ -143,9 +143,11 @@ export function registerProjectRoutes(ctx: Context): () => void {
   })
 
   // Open a disk folder as a new registered project (folder name = project name).
-  // Does NOT copy files into workspace; project assets root is a sibling of the
-  // registered project dir under workspaceRoot/projects/<id>/assets, and the
-  // first root-level folder name from the dialog is used as the project name.
+  // The optional `sourcePath` body field — when present — registers that
+  // exact absolute path as the project's source directory; absent it falls
+  // back to the legacy wsRoot layout. The native picker always sends
+  // `sourcePath`, so a folder-open from the UI immediately becomes a real
+  // project on disk with all assets + canvas + AGENTS.md living under it.
   wserver.register({
     kind: 'exact',
     path: '/api/media-studio/projects/open-folder',
@@ -155,8 +157,11 @@ export function registerProjectRoutes(ctx: Context): () => void {
           const body = await readBody(req)
           const folderName = typeof body.folderName === 'string' ? body.folderName.trim() : ''
           if (!folderName) { json(res, 400, { ok: false, error: 'folderName is required' }); return }
+          const sourcePath = typeof body.sourcePath === 'string' && body.sourcePath.trim()
+            ? body.sourcePath.trim()
+            : undefined
           const ps = getMediaStudioHandles().projectStore!
-          const meta = await ps.createProject(folderName)
+          const meta = await ps.createProject(folderName, sourcePath)
           json(res, 201, { ok: true, project: meta, registry: ps.snapshot() })
         } catch (e) {
           json(res, 400, { ok: false, error: (e as Error).message })
@@ -201,7 +206,10 @@ export function registerProjectRoutes(ctx: Context): () => void {
         try {
           const body = await readBody(req)
           const ps = getMediaStudioHandles().projectStore!
-          const meta = await ps.createProject(typeof body.name === 'string' ? body.name : undefined)
+          const sourcePath = typeof body.sourcePath === 'string' && body.sourcePath.trim()
+            ? body.sourcePath.trim()
+            : undefined
+          const meta = await ps.createProject(typeof body.name === 'string' ? body.name : undefined, sourcePath)
           json(res, 201, { ok: true, project: meta, registry: ps.snapshot() })
         } catch (e) {
           json(res, 400, { ok: false, error: (e as Error).message })

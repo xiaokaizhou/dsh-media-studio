@@ -547,9 +547,50 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 .media-img { object-fit: cover; }
 .media-video { object-fit: contain; background: #000; }
-.media-video-slot { background:#000; display:flex; align-items:center; justify-content:center; cursor:pointer; }
-.media-video-slot .media-lazy-hint { color:rgba(255,255,255,0.6); font-size:15px; }
-.media-lazy-hint { pointer-events:none; user-select:none; }
+.media-video-slot {
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+.media-video-slot .media-lazy-hint { color: rgba(255,255,255,0.6); font-size: 15px; }
+.media-lazy-hint { pointer-events: none; user-select: none; }
+/* Poster <img> — the ENTIRE idle card before first play (no <video> element
+   exists yet, so there is nothing to overlap and no browser-specific poster
+   quirk). Clicking anywhere mounts the video and plays it. */
+.media-video-poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  border-radius: var(--ms-radius-lg);
+  z-index: 2;
+  pointer-events: none;
+  user-select: none;
+}
+/* Centered play button — always visible while not playing, regardless of
+   hover state, so Chrome matches Safari's default (no native controls). */
+.media-video-play-btn {
+  position: absolute;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  cursor: pointer;
+  pointer-events: none;
+  user-select: none;
+  transition: transform 0.15s ease;
+}
+.media-video-slot:hover .media-video-play-btn {
+  transform: scale(1.08);
+}
 
 
 .media-audio-fill {
@@ -580,6 +621,13 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   background: rgba(255,255,255,0.04);
   border: 1px solid var(--ms-border);
   cursor: pointer;
+  /* Pointer drag-to-seek owns the gesture — don't let touch pan/zoom the
+     canvas while the user drags the playhead. */
+  touch-action: none;
+}
+.ms-audio-wave:focus-visible {
+  outline: 2px solid var(--ms-accent, #7c83ff);
+  outline-offset: 2px;
 }
 .ms-audio-controls {
   display: flex;
@@ -604,6 +652,8 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   flex: 1;
   min-width: 0;
   accent-color: var(--ms-accent);
+  /* Keep range-thumb dragging in the thumb's hands, not the canvas pan. */
+  touch-action: none;
 }
 .ms-audio-time {
   font: 600 11px/1 ui-monospace, Menlo, monospace;
