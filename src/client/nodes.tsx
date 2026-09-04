@@ -78,26 +78,12 @@ export function defaultLabel(kind: NodeKind): string {
 /** Remeasure handle positions after media loads / node resizes. */
 function useRefreshHandles(id: string) {
   const updateNodeInternals = useUpdateNodeInternals()
-  // NOTE: do NOT depend on `updateNodeInternals`. xyflow's useUpdateNodeInternals
-  // returns a new function reference on every render, so depending on it would
-  // tear down + re-run this effect on every DocNode re-render — and the effect
-  // itself calls updateNodeInternals(id), which dispatches a xyflow store
-  // update that triggers the re-render in the first place. That feedback loop
-  // was the React #300 root cause (Issue: nodes.tsx useRefreshHandles).
-  //
-  // Why the [60, 200, 500] timers + rAF: the card's handles are bound by
-  // xyflow from initial measurement, and React Flow caches handle positions
-  // per node. Until the node has measured its real DOM size, the cached
-  // positions are wrong and edges miss the handle. The retry schedule picks
-  // up the layout as it converges. All of that is keyed on `id`, not on
-  // updateNodeInternals' identity.
   useEffect(() => {
     const raf = requestAnimationFrame(() => updateNodeInternals(id))
     const timers = [60, 200, 500].map((ms) => setTimeout(() => updateNodeInternals(id), ms))
     updateNodeInternals(id)
     return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id])
+  }, [id, updateNodeInternals])
 }
 
 /**
@@ -242,13 +228,17 @@ function RefreshSideButton({ id }: { id: string }) {
   // Show only when this node has at least one upstream edge. We read the
   // precomputed Set from context (see AddSideButton above for the why).
   const hasUpstream = hasUpstreamById.has(id)
+  // ALL hooks must run on every render — React tracks hooks by call order,
+  // so any conditional `return null` must come AFTER every hook above it.
+  // The previous layout declared `useState` then `return null` then
+  // `useCallback`, which collapsed the hook count from 2 → 1 the moment
+  // `hasUpstream` flipped false and tripped React's "Rendered fewer hooks
+  // than expected" (Minified React error #310). Hoisting the callback fixes
+  // it; the disabled-when-no-upstream check still prevents misuse.
   const [refreshing, setRefreshing] = useState(false)
-
-  if (!hasUpstream) return null
-
   const handleRefresh = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
-    if (refreshing) return
+    if (refreshing || !hasUpstream) return
     setRefreshing(true)
     try {
       await refreshNode(id)
@@ -257,7 +247,9 @@ function RefreshSideButton({ id }: { id: string }) {
       // Brief delay so the spinner doesn't flicker away too fast.
       setTimeout(() => setRefreshing(false), 600)
     }
-  }, [id, refreshing, refreshNode])
+  }, [id, refreshing, refreshNode, hasUpstream])
+
+  if (!hasUpstream) return null
 
   return (
     <button

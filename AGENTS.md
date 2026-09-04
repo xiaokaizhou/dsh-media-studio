@@ -12,6 +12,8 @@
 
 ## 已注册工具
 
+### 画布（4 个）
+
 | 工具名 | 作用 |
 |---|---|
 | `canvas_graph_view` | 读取画布快照（nodes + edges + version） |
@@ -20,6 +22,35 @@
 | `canvas_refresh_node` | 基于上游内容重新生成某媒体节点（代理到 dsh-llm-multimodal） |
 
 > 缺省 `canvasId` = **当前激活项目**的画布（注册表 `activeId`；无项目时回退 `main`）。显式传 `canvasId` 仍然有效。
+
+### 项目管理（6 个）
+
+| 工具名 | 作用 |
+|---|---|
+| `media_studio_list_projects` | 列出注册表（active / recent ≤ recentLimit / all）；只读 |
+| `media_studio_create_project` | 新建项目（可选 `sourcePath` 把项目落在用户自有目录），自动激活 |
+| `media_studio_pick_folder` | macOS 原生 NSOpenPanel 选目录，返回 POSIX 路径（与 `create_project` 的 `sourcePath` 配套） |
+| `media_studio_open_project` | 激活已有项目（顶入 recent 并从磁盘恢复画布） |
+| `media_studio_rename_project` | 重命名（id 不变；若有 `sourcePath` 同步重命名磁盘目录） |
+| `media_studio_delete_project` | 删除（`mode=trash|permanent` × `cascade=cancel|break-refs|migrate-shared`）；被引用时返回 `code:"project-referenced" + dependents` |
+
+### 素材库（5 个）
+
+| 工具名 | 作用 |
+|---|---|
+| `media_studio_list_assets` | 列出某项目素材库（character / scene / audio / clip） |
+| `media_studio_register_asset` | 把画布节点的媒体正式入库（按 canvasNodeId 幂等去重） |
+| `media_studio_update_asset` | 改资产名 / 标签（≤12 个） |
+| `media_studio_delete_asset` | 删除资产（同 `cascade` 三档）；被引用时返回 `dependents` |
+| `media_studio_copy_asset` | 跨项目硬拷贝（产生新 assetId；引用请用 `search_assets + addSoftRef`） |
+
+### 全局搜索（1 个）
+
+| 工具名 | 作用 |
+|---|---|
+| `media_studio_search_assets` | 跨项目模糊匹配（catalog=`library`/`canvas`），结果分「当前 / 其他」两组；当 `addSoftRef=true` + `addAssetKey=<key>` 一步把素材软引用进当前画布 |
+
+> **REST 仍然可用**：`/api/media-studio/{projects,assets,search}/*` 与上述工具 1:1 对应，GUI / curl / 脚本任意入口，状态永远一致。
 
 ## 典型工作流
 
@@ -110,6 +141,6 @@ pnpm pack
 1. **先 view 再 patch**；一次 patch 完成批量操作。
 2. 处理视频超时（30–90s）勿过早判定失败；`video-timeout` 视为可重试。
 3. 管线迭代中 `deleteNode` 清理旧结果。
-4. 新建项目由用户在「项目 → 新建」创建（或未来 agent 工具）；Agent 操作画布默认落在当前激活项目，勿假设固定 canvasId。
-5. 素材登记/软引用是用户交互能力；如需为素材建库，引导用户把卡片「存入素材库」，再用顶栏搜索跨项目复用。
+4. 新建项目由用户在「项目 → 新建」创建，**或由 Agent 调用 `media_studio_create_project` / `media_studio_pick_folder`**（带 `sourcePath` 时项目落在用户自有目录；不带则注册到 workspace）。Agent 操作画布默认落在当前激活项目，勿假设固定 canvasId；切项目请用 `media_studio_open_project`。
+5. 素材登记/软引用既可在 GUI 完成，也可由 Agent 主动调用：`media_studio_register_asset` 把画布节点入库；`media_studio_search_assets({ addSoftRef: true, addAssetKey })` 一步完成「跨项目搜索 + 软引用到当前画布」，无需先拷贝文件。
 6. 修改服务端后跑全套 `pnpm test`；客户端改动需跑 `typecheck:client`；行为改动重启后在浏览器/curl 复测。

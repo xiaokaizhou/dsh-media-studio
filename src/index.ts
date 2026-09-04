@@ -17,7 +17,24 @@ import type {} from '@deepseek-ai/dsh-llm'
 import { homedir } from 'node:os'
 import { Config } from './config'
 import type { Config as ConfigShape } from './config'
-import { registerCanvasViewTool, registerCanvasPatchTool, registerAutoArrangeTool, registerCanvasRefreshNodeTool } from './tools'
+import {
+  registerCanvasViewTool,
+  registerCanvasPatchTool,
+  registerAutoArrangeTool,
+  registerCanvasRefreshNodeTool,
+  registerMediaStudioListProjectsTool,
+  registerMediaStudioCreateProjectTool,
+  registerMediaStudioPickFolderTool,
+  registerMediaStudioOpenProjectTool,
+  registerMediaStudioRenameProjectTool,
+  registerMediaStudioDeleteProjectTool,
+  registerMediaStudioListAssetsTool,
+  registerMediaStudioRegisterAssetTool,
+  registerMediaStudioUpdateAssetTool,
+  registerMediaStudioDeleteAssetTool,
+  registerMediaStudioCopyAssetTool,
+  registerMediaStudioSearchAssetsTool,
+} from './tools'
 import { CanvasStore } from './canvas-store'
 import { registerCanvasRoutes } from './routes'
 import { ProjectStore, type ProjectEvent } from './project-store'
@@ -161,23 +178,65 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // generate_video / generate_tts / generate_music) live in the sibling
   // `dsh-llm-multimodal` plugin and are reached via ctx.tools.execute(...)
   // from `canvas_refresh_node` whenever the user clicks "regenerate" on a
-  // canvas node. This plugin only owns the four canvas_* tools.
+  // canvas node. This plugin owns 4 canvas_* tools + 12 media_studio_*
+  // project / asset / search tools (see AGENTS.md "已注册工具").
   const toolRegs: Array<[string, () => void]> = [
     ['canvas_graph_view', () => registerCanvasViewTool(ctx)],
     ['canvas_graph_patch', () => registerCanvasPatchTool(ctx)],
     ['canvas_auto_arrange', () => registerAutoArrangeTool(ctx)],
     ['canvas_refresh_node', () => registerCanvasRefreshNodeTool(ctx)],
+    // Project management tools — drive the multi-project layer (create / open /
+    // rename / delete / list / pick-folder). Without these the agent was
+    // limited to operating whichever canvas the GUI happened to have open.
+    ['media_studio_list_projects', () => registerMediaStudioListProjectsTool(ctx)],
+    ['media_studio_create_project', () => registerMediaStudioCreateProjectTool(ctx)],
+    ['media_studio_pick_folder', () => registerMediaStudioPickFolderTool(ctx)],
+    ['media_studio_open_project', () => registerMediaStudioOpenProjectTool(ctx)],
+    ['media_studio_rename_project', () => registerMediaStudioRenameProjectTool(ctx)],
+    ['media_studio_delete_project', () => registerMediaStudioDeleteProjectTool(ctx)],
+    // Asset library tools — list / register / update / delete / copy / search.
+    // `media_studio_search_assets` also handles the one-shot "find an asset in
+    // another project and soft-reference it" workflow the GUI otherwise
+    // spreads across the search panel + add-to-canvas button.
+    ['media_studio_list_assets', () => registerMediaStudioListAssetsTool(ctx)],
+    ['media_studio_register_asset', () => registerMediaStudioRegisterAssetTool(ctx)],
+    ['media_studio_update_asset', () => registerMediaStudioUpdateAssetTool(ctx)],
+    ['media_studio_delete_asset', () => registerMediaStudioDeleteAssetTool(ctx)],
+    ['media_studio_copy_asset', () => registerMediaStudioCopyAssetTool(ctx)],
+    ['media_studio_search_assets', () => registerMediaStudioSearchAssetsTool(ctx)],
   ]
+  const registered: string[] = []
+  const failed: Array<{ name: string; error: string }> = []
   for (const [name, reg] of toolRegs) {
     try {
       reg()
+      registered.push(name)
     } catch (e) {
-      ctx.logger?.error?.(`[media-studio] tool registration failed for ${name}: ${(e as Error).message}`)
+      const msg = (e as Error).message
+      failed.push({ name, error: msg })
+      ctx.logger?.error?.(`[media-studio] tool registration failed for ${name}: ${msg}`)
     }
   }
   ctx.logger?.info?.(
-    '[media-studio] registered canvas_graph_view + canvas_graph_patch + canvas_auto_arrange + canvas_refresh_node + /api/media-studio/canvas/{sse,state,patch,refresh} + /api/media-studio/projects*',
+    `[media-studio] registered ${registered.length} tools (${registered.length === toolRegs.length ? 'all OK' : `${failed.length} failed`}): ${registered.join(', ')}`,
   )
-  // TEMP: confirm lib freshness end-to-end
-  try { writeFileSync('/tmp/dsh-media-studio-apply.txt', 'apply() ran at ' + new Date().toISOString()) } catch (e) { ctx.logger?.error?.('marker write failed: ' + (e as Error).message) }
+  if (failed.length > 0) {
+    ctx.logger?.error?.(`[media-studio] FAILED tool registrations: ${failed.map((f) => `${f.name}: ${f.error}`).join(' | ')}`)
+  }
+  // TEMP: confirm lib freshness end-to-end + tool registration result
+  try {
+    writeFileSync(
+      '/tmp/dsh-media-studio-apply.txt',
+      JSON.stringify({
+        applyAt: new Date().toISOString(),
+        registered,
+        failed,
+        total: toolRegs.length,
+        registeredCount: registered.length,
+      }, null, 2),
+      'utf8',
+    )
+  } catch (e) {
+    ctx.logger?.error?.('marker write failed: ' + (e as Error).message)
+  }
 }
