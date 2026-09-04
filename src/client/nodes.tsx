@@ -78,12 +78,26 @@ export function defaultLabel(kind: NodeKind): string {
 /** Remeasure handle positions after media loads / node resizes. */
 function useRefreshHandles(id: string) {
   const updateNodeInternals = useUpdateNodeInternals()
+  // NOTE: do NOT depend on `updateNodeInternals`. xyflow's useUpdateNodeInternals
+  // returns a new function reference on every render, so depending on it would
+  // tear down + re-run this effect on every DocNode re-render — and the effect
+  // itself calls updateNodeInternals(id), which dispatches a xyflow store
+  // update that triggers the re-render in the first place. That feedback loop
+  // was the React #300 root cause (Issue: nodes.tsx useRefreshHandles).
+  //
+  // Why the [60, 200, 500] timers + rAF: the card's handles are bound by
+  // xyflow from initial measurement, and React Flow caches handle positions
+  // per node. Until the node has measured its real DOM size, the cached
+  // positions are wrong and edges miss the handle. The retry schedule picks
+  // up the layout as it converges. All of that is keyed on `id`, not on
+  // updateNodeInternals' identity.
   useEffect(() => {
     const raf = requestAnimationFrame(() => updateNodeInternals(id))
     const timers = [60, 200, 500].map((ms) => setTimeout(() => updateNodeInternals(id), ms))
     updateNodeInternals(id)
     return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout) }
-  }, [id, updateNodeInternals])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id])
 }
 
 /**
