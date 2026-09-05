@@ -1,5 +1,4 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { writeFileSync } from 'node:fs'
 // Type-only import — pulls in `@deepseek-ai/dsh-llm/lib/types/index.d.ts`
 // which declares `module '@deepseek-ai/cordis'` so `ctx.llm` is in scope.
 //
@@ -22,6 +21,15 @@ import {
   registerCanvasPatchTool,
   registerAutoArrangeTool,
   registerCanvasRefreshNodeTool,
+  registerCanvasNodeViewTool,
+  registerCanvasNodeAddTool,
+  registerCanvasNodeUpdateTool,
+  registerCanvasNodeRenameTool,
+  registerCanvasNodeDeleteTool,
+  registerCanvasRegionAddTool,
+  registerCanvasRegionUpdateTool,
+  registerCanvasRegionDeleteTool,
+  registerCanvasRegionFitTool,
   registerMediaStudioListProjectsTool,
   registerMediaStudioCreateProjectTool,
   registerMediaStudioPickFolderTool,
@@ -72,6 +80,7 @@ export const inject = ['tools', 'webServer']
 export { Config }
 
 import { getMediaStudioHandles, setMediaStudioHandles, type MediaStudioHandles } from './service-state'
+export { migrateBrokenCanvasUrls, type MigrateResult } from './asset-store'
 
 /**
  * Lifecycle:
@@ -92,6 +101,38 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // `store.apply` can push live patches to every subscriber.
   const sseClients = new Set<ServerResponse>()
 
+  // Coalesce canvas broadcasts so a burst of agent patches in the same
+  // animation frame sends only the LAST state to subscribers. Without
+  // coalescing, an agent flow like "add 6 nodes → auto-arrange" would emit
+  // 6+ SSE events back-to-back; the client would JSON-parse the entire
+  // graph N times in <16 ms, the React reconciler would queue N renders,
+  // and just opening the canvas tab would feel like the conversation
+  // stalled. The coalesce keeps the wire rate at ≤1 event per
+  // `requestAnimationFrame` tick — the client only sees the final state.
+  //
+  // `pending` holds the most recent payload per canvasId; `flushTimer`
+  // is the pending setTimeout that resolves the coalescing window. We
+  // keep the per-canvas table around `unref()` so a live broadcast
+  // timer never holds the process open at shutdown.
+  const broadcastPending = new Map<string, { canvasId: string; version: number; graph: unknown; patch: unknown }>()
+  let broadcastFlushTimer: NodeJS.Timeout | null = null
+  const BROADCAST_COALESCE_MS = 16 // one animation frame
+  const flushBroadcasts = () => {
+    broadcastFlushTimer = null
+    if (broadcastPending.size === 0) return
+    // Stable wire shape: one SSE event per coalesced burst, carrying
+    // the latest (canvasId, version, graph) snapshot — exactly what the
+    // existing client canvas-bus expects.
+    for (const [, payload] of broadcastPending) {
+      const body = JSON.stringify({ type: 'canvas-patch', canvasId: payload.canvasId, version: payload.version, graph: payload.graph, patch: payload.patch })
+      const msg = `event: canvas-patch\ndata: ${body}\n\n`
+      for (const res of sseClients) {
+        try { res.write(msg) } catch { /* client gone */ }
+      }
+    }
+    broadcastPending.clear()
+  }
+
   // Broadcast hook wired into the store: writes the same wire shape the
   // SSE handler uses (`data: {type:'canvas-patch', canvasId, version,
   // graph, patch}`). Both the agent's `canvas_graph_patch` tool and the
@@ -103,11 +144,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
     // emitted the browser dispatches a `message` event (not the named
     // one), so the React state never updates. Include `event:` line so
     // dispatch matches.
-    const body = JSON.stringify({ type: 'canvas-patch', canvasId, ...payload })
-    const msg = `event: canvas-patch\ndata: ${body}\n\n`
-    for (const res of sseClients) {
-      try { res.write(msg) } catch { /* client gone */ }
-    }
+    broadcastPending.set(canvasId, { canvasId, ...payload })
+    if (broadcastFlushTimer) return
+    broadcastFlushTimer = setTimeout(flushBroadcasts, BROADCAST_COALESCE_MS)
   }
 
   // Expand `~` in config.workspaceRoot so defaults like
@@ -119,7 +158,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // the canvas renders as "failed to load".
   const mediaRoots = (config.mediaRoots ?? []).map(expandRoot)
 
-  const canvasStore = new CanvasStore(wsRoot, { broadcast })
+  const canvasStore = new CanvasStore(wsRoot, { broadcast, logger: ctx.logger })
   // restore() runs in the background — we don't await because apply()
   // must be sync; the first tool call may race with disk read but the
   // in-memory state is empty either way. The ProjectStore's boot also calls
@@ -141,6 +180,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     recentLimit: config.recentLimit,
     trashEnabled: config.trashEnabled,
     onEvent: broadcastProject,
+    logger: ctx.logger,
   })
 
   // Stash plugin-scoped handles. Tools + routes read via getMediaStudioHandles().
@@ -152,6 +192,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     sseClients,
     projectStore,
     projectSseClients,
+    logger: ctx.logger,
   }
   setMediaStudioHandles(handles)
 
@@ -178,13 +219,25 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // generate_video / generate_tts / generate_music) live in the sibling
   // `dsh-llm-multimodal` plugin and are reached via ctx.tools.execute(...)
   // from `canvas_refresh_node` whenever the user clicks "regenerate" on a
-  // canvas node. This plugin owns 4 canvas_* tools + 12 media_studio_*
+  // canvas node. This plugin owns 7 canvas_* tools (view / patch / arrange /
+  // refresh / node CRUD) + 4 canvas_region_* tools + 12 media_studio_*
   // project / asset / search tools (see AGENTS.md "已注册工具").
   const toolRegs: Array<[string, () => void]> = [
     ['canvas_graph_view', () => registerCanvasViewTool(ctx)],
     ['canvas_graph_patch', () => registerCanvasPatchTool(ctx)],
     ['canvas_auto_arrange', () => registerAutoArrangeTool(ctx)],
     ['canvas_refresh_node', () => registerCanvasRefreshNodeTool(ctx)],
+    // Single-node CRUD tools — preferred entry for one-off mutations.
+    ['canvas_node_view', () => registerCanvasNodeViewTool(ctx)],
+    ['canvas_node_add', () => registerCanvasNodeAddTool(ctx)],
+    ['canvas_node_update', () => registerCanvasNodeUpdateTool(ctx)],
+    ['canvas_node_rename', () => registerCanvasNodeRenameTool(ctx)],
+    ['canvas_node_delete', () => registerCanvasNodeDeleteTool(ctx)],
+    // Region container tools — partition the canvas into labeled boxes.
+    ['canvas_region_add', () => registerCanvasRegionAddTool(ctx)],
+    ['canvas_region_update', () => registerCanvasRegionUpdateTool(ctx)],
+    ['canvas_region_delete', () => registerCanvasRegionDeleteTool(ctx)],
+    ['canvas_region_fit', () => registerCanvasRegionFitTool(ctx)],
     // Project management tools — drive the multi-project layer (create / open /
     // rename / delete / list / pick-folder). Without these the agent was
     // limited to operating whichever canvas the GUI happened to have open.
@@ -222,21 +275,5 @@ export function apply(ctx: Context, config: ConfigShape): void {
   )
   if (failed.length > 0) {
     ctx.logger?.error?.(`[media-studio] FAILED tool registrations: ${failed.map((f) => `${f.name}: ${f.error}`).join(' | ')}`)
-  }
-  // TEMP: confirm lib freshness end-to-end + tool registration result
-  try {
-    writeFileSync(
-      '/tmp/dsh-media-studio-apply.txt',
-      JSON.stringify({
-        applyAt: new Date().toISOString(),
-        registered,
-        failed,
-        total: toolRegs.length,
-        registeredCount: registered.length,
-      }, null, 2),
-      'utf8',
-    )
-  } catch (e) {
-    ctx.logger?.error?.('marker write failed: ' + (e as Error).message)
   }
 }

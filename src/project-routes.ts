@@ -1,10 +1,10 @@
 /**
- * Project REST/SSE routes — multi-project management surface for the M1 UI.
+ * Project REST routes — multi-project management surface for the M1 UI.
  *
  * Mirrors the canvas routes' conventions: every handler is registered with
  * `ctx.webServer.register({ kind: 'exact', ... })`, writes funnel through the
  * ProjectStore's single-writer queue, and state changes push SSE events on
- * `/api/media-studio/projects/sse`.
+ * the unified `/api/media-studio/sse` endpoint (see routes.ts).
  *
  * No path-param routing is available (kind:'exact'), so resource ids travel
  * in the request body / query string, same as the canvas endpoints.
@@ -102,43 +102,6 @@ export function registerProjectRoutes(ctx: Context): () => void {
           json(res, 500, { ok: false, error: (e as Error).message })
         }
       })()
-    },
-  })
-
-  // Project SSE — registry/open/delete events.
-  wserver.register({
-    kind: 'exact',
-    path: '/api/media-studio/projects/sse',
-    handler: (req, res) => {
-      const sse = getMediaStudioHandles().projectSseClients
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      })
-      const push = (event: string, payload: unknown) => {
-        try {
-          res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
-        } catch { /* client gone */ }
-      }
-      // Immediate registry snapshot so subscribers render without waiting.
-      void (async () => {
-        try {
-          const ps = getMediaStudioHandles().projectStore!
-          await ps.ready()
-          push('registry-changed', { registry: ps.snapshot(), recentLimit: ps.getRecentLimit() })
-        } catch { /* store not ready — retry on next broadcast */ }
-      })()
-
-      sse?.add(res)
-      const ping = setInterval(() => {
-        try { res.write(`data: {"type":"heartbeat"}\n\n`) } catch { /* client gone */ }
-      }, 15_000)
-      req.on('close', () => {
-        clearInterval(ping)
-        sse?.delete(res)
-      })
     },
   })
 
@@ -246,7 +209,9 @@ export function registerProjectRoutes(ctx: Context): () => void {
       void (async () => {
         try {
           const body = await readBody(req)
-          const id = String(body.projectId ?? '').trim()
+          // Accept both `projectId` (canonical) and `id` (alias) so callers
+          // that use the field name from create-project responses keep working.
+          const id = String(body.projectId ?? body.id ?? '').trim()
           const name = typeof body.name === 'string' ? body.name : ''
           if (!id) { json(res, 400, { ok: false, error: 'projectId is required' }); return }
           const ps = getMediaStudioHandles().projectStore!
@@ -267,7 +232,7 @@ export function registerProjectRoutes(ctx: Context): () => void {
       void (async () => {
         try {
           const url = new URL(req.url ?? '/', 'http://x')
-          const id = url.searchParams.get('projectId') ?? ''
+          const id = url.searchParams.get('projectId') ?? url.searchParams.get('id') ?? ''
           if (!id) { json(res, 400, { ok: false, error: 'projectId is required' }); return }
           const ps = getMediaStudioHandles().projectStore!
           const dependents = await ps.dependentsOf(id)
@@ -287,7 +252,7 @@ export function registerProjectRoutes(ctx: Context): () => void {
       void (async () => {
         try {
           const body = await readBody(req)
-          const id = String(body.projectId ?? '').trim()
+          const id = String(body.projectId ?? body.id ?? '').trim()
           if (!id) { json(res, 400, { ok: false, error: 'projectId is required' }); return }
           const ps = getMediaStudioHandles().projectStore!
           const mode = body.mode === 'permanent' ? 'permanent' : 'trash'

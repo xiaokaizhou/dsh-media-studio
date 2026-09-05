@@ -47,6 +47,22 @@ export const MEDIA_STUDIO_CSS = String.raw`
 .media-studio-canvas .react-flow__pane.draggable,
 .media-studio-canvas .react-flow__pane.dragging { cursor: grab; }
 .media-studio-canvas .react-flow__pane.dragging { cursor: grabbing; }
+/* xyflow base layout: every container inside the pane (selection marquee,
+ * nodesselection wrapper, edges/nodes/background layers) is absolutely
+ * positioned at the pane origin so inline transforms (translate + scale)
+ * resolve against left/top instead of the normal document-flow box. Without
+ * this, NodesSelection's transform uses the default transform-origin
+ * (center center) and the rect detaches from its nodes after mouse-up and
+ * during pan/zoom. Redundant for layers that already set position:absolute
+ * + inset:0, but matches the official sheet and keeps future xyflow
+ * container elements correctly anchored. */
+.media-studio-canvas .react-flow__container {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  top: 0;
+  left: 0;
+}
 /* xyflow v12 sets --xy-selection-background-color / --xy-selection-border on
  * .react-flow itself; we layer the media-studio marquee tint on top via
  * .react-flow__selection so the Ctrl/Cmd-drag rectangle reads against our
@@ -137,19 +153,27 @@ export const MEDIA_STUDIO_CSS = String.raw`
 }
 .media-studio-canvas .react-flow__node:focus,
 .media-studio-canvas .react-flow__node:focus-visible { outline: none; }
-/* xyflow renders a per-node wrapper (the .react-flow__nodesselection layer)
- * and a tinted rectangle (.react-flow__nodesselection-rect) for each node
- * that falls inside the marquee while it is being dragged (so the user can
- * see what is about to be selected). The rect inherits the same tint as the
- * marquee background; we just bring it up to our z-index stack so it does
- * not disappear under the cards. */
+/* xyflow renders a single bounding-box rectangle (the
+ * .react-flow__nodesselection layer + .react-flow__nodesselection-rect)
+ * that covers all selected nodes after marquee mouse-up. The wrapper
+ * carries the same pan/zoom transform as the viewport so the box stays
+ * glued to its nodes. We render it ABOVE the cards (z-index 10 > nodes 6)
+ * as a yellow transparent overlay — never painted behind/under the nodes. */
 .media-studio-canvas .react-flow__nodesselection {
-  z-index: 7;
+  z-index: 10;
+  transform-origin: 0 0;
+  pointer-events: none;
 }
 .media-studio-canvas .react-flow__nodesselection-rect {
-  background: color-mix(in srgb, var(--ms-accent, #7c83ff) 18%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ms-accent, #7c83ff) 65%, transparent);
+  position: absolute;
+  pointer-events: all;
+  cursor: grab;
+  /* Yellow transparent selection overlay — clearly sits ON TOP of the cards
+   * instead of looking like a faint highlight underneath them. */
+  background: rgba(250, 204, 21, 0.18);
+  border: 1.5px solid rgba(250, 204, 21, 0.75);
   border-radius: var(--ms-radius, 12px);
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.25), inset 0 0 24px rgba(250, 204, 21, 0.08);
 }
 .media-studio-canvas .react-flow__node-toolbar {
   position: absolute;
@@ -175,6 +199,20 @@ export const MEDIA_STUDIO_CSS = String.raw`
 .media-studio-canvas .react-flow__background rect,
 .media-studio-canvas .react-flow__background-pattern {
   pointer-events: none !important;
+}
+/* Canvas dot-grid fill.
+ *
+ * xyflow v12 renders dots as a circle inside an SVG pattern. The circle
+ * carries the class "react-flow__background-pattern dots" - i.e. it IS the
+ * .react-flow__background-pattern element, not a descendant.
+ *
+ * media-studio does not load xyflow's style.css (we re-implement only the
+ * subset we need). Without this rule the dot has no fill at all and renders
+ * as solid black against the panel (SVG's default fill is black). Set fill
+ * here so the dot follows the DSH theme via the --ms-bg-dot token defined
+ * in the dark / light sections above. */
+.media-studio-canvas .react-flow__background-pattern.dots {
+  fill: var(--ms-bg-dot, rgba(180, 185, 200, 0.55));
 }
 .media-studio-canvas .react-flow__minimap {
   /* Side-panel panes are narrow (~450px). xyflow's default MiniMap
@@ -262,6 +300,10 @@ body:not([data-ds-dark-theme]) .media-studio-canvas .react-flow__minimap-mask {
   --ms-shadow-lg: 0 14px 40px rgba(0,0,0,0.5), 0 5px 12px rgba(0,0,0,0.35);
   --ms-radius: 12px;
   --ms-radius-lg: 18px;
+  /* Canvas dot-grid color — themed so dark mode is clearly visible without
+   * being noisy, and light mode reads as a subtle gray mesh instead of
+   * disappearing into the panel. */
+  --ms-bg-dot: rgba(180, 185, 200, 0.55);
 }
 
 /* DSH light color scheme: translucent "panel" tints and shadows that are
@@ -274,6 +316,7 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   --ms-shadow-sm: 0 1px 2px rgba(15,17,22,0.10), 0 1px 1px rgba(15,17,22,0.06);
   --ms-shadow-md: 0 6px 18px rgba(15,17,22,0.10), 0 2px 5px rgba(15,17,22,0.06);
   --ms-shadow-lg: 0 14px 40px rgba(15,17,22,0.16), 0 5px 12px rgba(15,17,22,0.10);
+  --ms-bg-dot: rgba(60, 65, 80, 0.42);
 }
 
 .media-studio-canvas {
@@ -320,6 +363,10 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   transition: transform 0.12s ease, background 0.12s ease;
 }
 .ms-fab-dock-btn:hover { background: var(--ms-card-hi); transform: translateY(-1px) scale(1.06); }
+.media-studio-canvas .ms-fab-dock-region {
+  margin-top: 6px;
+  border-top: 1px solid var(--ms-border, rgba(255, 255, 255, 0.12));
+}
 .ms-fab-dock-btn:active { transform: scale(0.95); }
 .ms-toolbar {
   flex: none;
@@ -412,6 +459,125 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 
 /* ────────────────────────────────────────────────────────────────
+   4b. Region layer (partition containers, inside the viewport)
+   ──────────────────────────────────────────────────────────────── */
+/* xyflow's base sheet (which we re-implement locally) sizes the
+ * viewport-portal; without it, portal content has no positioning context. */
+.media-studio-canvas .react-flow__viewport-portal {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+/* The layer is portaled into the transformed viewport, so boxes pan/zoom
+ * with the canvas for free. z-index 1: above the dot-grid background (0),
+ * below edges (2) / nodes (6). pointer-events: none on the layer; only the
+ * title bar and resize handle opt back in (nopan/nodrag keep xyflow's pane
+ * from turning those gestures into canvas pans). */
+.media-studio-canvas .ms-region-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+.media-studio-canvas .ms-region {
+  position: absolute;
+  border-radius: 18px;
+  border: 1px dashed color-mix(in srgb, var(--ms-accent, #7c83ff) 45%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--ms-accent, #7c83ff) 7%, transparent), transparent 36%),
+    color-mix(in srgb, var(--ms-bg2, #14171d) 55%, transparent);
+  transition: box-shadow 0.14s ease, border-color 0.14s ease;
+}
+.media-studio-canvas .ms-region:hover {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 22%, transparent);
+}
+/* kind-tinted borders — the drama skill ships regions with kinds
+ * (flow / script / character / scene / storyboard / output) so each partition
+ * reads at a glance. Unknown kinds fall back to the accent above. */
+.media-studio-canvas .ms-region[data-kind="flow"] { border-color: color-mix(in srgb, #22d3ee 50%, transparent); }
+.media-studio-canvas .ms-region[data-kind="script"] { border-color: color-mix(in srgb, #f59e0b 50%, transparent); }
+.media-studio-canvas .ms-region[data-kind="character"] { border-color: color-mix(in srgb, #f472b6 50%, transparent); }
+.media-studio-canvas .ms-region[data-kind="scene"] { border-color: color-mix(in srgb, #4ade80 50%, transparent); }
+.media-studio-canvas .ms-region[data-kind="storyboard"] { border-color: color-mix(in srgb, #a78bfa 50%, transparent); }
+.media-studio-canvas .ms-region[data-kind="output"] { border-color: color-mix(in srgb, #fb923c 50%, transparent); }
+.media-studio-canvas .ms-region-title {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 3px 5px 3px 11px;
+  border-radius: 999px;
+  background: var(--ms-panel, rgba(26, 29, 38, 0.96));
+  border: 1px solid var(--ms-border, rgba(255, 255, 255, 0.11));
+  box-shadow: var(--ms-shadow-sm);
+  color: var(--ms-fg);
+  font: 600 12px/1 system-ui, -apple-system, sans-serif;
+  pointer-events: auto;
+  user-select: none;
+}
+.media-studio-canvas .ms-region-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.media-studio-canvas .ms-region-kind {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--ms-accent-soft, rgba(124, 131, 255, 0.14));
+  color: var(--ms-fg-dim);
+  font: 600 9.5px/1.5 system-ui, -apple-system, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.media-studio-canvas .ms-region-title-spacer { flex: none; width: 1px; }
+.media-studio-canvas .ms-region-btn {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ms-fg-faint);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.1s ease;
+}
+.media-studio-canvas .ms-region-btn:hover { background: var(--ms-panel-soft); color: var(--ms-fg); transform: scale(1.1); }
+.media-studio-canvas .ms-region-btn.ms-region-btn-danger:hover { background: rgba(220, 38, 38, 0.22); color: #fca5a5; }
+/* Resize grip — bottom-right corner, visible on hover. */
+.media-studio-canvas .ms-region-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
+  pointer-events: auto;
+  opacity: 0;
+  border-radius: 0 0 18px 0;
+  background:
+    linear-gradient(
+      135deg,
+      transparent 44%,
+      color-mix(in srgb, var(--ms-accent, #7c83ff) 35%, transparent) 44%,
+      var(--ms-accent, #7c83ff) 100%
+    );
+  transition: opacity 0.14s ease;
+}
+.media-studio-canvas .ms-region:hover .ms-region-resize,
+.media-studio-canvas .ms-region-resize:hover { opacity: 1; }
+
+/* ────────────────────────────────────────────────────────────────
    5. Card wrappers
    ──────────────────────────────────────────────────────────────── */
 .canvas-card-wrap {
@@ -433,14 +599,15 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   bottom: 100%;
   left: 2px;
   right: 2px;
-  margin-bottom: 5px;
+  margin-bottom: 8px;
   display: flex;
   align-items: center;
   gap: 4px;
-  color: var(--ms-fg-dim);
+  color: var(--ms-fg);
   font-size: 11px;
   line-height: 16px;
   min-height: 16px;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 .ms-title-icon {
   display: inline-flex;
@@ -687,6 +854,13 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .ms-placeholder svg { color: var(--ms-fg-faint); opacity: 0.75; }
 .ms-placeholder.ms-error { color: #f0a3a3; }
 .ms-placeholder.ms-error svg { color: #f0a3a3; }
+.ms-placeholder-hint {
+  font-size: 10.5px;
+  color: var(--ms-fg-faint);
+  line-height: 1.4;
+  max-width: 90%;
+  opacity: 0.85;
+}
 
 .media-overlay {
   position: absolute;
@@ -1015,10 +1189,33 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 /* ────────────────────────────────────────────────────────────────
    11. Add-node / connect menus
    ──────────────────────────────────────────────────────────────── */
+/* Floating menus (the canvas right-click "add a node" popup, the top-bar
+ * "项目" dropdown) reuse this as their body-portal host. The backdrop itself
+ * MUST NOT swallow pointer events: when it did (z-index 900 over the entire
+ * viewport, invisible), clicks meant for the top bar's "项目" button, the
+ * "download canvas" icon, or anything else outside the canvas were eaten by
+ * the backdrop's onClose handler instead of reaching the top bar — leaving
+ * users thinking the canvas was "blocking UI" (issue: 画布当前有事件阻塞UI).
+ *
+ * Floating-menu backdrops are now pointer-event transparent and only their
+ * child menu/dialog receives pointer events; an outside-click listener on
+ * the menu component closes it. Modal dialogs (SaveToLibraryDialog, project
+ * new/rename/delete) opt back into a clickable backdrop with the
+ * is-modal modifier — those still need to dismiss on outside click and
+ * are intentionally modal. */
 .ms-menu-backdrop {
   position: fixed;
   inset: 0;
   z-index: 900;
+  pointer-events: none;
+}
+.ms-menu-backdrop > * {
+  pointer-events: auto;
+}
+.ms-menu-backdrop.is-modal {
+  pointer-events: auto;
+  background: rgba(6, 7, 10, 0.32);
+  animation: ms-fade-in 0.12s ease-out;
 }
 .ms-connect-menu {
   position: fixed;

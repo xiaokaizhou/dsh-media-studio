@@ -39,6 +39,13 @@ export interface MediaStudioHandles {
   projectStore?: ProjectStore
   /** SSE client registry for project-level events (registry/open/delete). */
   projectSseClients?: Set<ServerResponse>
+  /** Plugin logger (cordis ctx.logger). Absent in unit-test environments. */
+  logger?: {
+    info?: (msg: string) => void
+    warn?: (msg: string) => void
+    error?: (msg: string) => void
+    debug?: (msg: string) => void
+  }
 }
 
 let handles: MediaStudioHandles | null = null
@@ -50,4 +57,15 @@ export function setMediaStudioHandles(h: MediaStudioHandles): void {
 export function getMediaStudioHandles(): MediaStudioHandles {
   if (!handles) throw new Error('media-studio: handles not initialized before use')
   return handles
+}
+
+/** Safe logger that falls back to console when handles aren't initialized
+ *  (e.g. unit tests that call pure functions directly). Use this instead
+ *  of `getMediaStudioHandles().logger?.xxx?.()` in modules that may be
+ *  invoked outside the plugin lifecycle. */
+export const log = {
+  info: (msg: string): void => { try { handles?.logger?.info?.(msg) } catch { /* ignore */ } },
+  warn: (msg: string): void => { try { handles?.logger?.warn?.(msg) } catch { /* ignore */ } },
+  error: (msg: string): void => { try { handles?.logger?.error?.(msg) } catch { /* ignore */ } },
+  debug: (msg: string): void => { try { handles?.logger?.debug?.(msg) } catch { /* ignore */ } },
 }

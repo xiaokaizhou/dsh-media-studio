@@ -221,3 +221,63 @@ describe('hard copy + sync', () => {
     expect(listed[0].bytes).toBe(Buffer.byteLength('much-bigger-content'))
   })
 })
+
+describe('migrateBrokenCanvasUrls', () => {
+  it('rewrites file:///tmp/ URLs to project-relative paths for sourcePath projects', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'media-studio-migrate-'))
+    const srcPath = join(ws, 'my-project')
+    await mkdir(srcPath, { recursive: true })
+
+    // Write a real PNG-like file to OS temp dir so it is OUTSIDE the allowed roots
+    const os = await import('node:os')
+    const tmpFile = join(os.tmpdir(), `media-studio-test-img-${Date.now()}.png`)
+    await writeFile(tmpFile, Buffer.from('fake-png-bytes'))
+
+    // Write a canvas with a file:///tmp/ resultUrl
+    const canvas = {
+      nodes: [
+        { id: 'n-1', type: 'image', label: 'test', data: { resultUrl: `file://${tmpFile}`, status: 'done' } },
+      ],
+      edges: [],
+      version: 1,
+    }
+    await writeFile(join(srcPath, '.canvas.json'), JSON.stringify(canvas))
+
+    // Create project registry entry
+    const registry = {
+      version: 1,
+      activeId: 'p-test',
+      recent: ['p-test'],
+      projects: {
+        'p-test': {
+          id: 'p-test',
+          name: 'Test',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          lastOpenedAt: new Date().toISOString(),
+          sourcePath: srcPath,
+        },
+      },
+    }
+    await writeFile(join(ws, 'projects.json'), JSON.stringify(registry))
+
+    const { migrateBrokenCanvasUrls } = await import('../src/asset-store')
+    const r = await migrateBrokenCanvasUrls(ws, [ws], ['p-test'], { 'p-test': srcPath })
+
+    expect(r.migrated).toBe(1)
+    expect(r.errors).toHaveLength(0)
+
+    // Canvas should be rewritten
+    const updated = JSON.parse((await readFile(join(srcPath, '.canvas.json'), 'utf8')) as string)
+    const newUrl = updated.nodes[0].data.resultUrl
+    expect(newUrl).toMatch(/^projects\/p-test\/assets\/characters\//)
+    expect(newUrl).not.toMatch(/^file:\/\//)
+
+    // Asset file should be in sourcePath assets dir
+    const assetDir = join(srcPath, 'assets', 'characters')
+    expect(await readdir(assetDir)).toHaveLength(1)
+    expect(await readFile(join(assetDir, (await readdir(assetDir))[0]), 'utf8')).toBe('fake-png-bytes')
+
+    await rm(ws, { recursive: true, force: true })
+  })
+})

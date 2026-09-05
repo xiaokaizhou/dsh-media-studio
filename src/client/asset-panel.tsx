@@ -212,11 +212,11 @@ export default function AssetLibraryPanel(props: AssetLibraryPanelProps): ReactN
                 <div className="ms-alp-card" key={a.id}>
                   <div className="ms-alp-media">
                     {a.kind === 'audio' ? (
-                      <audio src={mediaSrc(thumb(a))} controls preload="none" />
+                      <audio src={mediaSrc(thumb(a), projectId)} controls preload="none" />
                     ) : a.kind === 'clip' ? (
-                      <video src={mediaSrc(thumb(a))} muted preload="none" />
+                      <video src={mediaSrc(thumb(a), projectId)} muted preload="none" />
                     ) : (
-                      <img src={mediaSrc(thumb(a))} alt={a.name} loading="lazy" />
+                      <img src={mediaSrc(thumb(a), projectId)} alt={a.name} loading="lazy" />
                     )}
                   </div>
                   <div className="ms-alp-card-body">

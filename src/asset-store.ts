@@ -27,6 +27,7 @@ import { join, dirname, extname } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import type { CanvasStore, CanvasOp } from './canvas-store'
 import { resolveMediaTarget } from './routes'
+import { getMediaStudioHandles } from './service-state'
 
 export const ASSET_KINDS = ['character', 'scene', 'audio', 'clip'] as const
 export type AssetKind = (typeof ASSET_KINDS)[number]
@@ -47,6 +48,9 @@ export type AssetOrigin =
   /** Asset relocated into the shared library when its owner project was
    *  deleted but other projects still referenced it. */
   | { type: 'migrated'; fromProject: string }
+  /** Asset pulled from a remote URL during a canvas patch (provider URLs
+   *  expire; we copy the bytes so the canvas never breaks later). */
+  | { type: 'pinned'; sourceUrl: string }
 
 /** SharedAssetOrigin — legacy alias for origin.type === 'migrated'. */
 export type SharedAssetOrigin = { fromProject: string }
@@ -125,7 +129,7 @@ export async function writeAssetIndex(root: string, index: AssetIndexFile, index
     await mkdir(root, { recursive: true })
     await writeFile(join(root, indexFile), JSON.stringify(index, null, 2), 'utf8')
   } catch (e) {
-    console.warn(`[media-studio] writeAssetIndex(${root}) failed: ${(e as Error).message}`)
+    getMediaStudioHandles().logger?.warn?.(`[media-studio] writeAssetIndex(${root}) failed: ${(e as Error).message}`)
   }
 }
 
@@ -368,7 +372,7 @@ function applyRefUpdates(canvasStore: CanvasStore, hits: AssetHit[], patch: { br
       canvasStore.apply(pid, ops)
       total += ops.length
     } catch (e) {
-      console.warn(`[media-studio] asset ref update on "${pid}" failed: ${(e as Error).message}`)
+      getMediaStudioHandles().logger?.warn?.(`[media-studio] asset ref update on "${pid}" failed: ${(e as Error).message}`)
     }
   }
   return total
@@ -531,4 +535,137 @@ export async function syncAssetFromCanvas(
   a.updatedAt = new Date().toISOString()
   await writeAssetIndex(root, index)
   return { asset: { ...a }, changed: true }
+}
+
+// ── batch migration of broken resultUrl nodes ──────────────────────────────
+
+export interface MigrateResult {
+  migrated: number
+  skipped: number
+  errors: string[]
+}
+
+/**
+ * Scan every registered project's canvas and rewrite any node whose
+ * `resultUrl` is a `file://` URL pointing outside the media-file proxy's
+ * allow-list. Files are copied into the project's asset directory and the
+ * node's resultUrl is updated to the project-relative path.
+ *
+ * Returns a summary; never throws — individual failures are collected in
+ * `errors` and the caller decides whether to retry.
+ */
+export async function migrateBrokenCanvasUrls(
+  wsRoot: string,
+  roots: string[],
+  projectIds: string[],
+  sourcePaths: Record<string, string | undefined>,
+): Promise<MigrateResult> {
+  const { readFile, mkdir, writeFile, stat } = await import('node:fs/promises')
+  const { resolve, extname, join, dirname } = await import('node:path')
+  const { resolveMediaTarget } = await import('./routes')
+  const { CanvasStore } = await import('./canvas-store')
+  const tmpStore = new CanvasStore(wsRoot)
+
+  let migrated = 0
+  let skipped = 0
+  const errors: string[] = []
+
+  for (const pid of projectIds) {
+    const srcPath = sourcePaths[pid]
+    const canvasPath = srcPath ? join(srcPath, '.canvas.json') : join(wsRoot, 'canvases', `${pid}.json`)
+    let raw: string
+    try {
+      raw = await readFile(canvasPath, 'utf8')
+    } catch {
+      continue // canvas not found — skip
+    }
+    let doc: { nodes?: Array<{ id: string; type: string; data?: Record<string, unknown> }>; edges?: unknown[]; version?: number }
+    try {
+      doc = JSON.parse(raw) as typeof doc
+    } catch {
+      errors.push(`${pid}: corrupt canvas JSON`)
+      continue
+    }
+    if (!Array.isArray(doc.nodes)) continue
+
+    let changed = false
+    for (const n of doc.nodes) {
+      const url = (n.data as { resultUrl?: unknown })?.resultUrl
+      if (typeof url !== 'string' || !url.startsWith('file://')) {
+        skipped += 1
+        continue
+      }
+      const localPath = url.slice('file://'.length)
+      const resolved = resolveMediaTarget(localPath, wsRoot, roots)
+      if (resolved.ok) {
+        skipped += 1
+        continue
+      }
+      // Migrate: read source, copy to project assets, rewrite URL.
+      let bytes: Buffer
+      try {
+        bytes = await readFile(localPath)
+      } catch (e) {
+        errors.push(`${pid}/${n.id}: cannot read ${localPath}: ${(e as Error).message}`)
+        continue
+      }
+      if (!bytes || bytes.length === 0) {
+        errors.push(`${pid}/${n.id}: empty source file`)
+        continue
+      }
+      // Determine kind from node type.
+      const typeMap: Record<string, 'character' | 'clip' | 'audio'> = {
+        image: 'character',
+        video: 'clip',
+        music: 'audio',
+      }
+      const kind = typeMap[n.type]
+      if (!kind) {
+        skipped += 1
+        continue
+      }
+      const ext = extname(localPath).replace(/^\./, '').toLowerCase() || assetExtFor(localPath, kind as 'character' | 'scene' | 'audio' | 'clip')
+      const assetId = newAssetId()
+      const fileName = newAssetFileName(assetId, ext)
+      // Honor sourcePath so assets land in the user's project directory.
+      const assetRoot = srcPath ? join(srcPath, 'assets') : join(wsRoot, 'projects', pid, 'assets')
+      const catDir = join(assetRoot, ASSET_CATEGORY_DIR[kind])
+      await mkdir(catDir, { recursive: true })
+      await writeFile(join(catDir, fileName), bytes)
+
+      // Update index.
+      const indexFile = srcPath ? '.index.json' : 'index.json'
+      const index = await loadAssetIndex(assetRoot, indexFile)
+      const now = new Date().toISOString()
+      const label = ((n.data as { label?: unknown })?.label ?? '').toString().trim().slice(0, 64) || `${kind}-${assetId.slice(2, 6)}`
+      index.assets.push({
+        id: assetId,
+        kind,
+        name: label,
+        file: fileName,
+        bytes: bytes.length,
+        origin: { type: 'canvas', canvasNodeId: n.id },
+        createdAt: now,
+        updatedAt: now,
+      })
+      await writeAssetIndex(assetRoot, index, indexFile)
+
+      // Rewrite resultUrl.
+      const newUrl = `projects/${pid}/assets/${ASSET_CATEGORY_DIR[kind]}/${fileName}`
+      ;(n.data as { resultUrl?: string }).resultUrl = newUrl
+      changed = true
+      migrated += 1
+    }
+    if (changed) {
+      const out = { nodes: doc.nodes, edges: doc.edges ?? [], version: doc.version ?? 0 }
+      const writePath = srcPath ? join(srcPath, '.canvas.json') : join(wsRoot, 'canvases', `${pid}.json`)
+      try {
+        await mkdir(dirname(writePath), { recursive: true })
+        await writeFile(writePath, JSON.stringify(out, null, 2), 'utf8')
+      } catch (e) {
+        errors.push(`${pid}: failed to persist rewritten canvas: ${(e as Error).message}`)
+      }
+    }
+  }
+  return { migrated, skipped, errors }
 }

@@ -55,12 +55,12 @@ function injectSearchStyles(): void {
   } catch { /* ignore */ }
 }
 
-function Thumb({ item }: { item: SearchItemAPI }) {
+function Thumb({ item, activeId }: { item: SearchItemAPI; activeId: string | null }) {
   const [failed, setFailed] = useState(false)
   if (!item.srcRaw || failed) {
     return <div className="ms-gs-thumb-null">{item.kind === 'audio' || item.kind === 'music' ? '♪' : item.kind === 'video' || item.kind === 'clip' ? '▶' : '🖼'}</div>
   }
-  return <img src={mediaSrc(item.srcRaw)} alt="" loading="lazy" onError={() => setFailed(true)} />
+  return <img src={mediaSrc(item.srcRaw, activeId ?? undefined)} alt="" loading="lazy" onError={() => setFailed(true)} />
 }
 
 export default function GlobalSearch({ registry, activeId }: {
@@ -203,7 +203,7 @@ export default function GlobalSearch({ registry, activeId }: {
                 </div>
                 {g.items.map((it) => (
                   <div className="ms-gs-row" key={it.key}>
-                    <div className="ms-gs-thumb"><Thumb item={it} /></div>
+                    <div className="ms-gs-thumb"><Thumb item={it} activeId={activeId} /></div>
                     <div className="ms-gs-main">
                       <div className="ms-gs-name">
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.name}</span>

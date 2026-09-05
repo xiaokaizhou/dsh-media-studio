@@ -36,7 +36,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   workspaceRoot: Schema.string().default('~/.media-studio').description('Directory for canvas + generated media. Created on first write.'),
-  mediaRoots: Schema.array(Schema.string()).default([]).description('Extra directories the media-file proxy may serve from, on top of workspaceRoot. Use when generated media lives in a project folder (e.g. ~/Movies/my-film). Leading ~ is expanded.'),
+  mediaRoots: Schema.array(Schema.string()).default(['~/Movies']).description('Extra directories the media-file proxy may serve from, on top of workspaceRoot. Use when generated media lives in a project folder (e.g. ~/Movies/my-film). Leading ~ is expanded. Defaults to ~/Movies so drama/film projects created with a sourcePath under ~/Movies render out of the box.'),
   defaultCanvasId: Schema.string().default('main').description('Canvas id every session is bound to unless it overrides.'),
   logToolCalls: Schema.boolean().default(true).description('Append every canvas/media tool result to the session log for replay.'),
   recentLimit: Schema.number().default(10).min(1).max(50).description('Max entries kept in the project "recently opened" list.'),

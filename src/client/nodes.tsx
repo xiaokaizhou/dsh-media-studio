@@ -388,11 +388,12 @@ function NodeShell({ id, kind, status, title, toolbar, children, selected = fals
 
 type MediaKind = 'image' | 'video' | 'music'
 
-function Placeholder({ Icon, text, error }: { Icon: typeof IconImage; text: string; error?: boolean }) {
+function Placeholder({ Icon, text, error, hint }: { Icon: typeof IconImage; text: string; error?: boolean; hint?: string }) {
   return (
     <div className={`ms-placeholder ${error ? 'ms-error' : ''}`}>
       <Icon size={26} strokeWidth={1.4} />
       <span>{text}</span>
+      {hint && <span className="ms-placeholder-hint">{hint}</span>}
     </div>
   )
 }
@@ -825,9 +826,10 @@ function MediaCardBody({ kind, nodeId, d }: {
   nodeId: string
   d: MsData
 }) {
+  const api = useMediaCanvas()
   const status = d.status ?? 'idle'
   const raw = d.resultUrl
-  const src = mediaSrc(raw)
+  const src = mediaSrc(raw, api.canvasId)
   const meta = KIND_META[kind]
   const Icon = meta.Icon
 
@@ -840,7 +842,6 @@ function MediaCardBody({ kind, nodeId, d }: {
   // instead of an infinite spinner. The refreshNode path has its own
   // 120s timeout — this covers the agent-patch path (e.g. generate_video
   // that timed out on the server).
-  const api = useMediaCanvas()
   const startedAtRef = useRef<number | null>(null)
   useEffect(() => {
     if (status !== 'running') { startedAtRef.current = null; return }
@@ -873,18 +874,20 @@ function MediaCardBody({ kind, nodeId, d }: {
         <Placeholder
           Icon={Icon}
           error={broken || status === 'error'}
-          text={broken ? 'Image failed to load' : status === 'error' ? (d.errorMsg || 'Generation failed') : status === 'running' ? 'Refreshing…' : 'No image yet'}
+          text={broken ? '图片加载失败' : status === 'error' ? (d.errorMsg || '生成失败') : status === 'running' ? '生成中…' : '等待生成图片'}
+          hint={!raw && status === 'idle' ? '连接上游节点后点击刷新按钮生成' : undefined}
         />
       )}
 
       {kind === 'video' && raw && (
-        <LazyVideo src={src} poster={d.poster ? mediaSrc(d.poster as string) : null} />
+        <LazyVideo src={src} poster={d.poster ? mediaSrc(d.poster as string, api.canvasId) : null} />
       )}
       {kind === 'video' && !raw && (
         <Placeholder
           Icon={Icon}
           error={status === 'error'}
-          text={status === 'error' ? (d.errorMsg || 'Generation failed') : 'No video yet'}
+          text={status === 'error' ? (d.errorMsg || '生成失败') : status === 'running' ? '生成中…' : '等待生成视频'}
+          hint={status === 'idle' ? '连接上游节点后点击刷新按钮生成' : undefined}
         />
       )}
 
@@ -895,7 +898,8 @@ function MediaCardBody({ kind, nodeId, d }: {
           <Placeholder
             Icon={Icon}
             error={status === 'error'}
-            text={status === 'error' ? (d.errorMsg || 'Generation failed') : 'No voice yet'}
+            text={status === 'error' ? (d.errorMsg || '生成失败') : status === 'running' ? '生成中…' : '等待生成音频'}
+            hint={status === 'idle' ? '连接上游节点后点击刷新按钮生成' : undefined}
           />
         )
       )}
@@ -904,7 +908,7 @@ function MediaCardBody({ kind, nodeId, d }: {
       {status === 'running' && (
         <div className="media-overlay">
           <IconLoader className="ms-spin" size={20} />
-          <span className="media-overlay-hint">Generating…</span>
+          <span className="media-overlay-hint">生成中…</span>
         </div>
       )}
     </div>
@@ -937,7 +941,7 @@ function makeMediaNode(kind: MediaKind) {
     const download = () => {
       if (!raw) return
       const a = document.createElement('a')
-      a.href = mediaSrc(raw)
+      a.href = mediaSrc(raw, api.canvasId)
       a.download = `${title || id}.${kind === 'image' ? 'png' : kind === 'video' ? 'mp4' : 'mp3'}`
       a.target = '_blank'
       a.rel = 'noopener'
@@ -989,6 +993,7 @@ function makeMediaNode(kind: MediaKind) {
             onClose={() => setLightboxSrc(null)}
             onPrev={() => navLightbox(-1)}
             onNext={() => navLightbox(1)}
+            projectId={api.canvasId}
           />
         )}
       </NodeShell>

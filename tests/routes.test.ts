@@ -48,12 +48,21 @@ async function startTestServer(
   const { CanvasStore } = await import('../src/canvas-store')
   const store = new CanvasStore(wsRoot)
   const sseClients = new Set<http.ServerResponse>()
+  const projectSseClients = new Set<http.ServerResponse>()
+
+  // Minimal mock ProjectStore for the unified SSE endpoint test.
+  const mockProjectStore = {
+    snapshot: () => ({ activeId: 'main', recent: [], projects: [] }),
+    getRecentLimit: () => 10,
+  }
 
   setMediaStudioHandles({
     workspaceRoot: wsRoot,
     defaultCanvasId: 'main',
     canvasStore: store,
     sseClients,
+    projectSseClients,
+    projectStore: mockProjectStore as never,
   })
 
   const routes = await import('../src/routes')
@@ -121,31 +130,31 @@ describe('media-studio HTTP endpoints — canvas surface (after multimodal refac
     expect(json.version).toBe(0)
   })
 
-  it('GET /api/media-studio/canvas/sse opens a stream with current snapshot + named `canvas-patch` event', async () => {
+  it('GET /api/media-studio/sse opens a unified stream with canvas-patch + registry-changed events', async () => {
     const got = await new Promise<{ status: number; bytes: string }>((resolve, reject) => {
       const req = http.request({
         host: '127.0.0.1',
         port: testServer.port,
-        path: '/api/media-studio/canvas/sse',
+        path: '/api/media-studio/sse?canvasId=main',
         method: 'GET',
       }, (res) => {
         let buf = ''
         res.on('data', (c) => { buf += c.toString('utf8') })
         res.on('close', () => resolve({ status: res.statusCode ?? 0, bytes: buf }))
-        // Stop after the named event lands.
-        setTimeout(() => { req.destroy(); resolve({ status: res.statusCode ?? 0, bytes: buf }) }, 200)
+        // Stop after both named events land.
+        setTimeout(() => { req.destroy(); resolve({ status: res.statusCode ?? 0, bytes: buf }) }, 300)
       })
       req.on('error', reject)
       req.end()
     })
     expect(got.status).toBe(200)
-    // The handler emits a `event: canvas-patch\\ndata: {...}\\n\\n` block as
-    // its first message; verify BOTH the named-event line and the data body
-    // are present. (Bare `data:` would dispatch as a `message` event in the
-    // browser, so this regression-test matters.)
+    // Unified endpoint must carry BOTH canvas-patch and registry-changed
+    // on a single socket — this is the core fix for the HTTP/1.1 six-connection
+    // saturation bug.
     expect(got.bytes).toContain('event: canvas-patch')
     expect(got.bytes).toContain('"type":"canvas-patch"')
     expect(got.bytes).toContain('"canvasId":"main"')
+    expect(got.bytes).toContain('event: registry-changed')
   })
 
   it('POST /api/media-studio/canvas/patch applies a batch of ops atomically', async () => {
@@ -328,15 +337,20 @@ describe('canvas_refresh_node delegates to dsh-llm-multimodal', () => {
     }
   })
 
-  it('canvas_refresh_node returns no-upstream when the target node has no upstream edges', async () => {
-    const exec = vi.fn(async () => ({ value: { success: true, url: 'file:///should-not-happen.png', model: 'x' } }))
+  it('canvas_refresh_node falls back to node.data.prompt when no upstream edges exist', async () => {
+    // Refresh used to require upstream edges; that was wrong for the
+    // common agent flow where a media node is the terminus of a pipeline
+    // (or a one-off after a manual generate). The current contract lets
+    // any image/video/music node refresh as long as it carries a prompt
+    // (or has upstream text to lift). This test pins the new behavior.
+    const exec = vi.fn(async () => ({ value: { success: true, url: 'file:///tmp/refreshed.png', model: 'x' } }))
     const testServer = await startTestServer(exec as never)
 
     try {
       const { getMediaStudioHandles } = await import('../src/service-state')
       const store = getMediaStudioHandles().canvasStore
       store.apply('main', [
-        { op: 'addNode', type: 'image', label: 'lonely', nodeId: 'i9', data: { prompt: 'no upstream' } },
+        { op: 'addNode', type: 'image', label: 'lonely', nodeId: 'i9', data: { prompt: 'no upstream, but I have a prompt' } },
       ])
 
       const r = await httpReq(testServer.port, '/api/media-studio/canvas/refresh', 'POST', {
@@ -344,8 +358,43 @@ describe('canvas_refresh_node delegates to dsh-llm-multimodal', () => {
       })
       expect(r.status).toBe(200)
       const json = JSON.parse(r.body)
+      expect(json.ok).toBe(true)
+      // Multimodal plugin WAS invoked — the prompt was used as the prompt.
+      expect(exec).toHaveBeenCalled()
+      const calledArgs = (exec.mock.calls[0] as unknown as unknown[])[0] as { name: string; arguments: { prompt?: string } }
+      expect(calledArgs.name).toBe('generate_image')
+      expect(calledArgs.arguments.prompt).toContain('no upstream, but I have a prompt')
+
+      const snap = store.snapshot('main')
+      const img = snap.graph.nodes.find((n) => n.id === 'i9')
+      expect(img?.data.status).toBe('done')
+      expect(img?.data.resultUrl).toBe('file:///tmp/refreshed.png')
+    } finally {
+      testServer.close()
+    }
+  })
+
+  it('canvas_refresh_node returns no-prompt when the target node has no prompt and no upstream', async () => {
+    // Negative case: a media node with neither prompt nor upstream text
+    // can't produce useful content — return a structured "nothing to
+    // refresh" error so the agent knows to set data.prompt first.
+    const exec = vi.fn(async () => ({ value: { success: true, url: 'file:///should-not-happen.png', model: 'x' } }))
+    const testServer = await startTestServer(exec as never)
+
+    try {
+      const { getMediaStudioHandles } = await import('../src/service-state')
+      const store = getMediaStudioHandles().canvasStore
+      store.apply('main', [
+        { op: 'addNode', type: 'image', label: 'empty', nodeId: 'i10', data: { status: 'idle' } },
+      ])
+
+      const r = await httpReq(testServer.port, '/api/media-studio/canvas/refresh', 'POST', {
+        canvasId: 'main', nodeId: 'i10',
+      })
+      expect(r.status).toBe(200)
+      const json = JSON.parse(r.body)
       expect(json.ok).toBe(false)
-      expect(json.code).toBe('no-upstream')
+      expect(json.code).toBe('no-prompt')
       // Multimodal plugin must NOT have been invoked.
       expect(exec).not.toHaveBeenCalled()
     } finally {

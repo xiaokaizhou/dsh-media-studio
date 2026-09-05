@@ -28,11 +28,12 @@ import {
 } from './projects-api'
 import { type LocaleSource } from './i18n'
 import { useI18n } from './use-i18n-hook'
-import { IconPlus, IconTrash2, IconX } from './icons'
+import { IconPlus, IconTrash2, IconX, IconDownload } from './icons'
 import AssetLibraryPanel from './asset-panel'
 import GlobalSearch from './global-search'
-import { getRevisions, subscribeRevisions, previewRevision, type RevEntry } from './revision-bus'
 import { subscribeSummary, subscribeConn } from './canvas-bus'
+import { SidebarFocusListener } from './sidebar-focus-listener'
+import { toPng } from 'html-to-image'
 
 // ── tiny inline icons (keep this file dependency-light) ────────────────────
 
@@ -81,7 +82,7 @@ function shortDate(iso: string): string {
   }
 }
 
-type MenuView = 'home' | 'open' | 'recent'
+type MenuView = 'home' | 'open'
 type Dialog =
   | { kind: 'new' }
   | { kind: 'rename'; projectId: string; name: string }
@@ -100,200 +101,259 @@ export interface ProjectAppProps {
   locale?: LocaleSource | null
 }
 
-// ── Live canvas badge (version · state) for the top bar ──────────────────────
-// Click opens the revision-history dropdown: scrub the progress bar or hit
-// play/pause to preview past versions of the canvas (client-side playback —
-// nothing is written to the server; closing returns to the live canvas).
+// ── Live canvas badge (connection state + version) for the top bar ──────────
+// Compact, non-interactive: shows the SSE state via a colored dot and the
+// latest canvas version. The version-history dropdown (M3b) was removed
+// because it leaked a 200 KB JSON parse into the main thread on every
+// canvas-tab open, which stalled the conversation input below it.
 
 type LiveConn = 'connecting' | 'open' | 'reconnecting'
 
-const PLAY_STEP_MS = 700
-
 function LiveBadge({ canvasId }: { canvasId: string }) {
-  const { t } = useI18n()
   const [version, setVersion] = useState(0)
-  const [count, setCount] = useState(0)
   const [conn, setConn] = useState<LiveConn>('connecting')
-  const [open, setOpen] = useState(false)
-  const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null)
-  const [revs, setRevs] = useState<RevEntry[]>(() => getRevisions(canvasId))
-  const [sel, setSel] = useState(-1) // index into revs; -1 = latest
-  const [playing, setPlaying] = useState(false)
-  const badgeRef = useRef<HTMLButtonElement | null>(null)
-  const panelRef = useRef<HTMLDivElement | null>(null)
-  const revsRef = useRef<RevEntry[]>(revs)
-  revsRef.current = revs
 
-  // Live SSE subscription: version + node count + connection state. Goes
-  // through the shared canvas-bus so this badge and CanvasView share one
-  // EventSource — two parallel connections against the same endpoint
-  // were doubling the work for every patch and (more importantly) were
-  // a measurable source of UI jank just from *opening* an empty canvas
-  // tab.
+  // Live SSE subscription: version + connection state. Goes through the
+  // shared canvas-bus so this badge and CanvasView share one EventSource —
+  // two parallel connections against the same endpoint were doubling the
+  // work for every patch and (more importantly) were a measurable source
+  // of UI jank just from *opening* an empty canvas tab.
   useEffect(() => {
     const offSummary = subscribeSummary(canvasId, (info) => {
       setVersion(info.version)
-      setCount(info.count)
     })
     const offConn = subscribeConn(canvasId, setConn)
     return () => { offSummary(); offConn() }
   }, [canvasId])
 
-  const close = () => {
-    setOpen(false)
-    setPlaying(false)
-    previewRevision(canvasId, null) // exit playback → live canvas
-  }
-
-  // Refresh revisions from the bus while the panel is open.
-  useEffect(() => {
-    if (!open) return
-    setRevs(getRevisions(canvasId))
-    const off = subscribeRevisions(canvasId, () => setRevs(getRevisions(canvasId)))
-    return off
-  }, [open, canvasId])
-
-  // Outside click / Escape closes (and exits preview).
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: PointerEvent) => {
-      const el = e.target as Node | null
-      if (!el) return
-      if (badgeRef.current?.contains(el) || panelRef.current?.contains(el)) return
-      close()
-    }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
-    window.addEventListener('pointerdown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('pointerdown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, canvasId])
-
-  const lastIdx = revs.length > 0 ? revs.length - 1 : -1
-  const curIdx = sel === -1 ? lastIdx : Math.min(sel, lastIdx)
-
-  // Playback loop: step through versions oldest → newest.
-  useEffect(() => {
-    if (!playing) return
-    const start = curIdx === lastIdx || curIdx < 0 ? 0 : curIdx
-    let i = Math.max(0, start)
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const tick = () => {
-      const list = revsRef.current
-      if (i >= list.length) {
-        setPlaying(false)
-        setSel(-1)
-        previewRevision(canvasId, null)
-        return
-      }
-      setSel(i)
-      previewRevision(canvasId, list[i])
-      i += 1
-      timer = setTimeout(tick, PLAY_STEP_MS)
-    }
-    tick()
-    return () => { if (timer) clearTimeout(timer) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, canvasId])
-
-  const openPanel = () => {
-    setRevs(getRevisions(canvasId))
-    const el = badgeRef.current
-    if (el) {
-      const r = el.getBoundingClientRect()
-      setAnchor({ x: Math.max(6, r.right - 300), y: r.bottom + 6 })
-    }
-    setSel(-1)
-    setOpen(true)
-  }
-
-  const seek = (i: number) => {
-    setPlaying(false)
-    const list = revsRef.current
-    const target = Math.max(0, Math.min(list.length - 1, i))
-    setSel(target)
-    const r = list[target]
-    if (r) previewRevision(canvasId, r)
-  }
-
   const cls = conn === 'open' ? 'is-open' : conn === 'reconnecting' ? 'is-reconnecting' : ''
   return (
-    <>
-      <button
-        ref={badgeRef}
-        type="button"
-        className={`ms-pb-live is-clickable ${cls}`}
-        title={`v${version} · ${count} nodes · SSE ${conn} — 历史版本`}
-        onClick={openPanel}
-      >
-        <span className="ms-pb-live-dot" />
-        <span className="ms-pb-sep" aria-hidden>·</span>
-        <span className="ms-pb-live-v">v{version}</span>
-        <span className="ms-pb-caret">▾</span>
-      </button>
-      {open && anchor && createPortal(
-        <div ref={panelRef} className="ms-pb-hist" style={{ left: anchor.x, top: anchor.y }} role="dialog" aria-label={t('hist.title')}>
-          <div className="ms-pb-hist-head">
-            <span>{t('hist.title')} · v{version}</span>
-            <button type="button" className="ms-pb-icon-btn" onClick={close} aria-label={t('common.close')}>
-              <IconX size={13} />
-            </button>
-          </div>
-          <div className="ms-pb-hist-ctrl">
-            <button
-              type="button"
-              className="ms-pb-play"
-              onClick={() => setPlaying((p) => !p)}
-              disabled={revs.length < 2}
-              aria-label={playing ? t('hist.pause') : t('hist.play')}
-            >
-              {playing ? '❚❚' : '▶'}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={Math.max(0, lastIdx)}
-              step={1}
-              value={Math.max(0, curIdx)}
-              disabled={revs.length < 2}
-              aria-label={t('hist.progress')}
-              onChange={(e) => seek(Number(e.target.value))}
-            />
-            <span className="ms-pb-hist-v">{curIdx >= 0 ? `v${revs[curIdx].version}` : '—'}</span>
-          </div>
-          <div className="ms-pb-hist-list">
-            {revs.length === 0 ? (
-              <div className="ms-pb-empty">{t('hist.none')}</div>
-            ) : (
-              [...revs].reverse().map((r, revIdx) => {
-                const i = revs.length - 1 - revIdx
-                const when = new Date(r.at).toLocaleTimeString()
-                const nodes = r.snap.graph.nodes.length
-                return (
-                  <button
-                    key={r.version}
-                    type="button"
-                    className={`ms-pb-hist-row ${i === curIdx ? 'is-on' : ''}`}
-                    onClick={() => seek(i)}
-                    title={`${when} · ${nodes} nodes`}
-                  >
-                    <span className="ms-pb-hist-row-v">v{r.version}</span>
-                    <span className="ms-pb-hist-row-meta">{when} · {nodes}</span>
-                  </button>
-                )
-              })
-            )}
-          </div>
-          <div className="ms-pb-hist-foot">
-            <button type="button" className="ms-btn-cancel" onClick={close}>{t('hist.backToLive')}</button>
-          </div>
-        </div>,
-        document.body,
-      )}
-    </>
+    <span
+      className={`ms-pb-live ${cls}`}
+      title={`canvas v${version} · SSE ${conn}`}
+      aria-label={`canvas live connection ${conn}`}
+    >
+      <span className="ms-pb-live-dot" />
+      <span className="ms-pb-live-v">v{version}</span>
+    </span>
+  )
+}
+
+// ── dialog components (module-level to avoid remount-on-parent-render) ────
+// These used to be defined inside ProjectApp, which meant every ProjectApp
+// re-render (triggered by SSE registry updates, canvas state changes, etc.)
+// created new function references and caused React to unmount/remount the
+// dialog. An in-flight submit() promise would then call setState on the
+// unmounted instance, while the fresh instance reset localBusy/name —
+// producing the stuck "处理中…" button and a modal backdrop that never went
+// away. Moving them to module scope gives them a stable identity.
+
+interface DeleteDialogContentProps {
+  target: NonNullable<Extract<Dialog, { kind: 'delete' }>>
+  onClose: () => void
+  onDelete: (projectId: string, mode: 'trash' | 'permanent', cascade: 'cancel' | 'migrate-shared' | 'break-refs') => Promise<boolean>
+}
+
+function DeleteDialogContent({ target, onClose, onDelete }: DeleteDialogContentProps) {
+  const { t } = useI18n()
+  const [deps, setDeps] = useState<DependentsAPI | null>(null)
+  const [analyzing, setAnalyzing] = useState(true)
+  const [cascade, setCascade] = useState<'migrate-shared' | 'break-refs' | null>(null)
+  const [permanent, setPermanent] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [localBusy, setLocalBusy] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    setAnalyzing(true)
+    setErr(null)
+    void apiFetchDependents(target.projectId).then((res) => {
+      if (!alive) return
+      setAnalyzing(false)
+      if (res.ok) setDeps(res.data.dependents)
+      else setErr(t('err.generic', { message: res.error }))
+    })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target.projectId])
+
+  const hasRefs = (deps?.totalRefs ?? 0) > 0
+  const canDelete = !hasRefs || cascade !== null
+  const doDelete = async () => {
+    if (!canDelete || localBusy) return
+    setLocalBusy(true)
+    setErr(null)
+    try {
+      const result = await Promise.race([
+        onDelete(target.projectId, permanent ? 'permanent' : 'trash', cascade ?? 'cancel'),
+        new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('timeout')), 10_000)),
+      ])
+      if (result) {
+        onClose()
+      } else {
+        setErr(t('err.blocked.project'))
+      }
+    } catch (e) {
+      setErr(t('err.generic', { message: (e as Error).message }))
+    } finally {
+      setLocalBusy(false)
+    }
+  }
+
+  return (
+    <div
+      className="ms-pb-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-label={t('dlg.delete.title')}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="ms-pb-dialog-head">
+        <span>{t('dlg.delete.title')}</span>
+        <button type="button" className="ms-pb-icon-btn" onClick={onClose} aria-label={t('common.close')}>
+          <IconX size={13} />
+        </button>
+      </div>
+      <div className="ms-pb-dialog-body">
+        <div className="ms-pb-delete-summary">{t('dlg.delete.summary', { name: target.name })}</div>
+        {analyzing ? (
+          <div className="ms-pb-muted">{t('dlg.delete.analyzing')}</div>
+        ) : hasRefs && deps ? (
+          <>
+            <div className="ms-pb-refs-block">
+              <div className="ms-pb-refs-header">{t('dlg.delete.refsHeader')}</div>
+              {deps.hits.map((h, i) => (
+                <div key={i} className="ms-pb-refs-row">
+                  <FolderIcon size={11} />
+                  <span>{t('dlg.delete.refsDetail', { project: h.refProjectName, nodes: h.nodeIds.length })}</span>
+                </div>
+              ))}
+              {deps.copyConsumers.length > 0 && (
+                <div className="ms-pb-muted" style={{ marginTop: 8 }}>
+                  {t('dlg.delete.copiesHint')}
+                  {deps.copyConsumers.map((c) => ` ${c.projectName} (×${c.count})`).join('、')}
+                </div>
+              )}
+            </div>
+            <div className="ms-pb-cascade-label">{t('dlg.delete.cascadeHint')}</div>
+            <label className="ms-pb-radio">
+              <input type="radio" name="cascade" checked={cascade === 'migrate-shared'} onChange={() => { setCascade('migrate-shared'); setErr(null) }} />
+              <span>{t('dlg.delete.cascade.migrate')}</span>
+            </label>
+            <label className="ms-pb-radio">
+              <input type="radio" name="cascade" checked={cascade === 'break-refs'} onChange={() => { setCascade('break-refs'); setErr(null) }} />
+              <span>{t('dlg.delete.cascade.break')}</span>
+            </label>
+            {err && <div className="ms-pb-err">{err}</div>}
+            {!canDelete && <div className="ms-pb-blocked">{t('dlg.delete.blocked')}</div>}
+          </>
+        ) : (
+          <>
+            <div className="ms-pb-muted">{t('dlg.delete.noRefs')}</div>
+            {err && <div className="ms-pb-err">{err}</div>}
+          </>
+        )}
+        <div className="ms-pb-trash-hint">{t('dlg.delete.trashHint')}</div>
+        <label className="ms-pb-check">
+          <input type="checkbox" checked={permanent} onChange={(e) => setPermanent(e.target.checked)} />
+          <span>{t('dlg.delete.permanent')}</span>
+        </label>
+      </div>
+      <div className="ms-pb-dialog-actions">
+        <button type="button" className="ms-btn-cancel" onClick={onClose} disabled={localBusy}>
+          {t('common.cancel')}
+        </button>
+        <button
+          type="button"
+          className="ms-btn-danger"
+          disabled={localBusy || !canDelete}
+          onClick={() => void doDelete()}
+        >
+          {localBusy ? t('common.loading') : t('dlg.delete.confirm')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+interface NameDialogContentProps {
+  dlg: Extract<Dialog, { kind: 'new' } | { kind: 'rename' }>
+  onClose: () => void
+  onCreate: (name: string) => Promise<boolean>
+  onRename: (projectId: string, name: string) => Promise<boolean>
+}
+
+function NameDialogContent({ dlg, onClose, onCreate, onRename }: NameDialogContentProps) {
+  const { t } = useI18n()
+  const [name, setName] = useState(dlg.kind === 'rename' ? dlg.name : '')
+  const [err, setErr] = useState<string | null>(null)
+  const [localBusy, setLocalBusy] = useState(false)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  useEffect(() => {
+    inputRef.current?.focus()
+    inputRef.current?.select()
+  }, [])
+  const submit = async () => {
+    if (localBusy) return
+    const vErr = validateName(name)
+    if (vErr) { setErr(t(vErr)); return }
+    setLocalBusy(true)
+    setErr(null)
+    try {
+      const op = dlg.kind === 'new' ? 'create' : 'rename'
+      const result = await Promise.race([
+        dlg.kind === 'new' ? onCreate(name) : onRename(dlg.projectId, name),
+        new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('timeout')), 30_000)),
+      ])
+      if (result) {
+        onClose()
+      } else {
+        setErr(t('err.generic', { message: `${op} failed` }))
+      }
+    } catch (e) {
+      setErr(t('err.generic', { message: (e as Error).message }))
+    } finally {
+      setLocalBusy(false)
+    }
+  }
+  return (
+    <div
+      className="ms-pb-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="ms-pb-dialog-head">
+        <span>{t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}</span>
+        <button type="button" className="ms-pb-icon-btn" onClick={onClose} aria-label={t('common.close')}>
+          <IconX size={13} />
+        </button>
+      </div>
+      <div className="ms-pb-dialog-body">
+        <input
+          ref={inputRef}
+          className="ms-pb-input"
+          value={name}
+          placeholder={t('project.name.placeholder')}
+          onChange={(e) => { setName(e.target.value); setErr(null) }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !localBusy) void submit()
+          }}
+        />
+        {err && <div className="ms-pb-err">{err}</div>}
+      </div>
+      <div className="ms-pb-dialog-actions">
+        <button type="button" className="ms-btn-cancel" onClick={onClose} disabled={localBusy}>
+          {t('common.cancel')}
+        </button>
+        <button type="button" className="ms-btn-primary" disabled={localBusy} onClick={() => void submit()}>
+          {localBusy ? t('common.loading') : (dlg.kind === 'rename' ? t('common.rename') : t('common.create'))}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -308,6 +368,7 @@ const PROJECT_STYLES = `
   --ms-bg: var(--dsw-alias-bg-base, #0c0e13);
   --ms-bg2: var(--dsw-alias-bg-layer-1, #14171d);
   --ms-panel: var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 0.96));
+  --ms-panel-bg: rgba(26, 29, 38, 1);
   --ms-panel-soft: rgba(255,255,255,0.08);
   --ms-fg: var(--dsw-alias-label-primary, #eceef2);
   --ms-fg-dim: var(--dsw-alias-label-secondary, rgba(255,255,255,0.68));
@@ -334,8 +395,11 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-muted { color:var(--ms-fg-faint); font-size:11.5px; }
 .ms-pb-host { flex:1; min-height:0; position:relative; display:flex; }
 .ms-pb-host > div { flex:1; min-width:0; }
-.ms-pb-menu { position:fixed; width:276px; max-height:min(560px, calc(100vh - 96px)); display:flex; flex-direction:column; background:var(--ms-panel); border:1px solid var(--ms-border-strong); border-radius:12px; box-shadow:var(--ms-shadow-lg); padding:6px; z-index:60; color:var(--ms-fg); font-size:12.5px; }
+.ms-pb-menu { position:fixed; width:276px; max-height:min(560px, calc(100vh - 96px)); display:flex; flex-direction:column; background:var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border:1px solid var(--ms-border-strong); border-radius:12px; box-shadow:var(--ms-shadow-lg); padding:6px; z-index:60; color:var(--ms-fg); font-size:12.5px; }
 .ms-pb-menu-item { display:flex; align-items:center; gap:8px; width:100%; padding:7px 8px; border:none; border-radius:8px; background:transparent; color:var(--ms-fg-dim); font:inherit; cursor:pointer; text-align:left; }
+.ms-pb-menu-item[aria-busy="true"] { opacity: 0.75; }
+.ms-pb-menu-item[aria-busy="true"] span { animation: ms-pb-pulse 1.2s ease-in-out infinite; }
+@keyframes ms-pb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 .ms-pb-menu-item:hover:not(:disabled) { background:var(--ms-panel-soft); color:var(--ms-fg); }
 .ms-pb-menu-item:disabled { opacity:0.4; cursor:not-allowed; }
 .ms-pb-menu-item svg { color:var(--ms-accent); flex:none; }
@@ -358,11 +422,14 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-icon-btn.is-danger:hover { color:var(--ms-error); background:rgba(239,68,68,0.14); }
 .ms-pb-chip { flex:none; padding:1px 6px; border-radius:99px; background:var(--ms-panel-soft); color:var(--ms-fg-faint); font-size:10px; }
 .ms-pb-empty { padding:14px 10px; color:var(--ms-fg-faint); font-size:12px; text-align:center; }
+.ms-pb-menu-err { margin: 4px 6px 2px; padding: 6px 8px; border-radius: 8px; background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.35); color: var(--ms-error); font-size: 11.5px; line-height: 1.4; }
+.ms-pb-submenu { position: fixed; width: 276px; max-height: min(440px, calc(100vh - 110px)); display: flex; flex-direction: column; background: var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border: 1px solid var(--ms-border-strong); border-radius: 12px; box-shadow: var(--ms-shadow-lg); padding: 6px; z-index: 70; color: var(--ms-fg); font-size: 12.5px; }
+.ms-pb-submenu .ms-pb-scroll { margin-top: 4px; }
 .ms-pb-lang-row { display:flex; align-items:center; justify-content:space-between; padding:2px 8px 4px; }
 .ms-pb-lang-btns { display:flex; gap:2px; }
 .ms-pb-lang-btns button { border:none; border-radius:6px; padding:3px 8px; background:transparent; color:var(--ms-fg-dim); cursor:pointer; font:600 11px/1 system-ui,sans-serif; }
 .ms-pb-lang-btns button.is-on { background:var(--ms-accent); color:#0b0d12; }
-.ms-pb-dialog { position:fixed; left:50%; top:44%; transform:translate(-50%,-50%); width:min(400px, calc(100vw - 44px)); background:var(--ms-panel); border:1px solid var(--ms-border-strong); border-radius:14px; box-shadow:var(--ms-shadow-lg); display:flex; flex-direction:column; color:var(--ms-fg); font-size:12.5px; }
+.ms-pb-dialog { position:fixed; left:50%; top:44%; transform:translate(-50%,-50%); width:min(400px, calc(100vw - 44px)); background:var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border:1px solid var(--ms-border-strong); border-radius:14px; box-shadow:var(--ms-shadow-lg); display:flex; flex-direction:column; color:var(--ms-fg); font-size:12.5px; }
 .ms-pb-dialog-head { display:flex; align-items:center; justify-content:space-between; padding:12px 14px 6px; font-weight:700; font-size:13px; }
 .ms-pb-dialog-body { padding:8px 14px; display:flex; flex-direction:column; gap:8px; }
 .ms-pb-delete-summary { color:var(--ms-fg); }
@@ -380,6 +447,10 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-dialog-actions { display:flex; justify-content:flex-end; gap:8px; padding:8px 14px 12px; }
 .ms-btn-primary { padding:6px 14px; border:none; border-radius:8px; background:var(--ms-accent); color:#0b0d12; font:600 12px/1 system-ui,sans-serif; cursor:pointer; }
 .ms-btn-primary:hover { filter:brightness(1.1); }
+.ms-btn-danger { padding:6px 14px; border:none; border-radius:8px; background:#dc2626; color:#fff; font:600 12px/1 system-ui,sans-serif; cursor:pointer; }
+.ms-btn-danger:hover { filter:brightness(1.1); }
+.ms-btn-cancel { padding:6px 14px; border:1px solid var(--ms-border); border-radius:8px; background:transparent; color:var(--ms-fg); font:600 12px/1 system-ui,sans-serif; cursor:pointer; }
+.ms-btn-cancel:hover { background:var(--ms-hover); }
 .ms-btn-primary:disabled, .ms-btn-danger:disabled, .ms-btn-cancel:disabled { opacity:0.5; cursor:not-allowed; }
 /* Top bar layout: left (menu+project) · centered search · right live badge */
 .ms-pb-bar { position: relative; }
@@ -396,7 +467,7 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-live.is-clickable:hover { background:var(--ms-panel-soft); color:var(--ms-fg); }
 .ms-pb-live-dot { margin-left:4px; }
 .ms-pb-caret { margin-left:4px; font-size:9px; color:var(--ms-fg-faint); }
-.ms-pb-hist { position:fixed; width:300px; max-height:min(460px, calc(100vh - 90px)); display:flex; flex-direction:column; background:var(--ms-panel); border:1px solid var(--ms-border-strong); border-radius:12px; box-shadow:var(--ms-shadow-lg); color:var(--ms-fg); z-index:80; font:12px/1.4 system-ui,sans-serif; overflow:hidden; }
+.ms-pb-hist { position:fixed; width:300px; max-height:min(460px, calc(100vh - 90px)); display:flex; flex-direction:column; background:var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border:1px solid var(--ms-border-strong); border-radius:12px; box-shadow:var(--ms-shadow-lg); color:var(--ms-fg); z-index:80; font:12px/1.4 system-ui,sans-serif; overflow:hidden; }
 .ms-pb-hist-head { display:flex; align-items:center; justify-content:space-between; padding:10px 12px 6px; font-weight:700; }
 .ms-pb-hist-ctrl { display:flex; align-items:center; gap:8px; padding:4px 12px 8px; border-bottom:1px solid var(--ms-border); }
 .ms-pb-play { flex:none; width:26px; height:26px; border-radius:8px; border:none; background:var(--ms-panel-soft); color:var(--ms-fg); cursor:pointer; font-size:11px; display:flex; align-items:center; justify-content:center; }
@@ -446,8 +517,9 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
   const [menuOpen, setMenuOpen] = useState(false)
   const [view, setView] = useState<MenuView>('home')
   const [dialog, setDialog] = useState<Dialog>(null)
-  const [busy, setBusy] = useState(false)
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [recentHover, setRecentHover] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const rootBtnRef = useRef<HTMLButtonElement | null>(null)
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null)
 
@@ -490,6 +562,34 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
     return () => window.removeEventListener('keydown', onKey)
   }, [menuOpen, dialog])
 
+  // Outside-click dismiss for the floating "项目" menu. The backdrop div
+  // uses `pointer-events: none` now (so the canvas context menu backdrop
+  // can't swallow clicks meant for the canvas; see canvas-styles.ts), so we
+  // close the dropdown ourselves when the pointer lands outside both the
+  // dropdown and the trigger button. Re-clicking the trigger button is
+  // handled by its own onClick (toggleMenu) which short-circuits before the
+  // listener runs.
+  useEffect(() => {
+    if (!menuOpen) return
+    const onPointerDown = (ev: PointerEvent) => {
+      const t = ev.target as Node | null
+      if (!t) return
+      const trigger = rootBtnRef.current
+      if (trigger && trigger.contains(t)) return
+      const menuEl = document.querySelector('.ms-pb-menu')
+      if (menuEl && menuEl.contains(t)) return
+      setMenuOpen(false)
+    }
+    // Defer one frame so the click that opened the menu doesn't dismiss it.
+    const id = window.setTimeout(() => {
+      window.addEventListener('pointerdown', onPointerDown, true)
+    }, 0)
+    return () => {
+      window.clearTimeout(id)
+      window.removeEventListener('pointerdown', onPointerDown, true)
+    }
+  }, [menuOpen])
+
   const toggleMenu = useCallback(() => {
     if (menuOpen) {
       setMenuOpen(false)
@@ -508,56 +608,38 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
     setRegistry(reg)
     setMenuOpen(false)
     setDialog(null)
-    setBusy(false)
   }, [])
 
   const handleCreate = useCallback(async (name: string): Promise<boolean> => {
-    setBusy(true)
-    try {
-      const res = await apiCreateProject(name || undefined)
-      if (res.ok) {
-        applyRegistry(res.data.registry)
-        return true
-      }
-      return false
-    } finally {
-      setBusy(false)
+    const res = await apiCreateProject(name || undefined)
+    if (res.ok) {
+      applyRegistry(res.data.registry)
+      return true
     }
+    return false
   }, [applyRegistry])
 
   const handleOpen = useCallback(async (id: string): Promise<boolean> => {
-    setBusy(true)
-    try {
-      const res = await apiOpenProject(id)
-      if (res.ok) {
-        applyRegistry(res.data.registry)
-        return true
-      }
-      return false
-    } finally {
-      setBusy(false)
+    const res = await apiOpenProject(id)
+    if (res.ok) {
+      applyRegistry(res.data.registry)
+      return true
     }
+    return false
   }, [applyRegistry])
 
   const handleRename = useCallback(async (id: string, name: string): Promise<boolean> => {
-    setBusy(true)
-    try {
-      const res = await apiRenameProject(id, name)
-      if (res.ok) {
-        applyRegistry(res.data.registry)
-        return true
-      }
-      return false
-    } finally {
-      setBusy(false)
+    const res = await apiRenameProject(id, name)
+    if (res.ok) {
+      applyRegistry(res.data.registry)
+      return true
     }
+    return false
   }, [applyRegistry])
 
   const handleDelete = useCallback(async (id: string, mode: 'trash' | 'permanent', cascade: 'cancel' | 'break-refs' | 'migrate-shared') => {
-    setBusy(true)
     const res = await apiDeleteProject(id, { mode, cascade })
     if (res.ok) applyRegistry(res.data.registry)
-    setBusy(false)
     return res.ok
   }, [applyRegistry])
 
@@ -572,213 +654,109 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
   // the native picker hands us; the picker returns an absolute path so the
   // project is registered with a real sourcePath.
   const commitOpen = useCallback(async (folderName: string, sourcePath?: string) => {
-    setBusy(true)
-    try {
-      const res = await apiOpenFolder(folderName, sourcePath)
-      if (res.ok) applyRegistry(res.data.registry)
-      else console.warn('[media-studio] open-folder failed:', res.error)
-    } finally {
-      setBusy(false)
-    }
+    const res = await apiOpenFolder(folderName, sourcePath)
+    if (res.ok) applyRegistry(res.data.registry)
+    else console.warn('[media-studio] open-folder failed:', res.error)
   }, [applyRegistry])
 
   // Native macOS folder picker via host-side osascript. Returns the absolute
   // path the user picked (e.g. /Users/x/Movies/douyin-viral-drama) — no
   // file contents are uploaded; we just register that directory as the
   // project's sourcePath.
+  //
+  // The picker is an OS-level modal spawned by the host process. We keep
+  // the menu mounted (with a "选择中…" pill on the menu item) instead of
+  // tearing it down immediately so the user has visible feedback that
+  // something is happening — without that, the menu vanishing on click
+  // looked exactly like "no response". A hard 60 s timeout also stops the
+  // dialog staying forever if osascript hangs (e.g. sandbox restrictions).
+  const [pickerRunning, setPickerRunning] = useState(false)
+  const [pickerErr, setPickerErr] = useState<string | null>(null)
   const handlePickNative = useCallback(async () => {
-    setMenuOpen(false)
-    setBusy(true)
+    if (pickerRunning) return
+    setPickerRunning(true)
+    setPickerErr(null)
     try {
-      const res = await apiPickFolder()
+      const res = await Promise.race([
+        apiPickFolder(),
+        new Promise<{ ok: false; error: string }>((resolve) =>
+          setTimeout(() => resolve({ ok: false, error: 'native folder picker timed out' }), 60_000),
+        ),
+      ])
       if (!res.ok) {
-        console.warn('[media-studio] pick-folder failed:', res.error)
+        // Surface the failure in the menu so the user knows the click did
+        // register — most "no response" reports were this branch being
+        // swallowed by console.warn only.
+        setPickerErr(res.error || 'native folder picker failed')
         return
       }
       if (res.data.canceled) return
       const absPath = res.data.path
       if (!absPath) return
       const tail = absPath.split('/').filter(Boolean).pop() || absPath
+      setMenuOpen(false)
       await commitOpen(tail, absPath)
     } finally {
-      setBusy(false)
+      setPickerRunning(false)
     }
-  }, [commitOpen])
+  }, [commitOpen, pickerRunning])
 
-  // Delete-dialog internals (dependency analysis lives here).
-  function DeleteDialogContent({ target }: { target: NonNullable<Extract<Dialog, { kind: 'delete' }>> }) {
-    const [deps, setDeps] = useState<DependentsAPI | null>(null)
-    const [analyzing, setAnalyzing] = useState(true)
-    const [cascade, setCascade] = useState<'migrate-shared' | 'break-refs' | null>(null)
-    const [permanent, setPermanent] = useState(false)
-    const [err, setErr] = useState<string | null>(null)
-
-    useEffect(() => {
-      let alive = true
-      setAnalyzing(true)
-      void apiFetchDependents(target.projectId).then((res) => {
-        if (!alive) return
-        setAnalyzing(false)
-        if (res.ok) setDeps(res.data.dependents)
-        else setErr(t('err.generic', { message: res.error }))
-      })
-      return () => {
-        alive = false
-      }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [target.projectId])
-
-    const hasRefs = (deps?.totalRefs ?? 0) > 0
-    const canDelete = !hasRefs || cascade !== null
-    const doDelete = async () => {
-      if (!canDelete) return
-      const ok = await handleDelete(target.projectId, permanent ? 'permanent' : 'trash', cascade ?? 'cancel')
-      if (!ok) {
-        setErr(t('err.blocked.project'))
-      }
+  // Export canvas as PNG — moved from the bottom view bar to the top bar
+  // right corner for better discoverability. Auto-fits the view first so
+  // all nodes are visible, then uses html-to-image to rasterize the
+  // .react-flow container at 2x pixel ratio.
+  //
+  // Two safety nets guard against the screenshot freezing the UI
+  // ("下载截图也卡住" repro):
+  //   1. `skipFonts: true` — html-to-image's default `embedWebFonts` walks
+  //      every stylesheet in the document and `fetch()`es every `@import`
+  //      URL with no timeout. DSH host stylesheets can pull CSS from
+  //      remote/origin-locked endpoints; one hung fetch hangs the whole
+  //      pipeline. We don't use any webfonts inside the canvas anyway
+  //      (every node uses inline styles + system-ui fallback), so skipping
+  //      the font-embed step costs nothing and removes the hang.
+  //   2. A 25s `Promise.race` timeout on the whole `toPng` call. Even if
+  //      some other internal fetch goes sideways, the export button can
+  //      never get stuck in `is-loading` forever.
+  //   3. Reset `exporting` state in a `useEffect` cleanup so unmount
+  //      during a hung export doesn't leave the state stuck (the parent
+  //      unmounts anyway, but the setState-on-unmounted warning is real).
+  const EXPORT_TIMEOUT_MS = 25_000
+  const doExport = useCallback(async () => {
+    if (exporting) return
+    setExporting(true)
+    try {
+      const container = document.querySelector('.react-flow') as HTMLElement | null
+      if (!container) throw new Error('Canvas container not found')
+      const dataUrl = await Promise.race([
+        toPng(container, {
+          backgroundColor: '#0d0d0d',
+          pixelRatio: 2,
+          cacheBust: true,
+          skipFonts: true,
+          filter: (node) => {
+            if (node instanceof HTMLElement) {
+              if (node.classList.contains('ms-view-bar')) return false
+              if (node.classList.contains('ms-connect-menu')) return false
+              if (node.classList.contains('ms-node-menu')) return false
+            }
+            return true
+          },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`toPng timed out after ${EXPORT_TIMEOUT_MS}ms`)), EXPORT_TIMEOUT_MS),
+        ),
+      ])
+      const link = document.createElement('a')
+      link.download = `media-studio-canvas-${Date.now()}.png`
+      link.href = dataUrl
+      link.click()
+    } catch (e) {
+      console.warn('[media-studio] export failed:', e)
+    } finally {
+      setExporting(false)
     }
-
-    return (
-      <div
-        className="ms-pb-dialog"
-        role="alertdialog"
-        aria-modal="true"
-        aria-label={t('dlg.delete.title')}
-        // Stop pointer events from bubbling to the backdrop so focusing the
-        // permanent-delete checkbox / cascade radios / clicking any label
-        // doesn't tear the dialog down before the user has picked a choice.
-        onMouseDown={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="ms-pb-dialog-head">
-          <span>{t('dlg.delete.title')}</span>
-          <button type="button" className="ms-pb-icon-btn" onClick={() => setDialog(null)} aria-label={t('common.close')}>
-            <IconX size={13} />
-          </button>
-        </div>
-        <div className="ms-pb-dialog-body">
-          <div className="ms-pb-delete-summary">{t('dlg.delete.summary', { name: target.name })}</div>
-          {analyzing ? (
-            <div className="ms-pb-muted">{t('dlg.delete.analyzing')}</div>
-          ) : hasRefs && deps ? (
-            <>
-              <div className="ms-pb-refs-block">
-                <div className="ms-pb-refs-header">{t('dlg.delete.refsHeader')}</div>
-                {deps.hits.map((h, i) => (
-                  <div key={i} className="ms-pb-refs-row">
-                    <FolderIcon size={11} />
-                    <span>{t('dlg.delete.refsDetail', { project: h.refProjectName, nodes: h.nodeIds.length })}</span>
-                  </div>
-                ))}
-                {deps.copyConsumers.length > 0 && (
-                  <div className="ms-pb-muted" style={{ marginTop: 8 }}>
-                    {t('dlg.delete.copiesHint')}
-                    {deps.copyConsumers.map((c) => ` ${c.projectName} (×${c.count})`).join('、')}
-                  </div>
-                )}
-              </div>
-              <div className="ms-pb-cascade-label">{t('dlg.delete.cascadeHint')}</div>
-              <label className="ms-pb-radio">
-                <input type="radio" name="cascade" checked={cascade === 'migrate-shared'} onChange={() => { setCascade('migrate-shared'); setErr(null) }} />
-                <span>{t('dlg.delete.cascade.migrate')}</span>
-              </label>
-              <label className="ms-pb-radio">
-                <input type="radio" name="cascade" checked={cascade === 'break-refs'} onChange={() => { setCascade('break-refs'); setErr(null) }} />
-                <span>{t('dlg.delete.cascade.break')}</span>
-              </label>
-              {err && <div className="ms-pb-err">{err}</div>}
-              {!canDelete && <div className="ms-pb-blocked">{t('dlg.delete.blocked')}</div>}
-            </>
-          ) : (
-            <>
-              <div className="ms-pb-muted">{t('dlg.delete.noRefs')}</div>
-              {err && <div className="ms-pb-err">{err}</div>}
-            </>
-          )}
-          <div className="ms-pb-trash-hint">{t('dlg.delete.trashHint')}</div>
-          <label className="ms-pb-check">
-            <input type="checkbox" checked={permanent} onChange={(e) => setPermanent(e.target.checked)} />
-            <span>{t('dlg.delete.permanent')}</span>
-          </label>
-        </div>
-        <div className="ms-pb-dialog-actions">
-          <button type="button" className="ms-btn-cancel" onClick={() => setDialog(null)} disabled={busy}>
-            {t('common.cancel')}
-          </button>
-          <button
-            type="button"
-            className="ms-btn-danger"
-            disabled={busy || !canDelete}
-            onClick={() => void doDelete()}
-          >
-            {busy ? t('common.loading') : t('dlg.delete.confirm')}
-          </button>
-        </div>
-      </div>
-    )
-  }
-
-  // Name input dialog (create / rename share it).
-  function NameDialogContent({ dlg }: { dlg: Extract<Dialog, { kind: 'new' } | { kind: 'rename' }> }) {
-    const [name, setName] = useState(dlg.kind === 'rename' ? dlg.name : '')
-    const [err, setErr] = useState<string | null>(null)
-    const inputRef = useRef<HTMLInputElement | null>(null)
-    useEffect(() => {
-      inputRef.current?.focus()
-      inputRef.current?.select()
-    }, [])
-    const submit = async () => {
-      const vErr = validateName(name)
-      if (vErr) { setErr(t(vErr)); return }
-      if (dlg.kind === 'new') {
-        const ok = await handleCreate(name)
-        if (!ok) setErr(t('err.generic', { message: 'create failed' }))
-      } else {
-        const ok = await handleRename(dlg.projectId, name)
-        if (!ok) setErr(t('err.generic', { message: 'rename failed' }))
-      }
-    }
-    return (
-      <div
-        className="ms-pb-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}
-        // Stop pointer events from bubbling to the backdrop so focusing the
-        // input (or clicking anywhere inside the dialog) doesn't dismiss it.
-        onMouseDown={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="ms-pb-dialog-head">
-          <span>{t(dlg.kind === 'new' ? 'dlg.new.title' : 'dlg.rename.title')}</span>
-          <button type="button" className="ms-pb-icon-btn" onClick={() => setDialog(null)} aria-label={t('common.close')}>
-            <IconX size={13} />
-          </button>
-        </div>
-        <div className="ms-pb-dialog-body">
-          <input
-            ref={inputRef}
-            className="ms-pb-input"
-            value={name}
-            placeholder={t('project.name.placeholder')}
-            onChange={(e) => { setName(e.target.value); setErr(null) }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !busy) void submit()
-            }}
-          />
-          {err && <div className="ms-pb-err">{err}</div>}
-        </div>
-        <div className="ms-pb-dialog-actions">
-          <button type="button" className="ms-btn-cancel" onClick={() => setDialog(null)} disabled={busy}>
-            {t('common.cancel')}
-          </button>
-          <button type="button" className="ms-btn-primary" disabled={busy} onClick={() => void submit()}>
-            {busy ? t('common.loading') : (dlg.kind === 'rename' ? t('common.rename') : t('common.create'))}
-          </button>
-        </div>
-      </div>
-    )
-  }
+  }, [exporting])
 
   // Project list (open view or recent view).
   function ProjectList({ items, onPick }: { items: ProjectMetaAPI[]; onPick: (id: string) => void }) {
@@ -813,6 +791,7 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
 
   return (
     <div className="media-studio-project">
+      <SidebarFocusListener />
       <div className="ms-pb-bar">
         <div className="ms-pb-left">
           <button ref={rootBtnRef} type="button" className="ms-pb-root" onClick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen}>
@@ -832,13 +811,24 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
           <GlobalSearch registry={registry} activeId={activeId} />
         </div>
         <div className="ms-pb-right">
+          <button
+            type="button"
+            className={`ms-pb-icon-btn ${exporting ? 'is-loading' : ''}`}
+            onClick={() => void doExport()}
+            title={exporting ? t('export.loading') : t('export.title')}
+            aria-label={t('export.title')}
+            disabled={exporting}
+            style={{ width: 26, height: 26 }}
+          >
+            <IconDownload size={14} />
+          </button>
           <LiveBadge canvasId={canvasId} />
         </div>
       </div>
       <div className="ms-pb-host">{props.renderCanvas(canvasId)}</div>
 
       {menuOpen && anchor && createPortal(
-        <div className="ms-menu-backdrop" onClick={() => setMenuOpen(false)}>
+        <div className="ms-menu-backdrop">
           <div
             className="ms-pb-menu"
             style={{ left: anchor.x, top: anchor.y }}
@@ -857,11 +847,31 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
                     neither produces an absolute path nor maps cleanly to the
                     native macOS chooser; the user reaches the project root
                     exclusively through the host-side NSOpenPanel below. */}
-                <button type="button" role="menuitem" className="ms-pb-menu-item" onClick={() => handlePickNative()}>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="ms-pb-menu-item"
+                  onClick={() => void handlePickNative()}
+                  disabled={pickerRunning}
+                  aria-busy={pickerRunning}
+                >
                   <FolderIcon size={13} />
-                  <span>{t('project.open.local')}</span>
+                  <span>{pickerRunning ? t('project.open.local.busy') : t('project.open.local')}</span>
                 </button>
-                <button type="button" role="menuitem" className="ms-pb-menu-item" onClick={() => setView('recent')} disabled={recentItems.length === 0}>
+                {pickerErr && <div className="ms-pb-menu-err" role="alert">{pickerErr}</div>}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="ms-pb-menu-item"
+                  onClick={() => setView('open')}
+                  onMouseEnter={() => setRecentHover(true)}
+                  onMouseLeave={() => setRecentHover(false)}
+                  onFocus={() => setRecentHover(true)}
+                  onBlur={() => setRecentHover(false)}
+                  disabled={recentItems.length === 0}
+                  aria-haspopup="menu"
+                  aria-expanded={recentHover && recentItems.length > 0}
+                >
                   <ClockIcon size={13} />
                   <span>{t('project.recent')}</span>
                   <span className="ms-pb-sub-arrow">›</span>
@@ -897,14 +907,59 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
                 ) : (
                   <div className="ms-pb-empty">{t('project.open.empty')}</div>
                 )}
+                {/* Recent submenu (proper flyout, not a view swap). Renders a
+                    second panel attached to the right of the home menu when
+                    the user hovers/focuses "最近打开" — it stays anchored
+                    to the parent menu and closes when the user moves away.
+                    Prevents the "new popup" feeling of the previous
+                    view-swap approach, and keeps the home menu visible as a
+                    breadcrumb. Position is computed from the parent menu's
+                    anchor (left edge of the menu + menu width + 8 px gap),
+                    not from a hard-coded x. Clamped to viewport so a menu
+                    pinned near the right edge opens the submenu on the LEFT
+                    of the parent instead of overflowing. */}
+                {recentHover && recentItems.length > 0 && anchor && (() => {
+                  const MENU_W = 276
+                  const GAP = 8
+                  let subLeft = anchor.x + MENU_W + GAP
+                  if (subLeft + MENU_W > window.innerWidth - 6) {
+                    // Open to the left of the parent menu instead.
+                    subLeft = Math.max(6, anchor.x - MENU_W - GAP)
+                  }
+                  return (
+                    <div
+                      className="ms-pb-submenu"
+                      role="menu"
+                      aria-label={t('project.recent.title')}
+                      style={{ left: subLeft, top: anchor.y }}
+                      onMouseEnter={() => setRecentHover(true)}
+                      onMouseLeave={() => setRecentHover(false)}
+                    >
+                      <div className="ms-pb-section-label">{t('project.recent.title')}</div>
+                      <div className="ms-pb-scroll">
+                        {recentItems.map((p) => (
+                          <div key={p.id} className="ms-pb-project-row" role="button" tabIndex={0} onClick={() => void handleOpen(p.id)}>
+                            <span className="ms-pb-row-name">
+                              {p.name}
+                              {p.id === activeId && <span className="ms-pb-active-dot" />}
+                            </span>
+                            <span className="ms-pb-row-actions" onClick={(e) => e.stopPropagation()}>
+                              {p.legacy && <span className="ms-pb-chip">{t('project.legacy')}</span>}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
               </>
             ) : (
               <>
                 <button type="button" className="ms-pb-menu-item ms-pb-back" onClick={() => setView('home')}>
                   <span className="ms-pb-sub-arrow" style={{ transform: 'rotate(180deg)' }}>›</span>
-                  <span>{view === 'recent' ? t('project.recent.title') : t('project.open.title')}</span>
+                  <span>{t('project.open.title')}</span>
                 </button>
-                <ProjectList items={view === 'recent' ? recentItems : allItems} onPick={handleOpen} />
+                <ProjectList items={allItems} onPick={handleOpen} />
               </>
             )}
           </div>
@@ -917,12 +972,15 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
         // dialog itself (including any input/checkbox/radio inside it) must
         // NOT bubble up here, otherwise typing in the rename input or ticking
         // the permanent-delete checkbox would tear the dialog down. Each
-        // dialog body stops propagation at its own root below.
-        <div className="ms-menu-backdrop" onClick={() => !busy && setDialog(null)}>
+        // dialog body stops propagation at its own root below. The
+        // `is-modal` modifier opts back into clickable backdrop + dim
+        // background (see canvas-styles.ts); the default .ms-menu-backdrop
+        // is `pointer-events: none` so it can't swallow top-bar clicks.
+        <div className="ms-menu-backdrop is-modal" onClick={() => setDialog(null)}>
           {dialog.kind === 'delete' ? (
-            <DeleteDialogContent target={dialog} />
+            <DeleteDialogContent target={dialog} onClose={() => setDialog(null)} onDelete={handleDelete} />
           ) : (
-            <NameDialogContent dlg={dialog} />
+            <NameDialogContent dlg={dialog} onClose={() => setDialog(null)} onCreate={handleCreate} onRename={handleRename} />
           )}
         </div>,
         document.body,

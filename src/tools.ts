@@ -2,8 +2,10 @@ import { defineTool, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import { CanvasStore, type CanvasOp, type CanvasSnapshot, type CanvasNode } from './canvas-store'
-import { join } from 'node:path'
-import { getMediaStudioHandles } from './service-state'
+import { join, extname, dirname } from 'node:path'
+import { mkdir, writeFile, stat } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { getMediaStudioHandles, log } from './service-state'
 import { prepareVideoForCanvas } from './video-cover'
 import {
   registerCanvasAsset,
@@ -13,9 +15,51 @@ import {
   deleteAsset,
   copyAssetToProject,
   scanCanvasRefs,
+  ASSET_CATEGORY_DIR,
+  newAssetId,
+  newAssetFileName,
+  assetExtFor,
+  loadAssetIndex,
+  writeAssetIndex,
 } from './asset-store'
 import { ProjectDeleteBlockedError } from './project-store'
 import { runSearch, addSoftRefToCanvas, resolveAsset } from './search'
+
+/**
+ * Canvas workflow rules — appended to every media-studio / canvas_*
+ * tool description so the model sees them on every request. The rules
+ * ride the plugin itself (not the agent preset) so published users get
+ * them automatically without editing their preset. Keep this block
+ * terse: it is multiplied by N tool schemas in every prompt.
+ *
+ * CANVAS WORKFLOW RULES (apply to every media-studio / canvas_* call):
+ * 1. NEW PROJECT → CREATE FIRST. When the user's intent is to start a new
+ *    project, call media_studio_create_project. The plugin broadcasts a
+ *    `project-focused` SSE event that auto-activates the sidebar Media
+ *    Studio tab; do not ask the user to open it.
+ * 2. CANVAS OPS WITHOUT SIDEBAR → AUTO-OPEN. The Media Studio client-side
+ *    listener activates the sidebar tab when the first canvas_* call lands.
+ * 3. CONTENT → NODES. Generated content (prompts, scripts, images, music,
+ *    video) MUST land on a canvas node, not stay only in chat. After
+ *    generate_image / generate_video / generate_music, use canvas_graph_patch
+ *    with batchAddMedia to attach the resultUrl to a node.
+ * 4. NO EMPTY NODES. After canvas_node_add('text' | 'note'), immediately
+ *    follow up with canvas_node_update to fill data.text / data.content. For
+ *    image/video/music nodes, use canvas_refresh_node (fills resultUrl from
+ *    prompt). Empty nodes show as placeholder cards and should be filled
+ *    before moving on.
+ * 5. NO ORPHAN NODES. When adding a non-seed node, include a `connect` op
+ *    in the same canvas_graph_patch batch linking the new node to its
+ *    predecessor (from: prevId, to: newId). Skip only for the first/seed
+ *    node or when the user explicitly asks for an isolated node.
+ */
+const CANVAS_RULES =
+  'CANVAS WORKFLOW RULES (apply to every media-studio / canvas_* call):\n' +
+  '1. NEW PROJECT → CREATE FIRST. When the user\'s intent is to start a new project, call media_studio_create_project. The plugin broadcasts a `project-focused` SSE event that auto-activates the sidebar Media Studio tab; do not ask the user to open it.\n' +
+  '2. CANVAS OPS WITHOUT SIDEBAR → AUTO-OPEN. The Media Studio client-side listener activates the sidebar tab when the first canvas_* call lands.\n' +
+  '3. CONTENT → NODES. Generated content (prompts, scripts, images, music, video) MUST land on a canvas node, not stay only in chat. After generate_image / generate_video / generate_music, use canvas_graph_patch with batchAddMedia to attach the resultUrl to a node.\n' +
+  '4. NO EMPTY NODES. After canvas_node_add(\'text\' | \'note\'), immediately follow up with canvas_node_update to fill data.text / data.content. For image/video/music nodes, use canvas_refresh_node (fills resultUrl from prompt). Empty nodes show as placeholder cards and should be filled before moving on.\n' +
+  '5. NO ORPHAN NODES. When adding a non-seed node, include a `connect` op in the same canvas_graph_patch batch linking the new node to its predecessor (from: prevId, to: newId). Skip only for the first/seed node or when the user explicitly asks for an isolated node.'
 
 /** Map a canvas node type to the asset-library kind for auto-registration.
  *  Canvas `music` nodes hold audio → 'audio' in the library. */
@@ -95,6 +139,224 @@ async function tryAutoRegisterAsset(
   }
 }
 
+/**
+ * Migrate one canvas node whose resultUrl points to a file outside the
+ * media-file proxy's allow-list (e.g. a `file:///tmp/…` path, an absolute
+ * POSIX path under a directory not in `mediaRoots`, or a non-proxy URL the
+ * dsh-llm-multimodal plugin handed back). Copies the file into the project's
+ * asset directory and rewrites resultUrl to the project-relative
+ * `projects/<id>/assets/<kind>/<file>` path the proxy understands.
+ *
+ * Non-fatal: any failure is logged and returned as an advisory string so
+ * the canvas patch itself is never rolled back.
+ *
+ * For video nodes we optionally also register the poster/thumb if one is
+ * present; for audio we just copy the single file.
+ */
+export async function migrateInaccessibleResultUrl(
+  projectId: string,
+  wsRoot: string,
+  roots: string[],
+  canvasStore: CanvasStore,
+  nodeId: string,
+  nodeType: CanvasNode['type'],
+  sourcePath?: string,
+): Promise<string | null> {
+  const snap = canvasStore.snapshot(projectId)
+  const node = snap.graph.nodes.find((n) => n.id === nodeId)
+  if (!node) return null
+  const raw = (node.data as { resultUrl?: unknown }).resultUrl
+  if (typeof raw !== 'string' || !raw) return null
+  const src = raw.trim()
+
+  // Nothing to migrate for URLs the browser can already render directly
+  // (remote https, in-memory data:/blob:) — those go through untouched.
+  if (/^(https?:|data:|blob:|\/api\/)/i.test(src)) return null
+  // Already a project-relative path the proxy resolves correctly.
+  if (src.startsWith('projects/') || src.startsWith('assets/')) return null
+
+  // Convert the stored URL into an absolute local path the migration can
+  // read. file:// gets the prefix stripped; bare absolute POSIX paths pass
+  // through. Everything else (relative paths, etc.) is left alone and the
+  // proxy will fail at render-time — same as before — instead of us
+  // guessing.
+  let localPath: string | null = null
+  if (src.startsWith('file://')) {
+    localPath = src.slice('file://'.length)
+  } else if (src.startsWith('/')) {
+    localPath = src
+  } else if (/^[a-zA-Z]:[\\/]/.test(src)) {
+    // Windows-style absolute path. The proxy and node fs handle this
+    // uniformly when it points at a real file; we just pass through.
+    localPath = src
+  } else {
+    // Relative path / unknown scheme. Skip — the existing UI flow handles
+    // it (the card simply won't render until the agent rewrites it).
+    return null
+  }
+
+  // Probe via the proxy: if the URL already resolves to a file the proxy
+  // can serve, no work needed. This keeps every URL the proxy accepts
+  // untouched (zero-copy, zero-overhead).
+  const { resolveMediaTarget } = await import('./routes')
+  // Use the public accessor — previously this reached into the private
+  // `canvasSourcePaths` map via a type assertion, which broke encapsulation
+  // and would silently fail if the field was renamed.
+  const projectRoots = canvasStore.allSourcePaths()
+  const probe = resolveMediaTarget(localPath, wsRoot, roots, projectRoots)
+  if (probe.ok) return null // already accessible — nothing to do
+
+  // Read the source file.
+  let bytes: Buffer
+  try {
+    bytes = await import('node:fs/promises').then((m) => m.readFile(localPath))
+  } catch (e) {
+    log.warn(`[media-studio] migrateInaccessibleResultUrl: cannot read "${localPath}": ${(e as Error).message}`)
+    return `node "${nodeId}" resultUrl is inaccessible (${localPath}) — file not found or permission denied`
+  }
+  if (!bytes || bytes.length === 0) {
+    return `node "${nodeId}" resultUrl points to empty file (${localPath})`
+  }
+
+  // Determine kind + ext.
+  const kind = assetKindForNodeType(nodeType)
+  if (!kind) return null // text/note — skip
+  const ext = extname(localPath).replace(/^\./, '').toLowerCase() || assetExtFor(localPath, kind)
+  const assetId = newAssetId()
+  const fileName = newAssetFileName(assetId, ext)
+  const catDir = join(sourcePath ? join(sourcePath, 'assets') : join(wsRoot, 'projects', projectId, 'assets'), ASSET_CATEGORY_DIR[kind])
+  await mkdir(catDir, { recursive: true })
+  await writeFile(join(catDir, fileName), bytes)
+
+  // Update index so future searches / syncs pick it up.
+  const assetRoot = sourcePath ? join(sourcePath, 'assets') : join(wsRoot, 'projects', projectId, 'assets')
+  const indexFile = sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(assetRoot, indexFile)
+  const now = new Date().toISOString()
+  const label = (node.label || '').trim().slice(0, 64) || `${kind}-${assetId.slice(2, 6)}`
+  index.assets.push({
+    id: assetId,
+    kind,
+    name: label,
+    file: fileName,
+    bytes: bytes.length,
+    origin: { type: 'canvas', canvasNodeId: nodeId },
+    createdAt: now,
+    updatedAt: now,
+  })
+  await writeAssetIndex(assetRoot, index, indexFile)
+
+  // Rewrite the node URL so the client can render it.
+  const projectRelative = `projects/${projectId}/assets/${ASSET_CATEGORY_DIR[kind]}/${fileName}`
+  const updateOp: CanvasOp = { op: 'updateNode', id: nodeId, data: { resultUrl: projectRelative } }
+  try {
+    canvasStore.apply(projectId, [updateOp])
+    log.debug(`[media-studio] migrated node "${nodeId}" resultUrl → ${projectRelative}`)
+    return null // success
+  } catch (e) {
+    log.warn(`[media-studio] migrateInaccessibleResultUrl: failed to apply update for "${nodeId}": ${(e as Error).message}`)
+    return `node "${nodeId}" migrated to assets but failed to update node: ${(e as Error).message}`
+  }
+}
+
+/**
+ * Pin a remote (http/https) URL into the project's asset directory. Provider
+ * URLs from image/video/music generators frequently expire (OpenAI ~2 h,
+ * many others 1 h or less) — the moment the user comes back to the canvas
+ * the URL is dead and the card shows a broken image. We pull the bytes
+ * synchronously during the canvas_graph_patch call so the stored resultUrl
+ * always points at a file the local proxy can serve indefinitely.
+ *
+ * Only invoked for batchAddMedia (the path agents use to "publish" a
+ * generated asset). For updateNode-driven refreshes, the same machinery
+ * runs through `migrateInaccessibleResultUrl` — but refresh already runs
+ * synchronously on the host, so URL expiration isn't a concern there.
+ *
+ * Returns:
+ *   • `{ ok: true, url }` — the URL was downloaded; the caller should rewrite
+ *     the node's resultUrl to `url`.
+ *   • `{ ok: false }` — the URL was skipped (already a local file path or
+ *     a data: URL). The caller should leave the original url in place.
+ */
+export async function pinRemoteResultUrl(
+  url: string,
+  projectId: string,
+  wsRoot: string,
+  sourcePath: string | undefined,
+  kind: AssetKind,
+): Promise<{ ok: boolean; url?: string; error?: string }> {
+  if (!url) return { ok: false }
+  const trimmed = url.trim()
+  if (!/^https?:\/\//i.test(trimmed)) return { ok: false } // already local / data:
+
+  // Pick an extension from the URL path; fall back to a kind default. The
+  // MIME sniff from the response headers would be more accurate, but the
+  // common cases (provider returns .png / .jpg / .mp4 / .mp3 / .webm) all
+  // carry the right extension in the URL.
+  let ext = ''
+  try {
+    const u = new URL(trimmed)
+    const last = u.pathname.split('/').pop() ?? ''
+    const dot = last.lastIndexOf('.')
+    if (dot >= 0 && dot < last.length - 1) ext = last.slice(dot + 1).toLowerCase()
+  } catch { /* bad URL — fall through */ }
+  if (!ext) ext = assetExtFor(trimmed, kind)
+  if (!ext) return { ok: false, error: `cannot infer extension for ${kind} url` }
+
+  const assetId = newAssetId()
+  const fileName = newAssetFileName(assetId, ext)
+  const assetRoot = sourcePath ? join(sourcePath, 'assets') : join(wsRoot, 'projects', projectId, 'assets')
+  const catDir = join(assetRoot, ASSET_CATEGORY_DIR[kind])
+  const dest = join(catDir, fileName)
+
+  try {
+    // Cap the response body at 50 MB so a misbehaving provider can't fill
+    // the disk. Most generated media is < 10 MB; 50 MB leaves headroom
+    // for short clips / high-res images without becoming a DoS vector.
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 60_000)
+    const res = await fetch(trimmed, { signal: controller.signal })
+    clearTimeout(timeout)
+    if (!res.ok) {
+      return { ok: false, error: `download failed: HTTP ${res.status} for ${trimmed}` }
+    }
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (!buf.length) return { ok: false, error: `downloaded 0 bytes from ${trimmed}` }
+    if (buf.length > 50 * 1024 * 1024) {
+      return { ok: false, error: `download too large (${buf.length} bytes) — refusing to pin` }
+    }
+    await mkdir(catDir, { recursive: true })
+    await writeFile(dest, buf)
+
+    // Register the asset so the library panel + cross-project search
+    // pick it up immediately. We don't carry a label here because the
+    // caller (batchAddMedia flow) controls the node label.
+    try {
+      const index = await loadAssetIndex(assetRoot, sourcePath ? '.index.json' : 'index.json')
+      const now = new Date().toISOString()
+      index.assets.push({
+        id: assetId,
+        kind,
+        name: fileName,
+        file: fileName,
+        bytes: buf.length,
+        origin: { type: 'pinned', sourceUrl: trimmed },
+        createdAt: now,
+        updatedAt: now,
+      })
+      await writeAssetIndex(assetRoot, index, sourcePath ? '.index.json' : 'index.json')
+    } catch (e) {
+      log.warn(`[media-studio] pinRemoteResultUrl: failed to update index (file is still pinned): ${(e as Error).message}`)
+    }
+
+    return { ok: true, url: `projects/${projectId}/assets/${ASSET_CATEGORY_DIR[kind]}/${fileName}` }
+  } catch (e) {
+    const msg = (e as Error).message
+    log.warn(`[media-studio] pinRemoteResultUrl: ${trimmed} → ${msg}`)
+    return { ok: false, error: msg }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // After the multimodal refactor the `dsh-media-studio` plugin no longer owns
@@ -166,6 +428,66 @@ export function buildRefreshContext(
 }
 
 /**
+ * Collect upstream image node resultUrls for I2I (image-to-image) and I2V
+ * (image-to-video) workflows. Returns an array of publicly accessible URLs or
+ * Base64 Data URIs that can be passed directly to the multimodal plugin's
+ * `image` parameter. Local file paths (projects/... or file://...) are read
+ * and converted to Base64 Data URIs because upstream APIs (Agnes etc.)
+ * cannot access localhost or filesystem paths.
+ */
+export function collectUpstreamImageUrls(
+  nodeId: string,
+  graph: CanvasSnapshot['graph'],
+  wsRoot: string,
+): string[] {
+  const upstreamIds = graph.edges
+    .filter((e) => e.target === nodeId)
+    .map((e) => e.source)
+
+  if (upstreamIds.length === 0) return []
+
+  const urls: string[] = []
+  for (const id of upstreamIds) {
+    const up = graph.nodes.find((n) => n.id === id)
+    if (!up) continue
+    // Only image nodes can serve as I2I/I2V reference (video nodes are not
+    // valid `image` inputs for the current multimodal plugin).
+    if (up.type !== 'image') continue
+    const resultUrl = (up.data.resultUrl as string | undefined) ?? ''
+    if (!resultUrl) continue
+
+    if (resultUrl.startsWith('http://') || resultUrl.startsWith('https://')) {
+      urls.push(resultUrl)
+    } else if (resultUrl.startsWith('data:')) {
+      urls.push(resultUrl)
+    } else if (resultUrl.startsWith('file://')) {
+      // Convert local file to Base64
+      const filePath = resultUrl.replace('file://', '')
+      try {
+        const buf = readFileSync(filePath)
+        const ext = extname(filePath).toLowerCase().replace('.', '') || 'png'
+        const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png'
+        urls.push(`data:${mime};base64,${buf.toString('base64')}`)
+      } catch { /* skip unreadable files */ }
+    } else if (resultUrl.startsWith('projects/')) {
+      // Project-relative path: projects/<canvasId>/<relativePath>
+      // Resolve to workspace root and convert to Base64
+      try {
+        const parts = resultUrl.split('/')
+        // parts[0] = 'projects', parts[1] = canvasId, rest = relative path
+        const relativePath = parts.slice(2).join('/')
+        const filePath = join(wsRoot, relativePath)
+        const buf = readFileSync(filePath)
+        const ext = extname(filePath).toLowerCase().replace('.', '') || 'png'
+        const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png'
+        urls.push(`data:${mime};base64,${buf.toString('base64')}`)
+      } catch { /* skip unreadable files */ }
+    }
+  }
+  return urls
+}
+
+/**
  * Map a canvas node type to the multimodal tool name. The dsh-llm-multimodal
  * plugin owns all five generators — `generate_image` etc.
  */
@@ -230,10 +552,26 @@ export async function executeNodeRefresh(
   const node = snap.graph.nodes.find((n) => n.id === nodeId)
   if (!node) return { ok: false, code: 'node-not-found', message: `node "${nodeId}" not found`, kind: 'image' }
 
-  // Guard: must have upstream edges
-  const upstreamEdges = snap.graph.edges.filter((e) => e.target === nodeId)
-  if (upstreamEdges.length === 0) {
-    return { ok: false, code: 'no-upstream', message: `node "${nodeId}" has no upstream connections`, kind: 'image' }
+  // The previous version required an upstream edge here. That was wrong
+  // for the common agent flow: it often creates a media node as the
+  // terminus of a pipeline (or as a one-off after generating content),
+  // stores the prompt in data.prompt, and calls canvas_refresh_node with
+  // zero upstream. The refresh path already falls back to basePrompt when
+  // no upstream context is available — so we let any image/video/music
+  // node refresh, regardless of edges, as long as it carries a usable
+  // prompt (or upstream text it can lift from). Empty nodes still fail
+  // with a clear "nothing to refresh" error so the agent knows to set
+  // data.prompt first.
+  const kind = node.type as 'image' | 'video' | 'music'
+  const basePrompt = ((node.data.prompt as string | undefined) ?? '').trim()
+  const context = buildRefreshContext(nodeId, snap.graph)
+  if (!basePrompt && !context) {
+    return {
+      ok: false,
+      code: 'no-prompt',
+      message: `node "${nodeId}" has no prompt and no upstream text; call canvas_node_update(id, {prompt: '...'}) first`,
+      kind,
+    }
   }
 
   // Set running status optimistically (sync patch so the tab reflects immediately)
@@ -242,37 +580,58 @@ export async function executeNodeRefresh(
     store.apply(canvasId, [runningOp])
   } catch { /* non-fatal — keep going */ }
 
-  const kind = node.type as 'image' | 'video' | 'music'
-  const context = buildRefreshContext(nodeId, snap.graph)
-  const basePrompt = (node.data.prompt as string | undefined) ?? ''
+  // Helper: mark the node as errored and return the failure payload.
+  // Previously the image/video/music failure paths returned directly,
+  // leaving the node stuck in "running" forever because only the catch
+  // block reset status to "error".
+  const fail = (code: string, message: string) => {
+    try {
+      store.apply(canvasId, [{ op: 'updateNode', id: nodeId, data: { status: 'error' as const, errorMsg: message } }])
+    } catch { /* ignore — best-effort status reset */ }
+    return { ok: false, code, message, kind }
+  }
 
   try {
     let resultUrl: string | undefined
     let newPrompt: string
-    /** Video-only: optional poster path produced by prepareVideoForCanvas
-     *  (provider-cover embed success means poster stays null and the
-     *  attached_pic stream paints itself; extract success sets it). */
+    /** Video-only: optional poster path produced by prepareVideoForCanvas */
     let videoPoster: string | null = null
+
+    // Collect upstream image URLs for I2I / I2V workflows.
+    const wsRoot = getMediaStudioHandles().workspaceRoot
+    const upstreamImageUrls = collectUpstreamImageUrls(nodeId, snap.graph, wsRoot)
 
     if (kind === 'image') {
       newPrompt = basePrompt
         ? `${basePrompt}\n\nContext from upstream nodes:\n${context || '(no upstream text content)'}\n\nRegenerate the image keeping the original style and subject.`
-        : `Regenerate image from upstream context:\n${context || '(empty)'}`
-      const r = await callMultimodal(ctx, 'generate_image', {
+        : `Generate an image that illustrates: ${context || '(empty)'}`
+      const imageArgs: Record<string, unknown> = {
         prompt: newPrompt,
         model: (node.data.model as string | undefined) || undefined,
-      }, signal)
-      if (!r.ok || !r.url) return { ok: false, code: r.code || 'image-failed', message: r.message || 'no url', kind }
+      }
+      // Pass upstream images as I2I reference when available.
+      if (upstreamImageUrls.length > 0) {
+        imageArgs.image = upstreamImageUrls
+      }
+      const r = await callMultimodal(ctx, 'generate_image', imageArgs, signal)
+      if (!r.ok || !r.url) return fail(r.code || 'image-failed', r.message || 'no url')
       resultUrl = r.url
     } else if (kind === 'video') {
       newPrompt = basePrompt
         ? `${basePrompt}\n\nContext from upstream nodes:\n${context || '(no upstream text content)'}\n\nRegenerate the video keeping the original style and subject.`
-        : `Regenerate video from upstream context:\n${context || '(empty)'}`
-      const r = await callMultimodal(ctx, 'generate_video', {
+        : `Generate a short video that illustrates: ${context || '(empty)'}`
+      const videoArgs: Record<string, unknown> = {
         prompt: newPrompt,
         model: (node.data.model as string | undefined) || undefined,
-      }, signal)
-      if (!r.ok || !r.url) return { ok: false, code: r.code || 'video-failed', message: r.message || 'no url', kind }
+        duration: (node.data.duration as number | undefined) || 5,
+        size: (node.data.size as string | undefined) || '1280x720',
+      }
+      // Pass upstream images as I2V first-frame reference when available.
+      if (upstreamImageUrls.length > 0) {
+        videoArgs.image = upstreamImageUrls[0]
+      }
+      const r = await callMultimodal(ctx, 'generate_video', videoArgs, signal)
+      if (!r.ok || !r.url) return fail(r.code || 'video-failed', r.message || 'no url')
       // prepareVideoForCanvas may rewrite r.url to a local copy under
       // web-jobs/ AND optionally attach (or extract) a poster. Failures are
       // non-fatal — we always fall back to the provider URL.
@@ -288,15 +647,15 @@ export async function executeNodeRefresh(
       resultUrl = prepared.url
       videoPoster = prepared.poster
     } else if (kind === 'music') {
-      newPrompt = context || '(no upstream text content)'
+      newPrompt = context || basePrompt || '(no upstream text content)'
       const r = await callMultimodal(ctx, 'generate_music', {
         text: newPrompt,
         voice: (node.data.voice as string | undefined) || undefined,
       }, signal)
-      if (!r.ok || !r.url) return { ok: false, code: r.code || 'music-failed', message: r.message || 'no url', kind }
+      if (!r.ok || !r.url) return fail(r.code || 'music-failed', r.message || 'no url')
       resultUrl = r.url
     } else {
-      return { ok: false, code: 'not-supported', message: `refresh not supported for kind "${kind}"`, kind }
+      return fail('not-supported', `refresh not supported for kind "${kind}"`)
     }
 
     const updateOp: CanvasOp = {
@@ -316,7 +675,7 @@ export async function executeNodeRefresh(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     const code = 'unknown'
-    console.error(`[media-studio] executeNodeRefresh: error ${code} ${msg}`)
+    log.error(`[media-studio] executeNodeRefresh: error ${code} ${msg}`)
     const errOp: CanvasOp = {
       op: 'updateNode',
       id: nodeId,
@@ -347,7 +706,8 @@ export function registerCanvasViewTool(ctx: Context): void {
   ctx.tools.register(
     defineTool({
       name: 'canvas_graph_view',
-      description: 'Read the current canvas graph (nodes + edges) for a canvas. Returns JSON; pass canvasId to disambiguate when the user has multiple canvases open (blank → the active project\'s canvas, else the plugin default).',
+      description: 'Read the current canvas graph (nodes + edges + regions) for a canvas. Returns JSON; pass canvasId to disambiguate when the user has multiple canvases open (blank → the active project\'s canvas, else the plugin default).\n\n' +
+        CANVAS_RULES,
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
       },
@@ -369,6 +729,81 @@ export function registerCanvasViewTool(ctx: Context): void {
 }
 
 /**
+ * Shared post-processing for every canvas patch — agent tool AND REST API
+ * both call this so behaviour is identical regardless of entry point.
+ *
+ * Steps (all best-effort; failures surface as `warn:` strings):
+ *   1. Pin remote https resultUrls (batchAddMedia items) into the project
+ *      assets directory so provider links don't expire into broken cards.
+ *   2. Migrate any remaining inaccessible urls (file:///tmp, absolute paths
+ *      outside the media-file proxy allow-list).
+ *   3. Auto-register media nodes into the project asset library.
+ *
+ * Returns the combined issues array (lint issues + post-process advisories).
+ */
+export async function postProcessCanvasPatch(
+  store: CanvasStore,
+  canvasId: string,
+  ops: CanvasOp[],
+  baseIssues: string[],
+): Promise<string[]> {
+  const issues = [...baseIssues]
+  const mst = getMediaStudioHandles()
+  const projectStore = mst.projectStore
+  const projectId = projectStore?.activeCanvasId?.() ?? null
+  if (!projectId) return issues
+
+  const sourcePath = (() => {
+    if (!projectStore) return undefined
+    const snap = projectStore.snapshot?.()
+    if (!snap) return undefined
+    const meta = snap.projects.find((p) => p.id === projectId)
+    return meta?.sourcePath
+  })()
+
+  // 1. Pin remote https URLs from batchAddMedia items
+  for (const op of ops) {
+    if (op.op !== 'batchAddMedia') continue
+    for (const item of op.items) {
+      if (typeof item.url !== 'string' || !/^https?:\/\//i.test(item.url)) continue
+      const kind: AssetKind | null = item.kind === 'audio' ? 'audio' : item.kind === 'image' ? 'character' : item.kind === 'video' ? 'clip' : null
+      if (!kind) continue
+      const pinned = await pinRemoteResultUrl(item.url, projectId, mst.workspaceRoot, sourcePath, kind)
+      if (pinned.ok && pinned.url) {
+        const nid = item.nodeId
+        if (nid) {
+          try {
+            store.apply(canvasId, [{ op: 'updateNode', id: nid, data: { resultUrl: pinned.url } }])
+          } catch (e) {
+            issues.push(`warn: pinned node "${nid}" to local but rewrite failed: ${(e as Error).message}`)
+          }
+        } else {
+          issues.push(`warn: pinned media url but batchAddMedia item has no nodeId; the node still references the original URL`)
+        }
+      } else if (pinned.error) {
+        issues.push(`warn: could not pin remote url "${item.url.slice(0, 80)}": ${pinned.error} (the canvas still references the original URL; re-run canvas_graph_patch once the provider recovers)`)
+      }
+    }
+  }
+
+  // 2. Migrate inaccessible resultUrls + 3. auto-register assets
+  const postSnap = store.snapshot(canvasId)
+  const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
+  for (const { nodeId, nodeType } of mediaNodes) {
+    const adv = await migrateInaccessibleResultUrl(
+      projectId, mst.workspaceRoot, mst.mediaRoots ?? [], store, nodeId, nodeType, sourcePath,
+    )
+    if (adv) issues.push(adv)
+  }
+  for (const { nodeId, nodeType } of mediaNodes) {
+    const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
+    if (adv) issues.push(adv)
+  }
+
+  return issues
+}
+
+/**
  * `canvas_graph_patch` — batched, atomic canvas mutation. This is the
  * primary tool the agent uses to "operate the canvas" from conversation.
  */
@@ -377,12 +812,14 @@ export function registerCanvasPatchTool(ctx: Context): void {
     defineTool({
       name: 'canvas_graph_patch',
       description:
-        'Batch-apply canvas graph ops atomically. Ops: addNode (type: text|image|video|music|note, label, data?, position?, nodeId? — position optional: auto-placed in a free grid slot when omitted; nodeId lets a later op in the same batch reference this node); updateNode (id, data); renameNode (id, label); deleteNode (id); moveNode (id, position); connect (from, to, branch?); deleteEdge (id); batchAddMedia (items: [{kind, url, prompt?, model?, position?, nodeId?}]). On reject, the whole batch fails — fix the lint hint and retry.\n\n' +
+        'Prefer the single-node / single-region tools (`canvas_node_view` / `canvas_node_add` / `canvas_node_update` / `canvas_node_rename` / `canvas_node_delete` / `canvas_region_add` / `canvas_region_update` / `canvas_region_delete` / `canvas_region_fit`) when you only need to touch one object — they have strict schemas so the LLM is less likely to typo them, and return smaller payloads. Use this tool only when batching 2+ ops that must be atomic together (e.g. "create node + connect + rename" in one shot). Ops: addNode (type: text|image|video|music|note, label, data?, position?, regionId?, nodeId? — position optional: auto-placed in a free grid slot when omitted, or inside the given region\'s grid when regionId is set; nodeId lets a later op in the same batch reference this node); updateNode (id, data); renameNode (id, label); deleteNode (id); moveNode (id, position); connect (from, to, branch?, label? — label gives the edge a human-readable meaning, e.g. "角色清单来源"); deleteEdge (id); addRegion (label, kind?, id?, x?, y?, w?, h? — a named container box; position/size optional: auto-stacks below existing regions with defaults 640×400); updateRegion (id, label?, kind?, x?, y?, w?, h?); deleteRegion (id — removes only the box, nodes stay); fitRegion (id — snap the box tightly around its member nodes; regions also auto-grow as nodes are added with regionId); batchAddMedia (items: [{kind, url, prompt?, model?, position?, regionId?, nodeId?}]). On reject, the whole batch fails — fix the lint hint and retry.\n\n' +
         'Data contract (non-blocking, but you should follow it):\n' +
         '  • text nodes MUST carry data.text (non-empty string)\n' +
         '  • note nodes MUST carry data.content (non-empty string)\n' +
         '  • image/video/music nodes are filled by a later refresh_node call (resultUrl arrives then)\n' +
-        'If you omit data.text or data.content, the node still gets created — but the lint pass will emit a warning, and the rendered card will show an "empty" placeholder to the user. After creating any text/note node you MUST follow up with updateNode(id, {text|content: ...}) or include data.text / data.content inline in the same addNode op. Never rely on the empty placeholder.',
+        '  • region membership: nodes created with regionId carry data.region automatically; put data.region in updateNode to move a node into a region\n' +
+        'If you omit data.text or data.content, the node still gets created — but the lint pass will emit a warning, and the rendered card will show an "empty" placeholder to the user. After creating any text/note node you MUST follow up with updateNode(id, {text|content: ...}) or include data.text / data.content inline in the same addNode op. Never rely on the empty placeholder.\n\n' +
+        CANVAS_RULES,
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
         ops: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true },
@@ -410,29 +847,11 @@ export function registerCanvasPatchTool(ctx: Context): void {
         if (ops.length > 60) throw new Error(`canvas_graph_patch: batch too large (${ops.length} ops, max 60)`)
         const result = store.apply(canvasId, ops)
 
-        // Auto-register any newly-patched media nodes (image/video/music with
-        // a resultUrl) into the project asset library. Best-effort: failures
-        // surface as `warn:` lines appended to the same `issues` array the
-        // lint pass uses, so the agent gets one unified diagnostics list and
-        // sees exactly what didn't make it into the library.
-        const issues = [...result.issues]
-        const projectStore = mst.projectStore
-        const projectId = projectStore?.activeCanvasId?.() ?? null
-        const sourcePath = (() => {
-          if (!projectId || !projectStore) return undefined
-          const snap = projectStore.snapshot?.()
-          if (!snap) return undefined
-          const meta = snap.projects.find((p) => p.id === projectId)
-          return meta?.sourcePath
-        })()
-        if (projectId) {
-          const postSnap = store.snapshot(canvasId)
-          const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
-          for (const { nodeId, nodeType } of mediaNodes) {
-            const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
-            if (adv) issues.push(adv)
-          }
-        }
+        // Shared post-processing (pin remote URLs → migrate inaccessible →
+        // auto-register assets). Extracted so the REST API endpoint follows
+        // the exact same code path — previously REST patches skipped these
+        // steps, leaving provider URLs to expire into broken cards.
+        const issues = await postProcessCanvasPatch(store, canvasId, ops, result.issues)
 
         return {
           applied: result.patch.length,
@@ -446,15 +865,20 @@ export function registerCanvasPatchTool(ctx: Context): void {
 }
 
 /**
- * `canvas_auto_arrange` — re-layout all nodes by topological depth.
+ * `canvas_auto_arrange` — re-layout nodes by topological depth. All nodes by
+ * default; pass `regionId` to re-arrange ONLY the nodes inside that region
+ * (constrained within the region bounds), so per-region tidy-ups never
+ * break a partitioned canvas.
  */
 export function registerAutoArrangeTool(ctx: Context): void {
   ctx.tools.register(
     defineTool({
       name: 'canvas_auto_arrange',
-      description: 'Auto-arrange all nodes in a canvas by topological flow depth (columns ordered by BFS from sources, nodes stacked vertically within each column). Mirrors the client\'s bottom-right wand button. Call this after building a workflow for an immediately clean layout.',
+      description: 'Auto-arrange nodes by topological flow depth (columns ordered by BFS from sources, nodes stacked vertically within each column). Mirrors the client\'s bottom-right wand button. Pass regionId to arrange only the nodes inside that region (kept within the region box) — use this for per-region tidy-ups so a partitioned layout stays intact.\n\n' +
+        CANVAS_RULES,
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        regionId: { type: 'string', description: 'Optional region id — when set, only nodes whose data.region matches are re-arranged, constrained inside the region bounds.' },
       },
       output: {
         schema: { type: 'json' },
@@ -466,7 +890,8 @@ export function registerAutoArrangeTool(ctx: Context): void {
       async execute(args) {
         const store = getMediaStudioHandles().canvasStore
         const canvasId = args.canvasId?.trim() || resolveCanvasId()
-        const result = store.autoArrange(canvasId)
+        const regionId = typeof args.regionId === 'string' && args.regionId.trim() ? args.regionId.trim() : undefined
+        const result = store.autoArrange(canvasId, regionId ? { regionId } : undefined)
         return {
           applied: result.patch.length,
           version: result.version,
@@ -505,7 +930,8 @@ export function registerCanvasRefreshNodeTool(ctx: Context): void {
     defineTool({
       name: 'canvas_refresh_node',
       description:
-        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_music). For image/video nodes, gathers upstream prompts and regenerates; for music nodes, regathers upstream text and re-runs TTS. Sets status to "running" during generation and updates resultUrl on completion.',
+        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_music). For image/video nodes, gathers upstream prompts and regenerates; for music nodes, regathers upstream text and re-runs TTS. Sets status to "running" during generation and updates resultUrl on completion.\n\n' +
+        CANVAS_RULES,
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
         nodeId: { type: 'string', description: 'The node id to refresh. Must exist on the canvas.' },
@@ -517,6 +943,343 @@ export function registerCanvasRefreshNodeTool(ctx: Context): void {
         const nodeId = String(args.nodeId).trim()
         if (!nodeId) return { ok: false, code: 'missing-node-id', message: 'nodeId is required', kind: 'image' }
         return executeNodeRefresh(mst.canvasStore, canvasId, nodeId, exec.signal, ctx)
+      },
+    }),
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single-node CRUD tools (M5) — the agent's preferred entry for one-off
+// mutations. Each tool wraps a single op through `store.apply()` so it
+// reuses the same atomicity / SSE / persist / lint path as
+// `canvas_graph_patch`. Reserve `canvas_graph_patch` for multi-op batches.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `canvas_node_view` — read one node by id. The cheapest way to verify a
+ * node exists or fetch its current data after an SSE event (no mutation
+ * path, no store.apply call).
+ */
+export function registerCanvasNodeViewTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_node_view',
+      description:
+        'Read one canvas node by id without any mutation. Use this to verify a node exists, or to fetch its current data after an SSE event (cheaper than reading the whole snapshot). Returns the full node + current version.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The node id to look up. Required.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; node?: { id: string; label: string; type: string }; version: number }).ok
+            ? `node "${(value as { node: { id: string; label: string } }).node.id}" [(value as { node: { type: string } }).node.type] "${(value as { node: { label: string } }).node.label}" — version ${(value as { version: number }).version}`
+            : `not found: ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const nodeId = String(args.id).trim()
+        if (!nodeId) return { ok: false, code: 'missing-node-id', message: 'id is required' }
+        const snap = store.snapshot(canvasId)
+        const node = snap.graph.nodes.find((n) => n.id === nodeId)
+        if (!node) return { ok: false, code: 'node-not-found', message: `node "${nodeId}" not found on canvas "${canvasId}"` }
+        return { ok: true, node: node as unknown as JsonValue, version: snap.version } as unknown as JsonValue
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_node_add` — create a single node. The store auto-generates an id
+ * when `nodeId` is omitted, or returns `{ ok:false, code:'duplicate-node-id' }`
+ * when the provided id already exists. Position defaults to the store's
+ * `defaultSlot` auto-placement grid.
+ */
+export function registerCanvasNodeAddTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_node_add',
+      description:
+        'Add a single canvas node. The store auto-places it (defaultSlot grid) when `position` is omitted, and auto-generates a unique id when `nodeId` is omitted — the generated id is returned in the response so you can reference it in follow-ups.\n\n' +
+        'When `nodeId` IS provided and already exists, returns `{ ok: false, code: "duplicate-node-id" }` instead of silently upgrading. To mutate an existing node use `canvas_node_update` / `canvas_node_rename`.\n\n' +
+        'Does NOT auto-register as an asset — that\'s only for media nodes with a `resultUrl`, and the existing `canvas_graph_patch` tool handles that via `batchAddMedia`. Use this for placeholders and incremental builds; if you need auto-registration call `media_studio_register_asset` separately.',
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        type: {
+          type: 'string' as const,
+          enum: ['text', 'image', 'video', 'music', 'note'] as const,
+          description: 'Node type. Must be one of: text, image, video, music, note.',
+        },
+        label: { type: 'string', description: 'User-facing label. Required, non-empty.' },
+        data: {
+          type: 'object' as const,
+          additionalProperties: true as const,
+          description: 'Free-form data attached to the node. Defaults to {}.',
+        },
+        position: {
+          type: 'object' as const,
+          additionalProperties: false as const,
+          description: 'Optional explicit position {x, y} in px. When omitted the store auto-places the node.',
+          properties: {
+            x: { type: 'number' as const },
+            y: { type: 'number' as const },
+          },
+        },
+        nodeId: { type: 'string', description: 'Optional explicit id. When omitted the store generates one. If provided and already exists, returns code:"duplicate-node-id".' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; node?: { id: string; label: string } }).ok
+            ? `added node "${(value as { node: { id: string; label: string } }).node.id}" [(value as { node: { label: string } }).node.label] → version ${(value as { version: number }).version}`
+            : `add failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const type = args.type as CanvasNode['type'] | undefined
+        const label = typeof args.label === 'string' ? args.label.trim() : ''
+        const data = (typeof args.data === 'object' && args.data !== null && !Array.isArray(args.data)) ? (args.data as Record<string, unknown>) : {}
+        const position = (typeof args.position === 'object' && args.position !== null && !Array.isArray(args.position))
+          ? (args.position as { x: number; y: number })
+          : undefined
+        const nodeId = (typeof args.nodeId === 'string' && args.nodeId.trim()) ? args.nodeId.trim() : undefined
+        if (!type) return { ok: false, code: 'missing-type', message: 'type is required (text|image|video|music|note)' } as unknown as JsonValue
+        if (!label) return { ok: false, code: 'missing-label', message: 'label is required (non-empty string)' } as unknown as JsonValue
+        try {
+          // Default the status to 'idle' for media nodes so the card renders
+          // a clean "no image yet" placeholder instead of looking like a
+          // permanent error when the agent hasn't attached a resultUrl yet
+          // (the very common "create → fill later via canvas_refresh_node"
+          // flow). Without this, nodes without data.status render with
+          // `status-${undefined}` which doesn't match any rule and gets
+          // stuck on an empty shell — the "media node added but won't load"
+          // report.
+          const initialData: Record<string, unknown> = { ...data }
+          if ((type === 'image' || type === 'video' || type === 'music') && !initialData.status) {
+            initialData.status = 'idle'
+          }
+          // If the caller passed an https:// resultUrl directly in data,
+          // pin it into the project assets before storing — same defensive
+          // copy the batchAddMedia path does, so agents who skip the
+          // batchAddMedia helper don't end up with a URL that expires
+          // under the user's feet.
+          const rawUrl = initialData.resultUrl
+          if (typeof rawUrl === 'string' && /^https?:\/\//i.test(rawUrl.trim()) && (type === 'image' || type === 'video' || type === 'music')) {
+            const projectId = mst.projectStore?.activeCanvasId?.() ?? null
+            const sourcePath = (() => {
+              if (!projectId || !mst.projectStore) return undefined
+              const snap = mst.projectStore.snapshot?.()
+              if (!snap) return undefined
+              return snap.projects.find((p) => p.id === projectId)?.sourcePath
+            })()
+            const kind: AssetKind | null = type === 'image' ? 'character' : type === 'video' ? 'clip' : 'audio'
+            if (projectId && kind) {
+              const pinned = await pinRemoteResultUrl(rawUrl, projectId, mst.workspaceRoot, sourcePath, kind)
+              if (pinned.ok && pinned.url) {
+                initialData.resultUrl = pinned.url
+              }
+            }
+          }
+          const result = store.apply(canvasId, [{
+            op: 'addNode',
+            type,
+            label,
+            data: Object.keys(initialData).length > 0 ? initialData : undefined,
+            ...(position ? { position } : {}),
+            ...(nodeId ? { nodeId } : {}),
+          }])
+          const node = result.graph.nodes[result.graph.nodes.length - 1]
+          return { ok: true, node: node as unknown as JsonValue, version: result.version, lintOk: result.lintOk, issues: result.issues } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('duplicate node id')) return { ok: false, code: 'duplicate-node-id', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_node_update` — shallow-merge `data` into one node. To REMOVE a key,
+ * use `canvas_graph_patch` with the key set to `undefined` (this tool merges,
+ * never deletes).
+ */
+export function registerCanvasNodeUpdateTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_node_update',
+      description:
+        'Shallow-merge `data` into the node\'s existing `data` map (same semantics as the `updateNode` op in `canvas_graph_patch`). Keys not present in `data` are preserved.\n\n' +
+        'To remove a key from data, use `canvas_graph_patch` with the key set to `undefined` (or delete-and-recreate the node with `canvas_node_delete` + `canvas_node_add`).\n\n' +
+        'Returns the full merged node so you can verify the result without a follow-up view call.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The node id to update. Required.' },
+        data: {
+          type: 'object' as const,
+          additionalProperties: true as const,
+          description: 'Data to shallow-merge into the node. Required.',
+        },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; node?: { id: string } }).ok
+            ? `updated node "${(value as { node: { id: string } }).node.id}" → version ${(value as { version: number }).version}`
+            : `update failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const nodeId = String(args.id).trim()
+        const data = (typeof args.data === 'object' && args.data !== null && !Array.isArray(args.data)) ? (args.data as Record<string, unknown>) : undefined
+        if (!nodeId) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        if (!data) return { ok: false, code: 'missing-data', message: 'data is required (object to merge)' } as unknown as JsonValue
+        try {
+          // If the update is setting an https resultUrl on an image/video/music
+          // node, pin it locally first — same defensive copy the add / patch
+          // paths do — so an LLM that writes the URL via canvas_node_update
+          // instead of canvas_graph_patch doesn't bypass expiration handling.
+          const extraIssues: string[] = []
+          const node = store.snapshot(canvasId).graph.nodes.find((n) => n.id === nodeId)
+          const rawUrl = data.resultUrl
+          if (node && (node.type === 'image' || node.type === 'video' || node.type === 'music') && typeof rawUrl === 'string' && /^https?:\/\//i.test(rawUrl.trim())) {
+            const projectId = mst.projectStore?.activeCanvasId?.() ?? null
+            const sourcePath = (() => {
+              if (!projectId || !mst.projectStore) return undefined
+              const snap = mst.projectStore.snapshot?.()
+              if (!snap) return undefined
+              return snap.projects.find((p) => p.id === projectId)?.sourcePath
+            })()
+            const kind: AssetKind | null = node.type === 'image' ? 'character' : node.type === 'video' ? 'clip' : 'audio'
+            if (projectId && kind) {
+              const pinned = await pinRemoteResultUrl(rawUrl, projectId, mst.workspaceRoot, sourcePath, kind)
+              if (pinned.ok && pinned.url) {
+                data.resultUrl = pinned.url
+              } else if (pinned.error) {
+                extraIssues.push(`warn: could not pin remote url "${rawUrl.slice(0, 80)}": ${pinned.error}`)
+              }
+            }
+          }
+          const result = store.apply(canvasId, [{ op: 'updateNode', id: nodeId, data }])
+          const merged = result.graph.nodes.find((n) => n.id === nodeId)
+          const issues = [...result.issues, ...extraIssues]
+          return { ok: true, node: merged as unknown as JsonValue, version: result.version, lintOk: result.lintOk, issues } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'node-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_node_rename` — change only the label field of one node.
+ */
+export function registerCanvasNodeRenameTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_node_rename',
+      description:
+        'Change the label of one node. Only the `label` field is touched; `data` and all other fields are preserved.\n\n' +
+        'Returns the full updated node so you can verify the new label without a follow-up view call.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The node id to rename. Required.' },
+        label: { type: 'string', description: 'New label. Required, non-empty.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; node?: { id: string; label: string } }).ok
+            ? `renamed node "${(value as { node: { id: string; label: string } }).node.id}" → "${(value as { node: { label: string } }).node.label}" — version ${(value as { version: number }).version}`
+            : `rename failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const nodeId = String(args.id).trim()
+        const label = typeof args.label === 'string' ? args.label.trim() : ''
+        if (!nodeId) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        if (!label) return { ok: false, code: 'missing-label', message: 'label is required (non-empty string)' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{ op: 'renameNode', id: nodeId, label }])
+          const node = result.graph.nodes.find((n) => n.id === nodeId)
+          return { ok: true, node: node as unknown as JsonValue, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'node-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_node_delete` — delete one node. All edges connected to this node
+ * (where it's source OR target) are automatically removed as part of the
+ * deletion (inherited from `store.apply`). To keep edges and orphan the node,
+ * the agent must not call this tool — use `canvas_graph_patch` with
+ * `deleteEdge` ops first, then delete the node.
+ */
+export function registerCanvasNodeDeleteTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_node_delete',
+      description:
+        'Delete one node from the canvas. All edges connected to this node (where it\'s source OR target) are automatically removed as part of the deletion — this is the existing store behavior inherited via `store.apply()`.\n\n' +
+        'To keep edges and orphan the node, the agent must not call this tool: instead use `canvas_graph_patch` with `deleteEdge` ops first, then optionally delete the node.\n\n' +
+        'Returns the deleted node id + new version so the agent can chain follow-ups.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The node id to delete. Required.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; deletedId?: string }).ok
+            ? `deleted node "${(value as { deletedId: string }).deletedId}" → version ${(value as { version: number }).version}`
+            : `delete failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const nodeId = String(args.id).trim()
+        if (!nodeId) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{ op: 'deleteNode', id: nodeId }])
+          return { ok: true, deletedId: nodeId, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'node-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
       },
     }),
   )
@@ -541,6 +1304,226 @@ function requireProjectStore(): NonNullable<ReturnType<typeof getMediaStudioHand
   const ps = getMediaStudioHandles().projectStore
   if (!ps) throw new Error('media_studio: projectStore is not initialized (plugin not ready?)')
   return ps
+}
+
+/**
+ * `canvas_region_add` — create one region (a named container box). Regions
+ * give a partitioned canvas: group related nodes inside a box and label it
+ * so the user can read which block is the flow, which are the character
+ * assets, the scene assets, the storyboard, etc. Regions carry no content
+ * themselves; node membership is declared via `data.region` (auto-set when
+ * the node is created with a regionId).
+ */
+export function registerCanvasRegionAddTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_region_add',
+      description:
+        'Add one region (a named container box) to the canvas. Regions partition the canvas into labeled areas — use them to group nodes into clear blocks (flow overview, script, character assets, scene assets, storyboard, media/audio). The region auto-stacks below existing regions when x/y are omitted, with default size 640×400 (w/h optional).\n\n' +
+        'Membership: after adding the region, create nodes with the same `regionId` (addNode/batchAddMedia regionId) or set data.region via canvas_node_update — region-aware auto-arrange and the grid placement then treat them as inside this box.\n\n' +
+        'Deleting a region never deletes nodes — it only removes the box.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        label: { type: 'string', description: 'Region title rendered in the box header. Required, non-empty.' },
+        kind: { type: 'string', description: 'Optional classification used for tinting: e.g. flow | script | characters | scenes | storyboard | media | generic.' },
+        id: { type: 'string', description: 'Optional explicit region id. When omitted the store generates one (returned in the response).' },
+        x: { type: 'number', description: 'Optional left coordinate (px). Omitted → auto-stack below the lowest existing region.' },
+        y: { type: 'number', description: 'Optional top coordinate (px). Omitted → auto-stack below the lowest existing region.' },
+        w: { type: 'number', description: 'Optional width (px). Default 640.' },
+        h: { type: 'number', description: 'Optional height (px). Default 400.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; region?: { id: string; label: string } }).ok
+            ? `added region "${(value as { region: { id: string; label: string } }).region.id}" (${(value as { region: { label: string } }).region.label}) → version ${(value as { version: number }).version}`
+            : `add region failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const label = typeof args.label === 'string' ? args.label.trim() : ''
+        const kind = typeof args.kind === 'string' && args.kind.trim() ? args.kind.trim() : undefined
+        const id = typeof args.id === 'string' && args.id.trim() ? args.id.trim() : undefined
+        const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+        if (!label) return { ok: false, code: 'missing-label', message: 'label is required (non-empty string)' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{
+            op: 'addRegion',
+            label,
+            ...(kind ? { kind } : {}),
+            ...(id ? { id } : {}),
+            ...(num(args.x) !== undefined ? { x: num(args.x) } : {}),
+            ...(num(args.y) !== undefined ? { y: num(args.y) } : {}),
+            ...(num(args.w) !== undefined ? { w: num(args.w) } : {}),
+            ...(num(args.h) !== undefined ? { h: num(args.h) } : {}),
+          }])
+          const region = result.graph.regions[result.graph.regions.length - 1]
+          return { ok: true, region: region as unknown as JsonValue, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('duplicate region id')) return { ok: false, code: 'duplicate-region-id', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_region_update` — change a region's label / kind / bounds.
+ */
+export function registerCanvasRegionUpdateTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_region_update',
+      description:
+        'Update one region: change its label, kind, or x/y/w/h bounds. Only provided fields change (shallow update). Nodes inside keep their positions even when the box moves — move the box first, then re-arrange with canvas_auto_arrange(regionId) if you want them to follow.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The region id to update. Required.' },
+        label: { type: 'string', description: 'New region title.' },
+        kind: { type: 'string', description: 'New classification (flow | script | characters | scenes | storyboard | media | generic …).' },
+        x: { type: 'number', description: 'New left coordinate (px).' },
+        y: { type: 'number', description: 'New top coordinate (px).' },
+        w: { type: 'number', description: 'New width (px).' },
+        h: { type: 'number', description: 'New height (px).' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; region?: { id: string; label: string } }).ok
+            ? `updated region "${(value as { region: { id: string; label: string } }).region.id}" → version ${(value as { version: number }).version}`
+            : `update region failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const id = String(args.id).trim()
+        const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+        if (!id) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{
+            op: 'updateRegion',
+            id,
+            ...(typeof args.label === 'string' ? { label: args.label } : {}),
+            ...(typeof args.kind === 'string' ? { kind: args.kind } : {}),
+            ...(num(args.x) !== undefined ? { x: num(args.x) } : {}),
+            ...(num(args.y) !== undefined ? { y: num(args.y) } : {}),
+            ...(num(args.w) !== undefined ? { w: num(args.w) } : {}),
+            ...(num(args.h) !== undefined ? { h: num(args.h) } : {}),
+          }])
+          const region = result.graph.regions.find((r) => r.id === id)
+          return { ok: true, region: region as unknown as JsonValue, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'region-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_region_delete` — remove a region box. Nodes keep their positions
+ * and edges; only the container is removed.
+ */
+export function registerCanvasRegionDeleteTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_region_delete',
+      description:
+        'Delete one region (the container box) from the canvas. Nodes and edges inside are untouched — only the box and its label disappear. Deleting a region does NOT cascade to nodes.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The region id to delete. Required.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; deletedId?: string }).ok
+            ? `deleted region "${(value as { deletedId: string }).deletedId}" → version ${(value as { version: number }).version}`
+            : `delete region failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const id = String(args.id).trim()
+        if (!id) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{ op: 'deleteRegion', id }])
+          return { ok: true, deletedId: id, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'region-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
+}
+
+/**
+ * `canvas_region_fit` — snap a region box to the tight bounding box of its
+ * member nodes (small padding + header). Regions already grow automatically
+ * as nodes are added with `regionId`; this is for tidying up after nodes
+ * were dragged in/out manually.
+ */
+export function registerCanvasRegionFitTool(ctx: Context): void {
+  ctx.tools.register(
+    defineTool({
+      name: 'canvas_region_fit',
+      description:
+        'Fit one region\'s box tightly around its member nodes (small padding, header band on top). ' +
+        'Regions auto-grow as nodes are added with regionId, so this is only needed after manual node ' +
+        'drags leave members outside the box. Empty regions are left untouched.\n\n' +
+        CANVAS_RULES,
+      parameters: {
+        canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
+        id: { type: 'string', description: 'The region id to fit. Required.' },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args: unknown, value: unknown) => [{
+          type: 'text' as const,
+          text: (value as { ok: boolean; region?: { id: string; x: number; y: number; w: number; h: number } }).ok
+            ? `fitted region "${(value as { region: { id: string; x: number; y: number; w: number; h: number } }).region.id}" → ` +
+              `${(value as { region: { x: number; y: number; w: number; h: number } }).region.w}×${(value as { region: { h: number } }).region.h} ` +
+              `at (${(value as { region: { x: number; y: number } }).region.x},${(value as { region: { y: number } }).region.y}) → version ${(value as { version: number }).version}`
+            : `fit region failed: ${(value as { code: string; message: string }).code} — ${(value as { message: string }).message}`,
+        }],
+      },
+      async execute(args) {
+        const mst = getMediaStudioHandles()
+        const store = mst.canvasStore
+        const canvasId = args.canvasId?.trim() || resolveCanvasId()
+        const id = String(args.id).trim()
+        if (!id) return { ok: false, code: 'missing-id', message: 'id is required' } as unknown as JsonValue
+        try {
+          const result = store.apply(canvasId, [{ op: 'fitRegion', id }])
+          const region = result.graph.regions.find((r) => r.id === id)
+          return { ok: true, region, version: result.version } as unknown as JsonValue
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('not found')) return { ok: false, code: 'region-not-found', message: msg } as unknown as JsonValue
+          return { ok: false, code: 'apply-failed', message: msg } as unknown as JsonValue
+        }
+      },
+    }),
+  )
 }
 
 export function registerMediaStudioListProjectsTool(ctx: Context): void {
@@ -580,7 +1563,11 @@ export function registerMediaStudioCreateProjectTool(ctx: Context): void {
         'workspace layout and is fully owned by media-studio. With `sourcePath` (an absolute host ' +
         'directory the agent or user chose) the project\'s canvas + assets are placed INSIDE that ' +
         'user-owned directory; media-studio only owns the registry entry. The new project is also ' +
-        'activated and pushed to the front of `recent`.',
+        'activated and pushed to the front of `recent`.\n\n' +
+        'AUTO-FOCUS: after this tool returns, the plugin broadcasts a `project-focused` SSE event ' +
+        'that the Media Studio client-side listener picks up to activate the sidebar Media Studio ' +
+        'tab. No further GUI action is required.\n\n' +
+        CANVAS_RULES,
       parameters: {
         name: { type: 'string', description: 'Display name (optional; auto-default "未命名项目 N" when blank). Max 64 chars; no \\ / : * ? " < > |.' },
         sourcePath: { type: 'string', description: 'Optional absolute host directory the project\'s data lives under. Pass the path returned by media_studio_pick_folder, or omit for a managed workspace project.' },
@@ -665,7 +1652,10 @@ export function registerMediaStudioOpenProjectTool(ctx: Context): void {
       description:
         'Activate an existing project (bumping it to the front of `recent` and restoring its canvas ' +
         'from disk). Subsequent canvas_graph_* tool calls without an explicit canvasId will land on ' +
-        'this project\'s canvas. Returns the refreshed registry so the agent can verify activeId.',
+        'this project\'s canvas. Returns the refreshed registry so the agent can verify activeId.\n\n' +
+        'AUTO-FOCUS: same as media_studio_create_project — broadcasts a `project-focused` SSE event ' +
+        'that activates the sidebar Media Studio tab. No further GUI action is required.\n\n' +
+        CANVAS_RULES,
       parameters: {
         projectId: { type: 'string', description: 'Project id (p-… format).', required: true },
       },

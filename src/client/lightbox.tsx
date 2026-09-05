@@ -24,6 +24,8 @@ interface Props {
   onClose: () => void
   onPrev?: () => void
   onNext?: () => void
+  /** Project id for resolving bare `assets/...` relative paths. */
+  projectId?: string
 }
 
 async function downloadUrl(url: string, suggestedName: string) {
@@ -66,13 +68,13 @@ function MetaRow({ meta }: { meta?: LightboxMeta }) {
   )
 }
 
-function download(raw: string, suggestedName: string) {
+function download(raw: string, suggestedName: string, projectId?: string) {
   // mediaSrc() maps stored local paths onto the host proxy — download from
   // the rendered form so fetch() can reach it.
-  void downloadUrl(mediaSrc(raw), suggestedName)
+  void downloadUrl(mediaSrc(raw, projectId), suggestedName)
 }
 
-export default function Lightbox({ src, kind, meta, filename = 'media', onClose, onPrev, onNext }: Props) {
+export default function Lightbox({ src, kind, meta, filename = 'media', onClose, onPrev, onNext, projectId }: Props) {
   // ESC + arrow navigation, and a body scroll lock (the plugin owns the tab
   // body; adding one class is enough to freeze panning behind the preview).
   useEffect(() => {
@@ -91,12 +93,12 @@ export default function Lightbox({ src, kind, meta, filename = 'media', onClose,
 
   const media: ReactNode =
     kind === 'image' ? (
-      <img className="lightbox-media lightbox-img" src={mediaSrc(src)} alt={meta?.prompt ?? meta?.title ?? ''} />
+      <img className="lightbox-media lightbox-img" src={mediaSrc(src, projectId)} alt={meta?.prompt ?? meta?.title ?? ''} />
     ) : kind === 'video' ? (
-      <video className="lightbox-media lightbox-video" src={mediaSrc(src)} controls autoPlay playsInline />
+      <video className="lightbox-media lightbox-video" src={mediaSrc(src, projectId)} controls autoPlay playsInline />
     ) : (
       <div className="lightbox-media lightbox-audio">
-        <audio src={mediaSrc(src)} controls autoPlay />
+        <audio src={mediaSrc(src, projectId)} controls autoPlay />
       </div>
     )
 
@@ -112,7 +114,7 @@ export default function Lightbox({ src, kind, meta, filename = 'media', onClose,
         {media}
         <div className="lightbox-footer">
           <MetaRow meta={meta} />
-          <button type="button" className="lightbox-download" onClick={() => download(src, filename)}>
+          <button type="button" className="lightbox-download" onClick={() => download(src, filename, projectId)}>
             <IconDownload size={14} /> Download
           </button>
         </div>

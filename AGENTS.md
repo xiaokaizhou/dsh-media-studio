@@ -10,16 +10,46 @@
 
 **画布为服务端权威**：每次接受写入都持久化并 SSE 广播；Agent 工具与浏览器 UI 走同一条 `CanvasStore.apply` 通道，因此双方永远看到一致状态。
 
+## 画布协作原则（LLM 自约束 / Built-in Workflow Rules）
+
+为了让**发布后的用户**在不改自己 agent preset 的情况下也能让 LLM 遵守画布协作纪律，本插件把 5 条规则写进所有 `media_studio_*` 与 `canvas_*` 工具的 `description`（definition 的 `name`+`description` 自动汇入 system-prompt；详见 DSH `subsystems/system-prompt.md` 的 `ToolProviderResult.schemas`）。这是**唯一能在部署侧不修改 preset 就生效的引导机制** —— preset 是 deployment-scoped，插件无法为用户写入。
+
+| # | 原则 | 落点（description 中） |
+|---|---|---|
+| 1 | 创建新项目 → 先调 `media_studio_create_project`；SSE `project-focused` 事件触发客户端 `betterSidebar.activateTab('media-studio:canvas')` | `media_studio_create_project` |
+| 2 | 画布操作 → 客户端 `SidebarFocusListener` 监听 SSE 自动激活 Media Studio 侧 tab | `canvas_*` 全部 |
+| 3 | 内容产出 → 必须落到 canvas 节点（`batchAddMedia` + `canvas_node_update`） | `canvas_*` + `media_studio_*` |
+| 4 | 不留空节点 → 创建 `text`/`note` 后必须紧跟 `canvas_node_update` 补内容；`image`/`video`/`music` 用 `canvas_refresh_node` 填 resultUrl | `canvas_node_add` / `canvas_node_update` / `canvas_refresh_node` |
+| 5 | 不留孤儿节点 → 非种子节点的 `addNode` 必须同批带 `connect(prev, new)` | `canvas_graph_patch` + `canvas_node_add` |
+
+> **机制边界**：DSH 的 `betterSidebar` 是 client-side service（运行在浏览器），server-side agent 不能直接命令 GUI。"自动打开侧栏"必须走 `工具调用 → SSE 广播 → 客户端监听 → activateTab` 这条链。本插件已通过 `project-focused` SSE 事件 + `SidebarFocusListener` 组件实现。
+
+> **未来扩展**：若希望某些用户能更细粒度地覆盖规则，可在自己 profile 的 `agent.cordis.yml` 的 `@deepseek-ai/dsh-system-prompt-section` 里再附加 section（preset 范围生效）。本插件不主动写入 preset。
+
 ## 已注册工具
 
-### 画布（4 个）
+### 画布（7 个）
 
 | 工具名 | 作用 |
 |---|---|
-| `canvas_graph_view` | 读取画布快照（nodes + edges + version） |
-| `canvas_graph_patch` | **原子批量写画布**（单批 ≤60 op） |
-| `canvas_auto_arrange` | 按边深度自动整理布局 |
+| `canvas_graph_view` | 读取画布快照（nodes + edges + **regions** + version） |
+| `canvas_graph_patch` | **原子批量写画布**（单批 ≤60 op；支持 `addRegion/updateRegion/deleteRegion`、`addNode.regionId`、`connect.label`、`batchAddMedia.items[].regionId`） |
+| `canvas_auto_arrange` | 按边深度自动整理布局；`regionId` 参数可只整理某个分区内的节点 |
 | `canvas_refresh_node` | 基于上游内容重新生成某媒体节点（代理到 dsh-llm-multimodal） |
+| `canvas_region_add` | 新建分区容器（`label` 必填，`kind/id/x/y/w/h` 可选；无坐标时自动堆叠在最低分区下方，默认 720×400） |
+| `canvas_region_update` | 浅更新分区（label / kind / 几何） |
+| `canvas_region_delete` | 删除分区**容器盒**（不级联删除其中的节点） |
+| `canvas_region_fit` | 把分区盒**紧贴包裹**其成员节点（小内边距 + 顶部标题带）；空分区不动。新增节点带 `regionId` 时盒会**自动扩容**，此工具用于节点被手动拖出盒外后的收拢 |
+
+### 单节点 CRUD（5 个）
+
+| 工具名 | 作用 |
+|---|---|
+| `canvas_node_view` | 读单个节点（无副作用，比 view 快照便宜） |
+| `canvas_node_add` | 新建一个节点（strict schema，自动定位 / 自动生成 id） |
+| `canvas_node_update` | 浅合并 data 到现有节点（不删除 key） |
+| `canvas_node_rename` | 只改 label，data 不动 |
+| `canvas_node_delete` | 删除节点；与它相连的所有边自动清除 |
 
 > 缺省 `canvasId` = **当前激活项目**的画布（注册表 `activeId`；无项目时回退 `main`）。显式传 `canvasId` 仍然有效。
 
@@ -88,6 +118,20 @@
 | `music` | 音频/TTS | `{ text, voice, resultUrl, status }` |
 | `note` | 备注 | `{ content }` |
 
+## 分区（Region）语义
+
+分区是**纯容器**，用于把画布按业务区块划分（如：流程总览 / 剧本文案 / 人物资产 / 场景资产 / 分镜区 / 成片与音频），客户端以虚线盒 + 标题 pill 渲染，区内节点按宫格排列。
+
+- 节点归属 = `data.region = <regionId>`（`addNode.regionId` / `batchAddMedia.items[].regionId` 自动写入；带 regionId 且不传 position 时，节点落在分区自己的 宫格网格 `regionSlot` 内，而不是全局 `defaultSlot`）。
+- 分区几何：默认 720×400（容纳 2 列宫格），`REGION_HEADER_H=64` 顶部标题区留给标题；区内网格列距 300、行距 300（卡片 240px + 60px 间距）、内边距 24、容量上限 240。
+- `canvas_region_delete` 只删盒不删节点（节点保留原位置，`data.region` 指向失效 id —— 需要时用 `updateNode` 清掉或补回）。
+- `canvas_auto_arrange({ regionId })` 只重排该分区成员，列在分区宽度内折行、不出界；**不带** regionId 时仍是全画布按边深度布局。
+- 边可带语义 `label`（如「角色清单来源」「一致性锚点」）。**画布 UI 不渲染边标签**（产品决定：视觉上只保留连线本体）；`label` 仍随 `connect` 写入图数据并参与版本令牌，供刷新协议 / 语义字典使用。
+- 持久化：`canvases/<id>.json` 顶层新增 `regions` 数组，旧文件缺省视为空；`restore` / 级联迁移均带 regions。
+- **自动扩容**：`addNode` / `batchAddMedia` 带 `regionId` 落宫格时，若新节点超出分区右/下沿，分区 `w/h` 就地扩大（宫格 240px 卡片 + 300px 列/行距，60px 间距），保证「节点永远在盒内」——agent 无需手工维护几何；节点被手动拖出后可用 `canvas_region_fit` 收拢。
+- **autoArrange 自动收拢**：`canvas_auto_arrange`（含 `regionId` 单分区版）整理完节点位置后，会自动对受影响的分区执行 `fitRegion`，盒子紧贴内容，不会留下大片空白。
+- **客户端交互**（`ms-region-layer` 经 `ViewportPortal` 渲染进 viewport，随缩放平移）：标题栏提供「贴合内容」「删除分区」按钮；右下角手柄可拖拽调整大小（落盘一次 `updateRegion`，可撤销）。
+
 ## 画布 Tab
 
 - 路径：DSH Web GUI → 侧栏 `+ 新建标签页` → `Media Studio`（betterSidebar 注册，id `media-studio:canvas`）。
@@ -122,7 +166,7 @@
 
 ## 配置
 
-- 插件级（bundle 行，Schemastery）：`workspaceRoot`、`mediaRoots`、`defaultCanvasId`、`logToolCalls`、`recentLimit`(10)、`trashEnabled`(true)。
+- 插件级（bundle 行，Schemastery）：`workspaceRoot`、`mediaRoots`、`defaultCanvasId`、`logToolCalls`、`recentLimit`(10)、`trashEnabled`(true)。**`mediaRoots` 默认 `['~/Movies']`**——戏剧/电影类项目用 `media_studio_create_project` 带 `sourcePath` 建在 `~/Movies` 下时，其媒体文件可直接被代理渲染；运行 profile 仍可能以 cordis.patch.yml 覆盖。
 - 媒体提供商配置在 **dsh-llm-multimodal** 的 `llm-multimodal` settings 命名空间（DSH Settings UI），与本插件无关。
 
 ## 开发
@@ -144,3 +188,54 @@ pnpm pack
 4. 新建项目由用户在「项目 → 新建」创建，**或由 Agent 调用 `media_studio_create_project` / `media_studio_pick_folder`**（带 `sourcePath` 时项目落在用户自有目录；不带则注册到 workspace）。Agent 操作画布默认落在当前激活项目，勿假设固定 canvasId；切项目请用 `media_studio_open_project`。
 5. 素材登记/软引用既可在 GUI 完成，也可由 Agent 主动调用：`media_studio_register_asset` 把画布节点入库；`media_studio_search_assets({ addSoftRef: true, addAssetKey })` 一步完成「跨项目搜索 + 软引用到当前画布」，无需先拷贝文件。
 6. 修改服务端后跑全套 `pnpm test`；客户端改动需跑 `typecheck:client`；行为改动重启后在浏览器/curl 复测。
+7. 单节点操作优先用 `canvas_node_view / add / update / rename / delete` —— schema 严格、LLM 不易拼错、返回更小。**只**在 2+ 个 op 必须原子完成时才用 `canvas_graph_patch`（如"建节点 + 连线 + 改名"三步走）。
+8. `canvas_node_update` 是**浅合并**：要删除某个 data key，请用 `canvas_graph_patch` 的 `updateNode` 把该 key 设为 `undefined`（或 delete + add 重建）。
+9. `canvas_node_add` 不会自动把媒体节点入库为素材 —— 那是 `batchAddMedia` + `media_studio_register_asset` 的职责。单节点 add 用于占位符和增量构建。
+10. `canvas_node_delete` 会自动清除所有相连边（无论 source 还是 target）；若要保留边，必须先用 `canvas_graph_patch` 单独删边再删节点。
+11. **分区优先**：内容分块明确时先建分区（`addRegion`），后续节点都带 `regionId` 落位；同一批建分区 + 落节点（≤60 op）可以一次 `canvas_graph_patch` 完成。需要语义连线时给 `connect` 传 `label`（画布只画线、不显示标签文本）。
+12. **分区内整理**：只想整理某个分区的布局时用 `canvas_auto_arrange({ regionId })`，不要用全画布版（会把跨区节点的精心布局打乱）。
+
+## 历史故障复盘：画布展开导致交互卡死（2026-09）
+
+### 现象
+画布打开后，Agent 对话输入框无法发送、项目菜单所有操作（重命名/打开本地/打开最近项目）无响应、导出截图无法下载；关闭画布后全部恢复。
+
+### 根因（一条因果链）
+```
+画布打开 → /canvas/sse + /projects/sse 两个 SSE 长连接建立
+→ 加上 DSH 核心的 3-4 个 SSE（plugins/events、voice-mode/stream、bsk-observation/events）
+→ 共 6 个长连接，刚好占满 HTTP/1.1 的「每主机 6 连接」限制
+→ 所有短请求（rename、delete、status 轮询、聊天发送）排队，永远拿不到连接
+→ fetch() 永久挂起（5s+ 无返回）
+→ 重命名对话框的 submit() Promise 永不 resolve，按钮永久禁用在「处理中…」
+→ 模态遮罩 .ms-menu-backdrop.is-modal (z-index:900, pointer-events:auto) 不消失
+→ 全屏遮罩吞掉所有点击 → 表现为「整个 UI 卡死」
+```
+直接诱发表层是模态遮罩，但**根本原因是 HTTP/1.1 连接池被 SSE 长连接占满**。curl 和 CDP 走的是独立网络栈，不受浏览器渲染进程的 6 连接限制影响，因此服务端一直正常。
+
+### 加重因素
+- `NameDialogContent` / `DeleteDialogContent` 定义在 `ProjectApp` 函数内部，每次 SSE 触发父组件重渲染都会产生新函数引用 → React 卸载重挂载对话框 → in-flight 的 submit() Promise 的 setLocalBusy 作用于已卸载组件被忽略 → 新实例 localBusy=false 但 name 重置为原始值。
+- 对话框操作成功后不自动关闭，用户需手动点取消，增加了遮罩停留时间。
+
+### 修复方案
+1. **合并 SSE 端点（根本修复）**：新增 `/api/media-studio/sse` 统一端点，一个连接同时推送 `canvas-patch` 和 `registry-changed` / `project-open` 事件。客户端 `canvas-bus.ts` 扩展为统一 SSE 总线，`subscribeProjects` 复用同一 EventSource，media-studio 的 SSE 连接从 2 个降到 1 个，为短请求腾出连接。
+2. **对话框组件模块化**：`NameDialogContent` / `DeleteDialogContent` 移到模块级别，通过 props 传入回调，避免父组件重渲染时对话框被卸载重挂载。
+3. **成功后自动关闭对话框**：submit() 成功后调用 onClose()，不再让用户手动关闭。
+4. **保留 30s Promise.race 超时保护**作为兜底。
+
+### 教训与防再犯规则
+- **新增任何 SSE 端点前，先数当前已有几个长连接**：DSH 核心约 3-4 个 + media-studio 应 ≤1 个，总和不能接近 6。若需要新的事件流，优先合并到现有统一端点，而不是新开 EventSource。
+- **React 组件不要定义在父组件函数内部**：每次重渲染都会产生新引用导致卸载重挂载，丢失 in-flight 状态。定义在模块级，通过 props 传数据和回调。
+- **模态对话框操作成功后必须自动关闭**：不要让用户手动关闭，否则任何异常都会留下全屏遮罩。
+- **诊断「UI 卡死」时先查 `.ms-menu-backdrop.is-modal`**：这是最常见的直接阻塞源；但不要停在表层，要继续查为什么对话框没关闭（通常是 fetch 挂起 → 连接池满）。
+- **浏览器内 fetch 挂起但 curl 正常 = 连接池问题**：用 `lsof -i TCP:<port>` 数 ESTABLISHED 连接，用 CDP `network_requests()` 看 inflight 请求分布。
+
+### 后续优化（2026-09，同一轮修复中完成）
+在根本修复（合并 SSE 端点）基础上，进一步把 media-studio 的 SSE 连接从「修复后的 1 个 + SidebarFocusListener 偷偷开的第 3 个」收敛到真正的 1 个，并增加健壮性：
+
+1. **SidebarFocusListener 迁移到统一总线**：原 `sidebar-focus-listener.tsx` 自己开了 `/projects/sse` 监听 `project-focused`，是未被发现的第 3 个 SSE 连接。改为通过 `canvas-bus.subscribeProjectFocused()` 复用统一连接。
+2. **删除旧端点**：`/api/media-studio/canvas/sse` 和 `/api/media-studio/projects/sse` 已从服务端移除，客户端无任何引用。统一端点 `/api/media-studio/sse` 是唯一 SSE 入口。
+3. **页面不可见时暂停 SSE**：`visibilitychange` 事件监听，标签页后台化时关闭 SSE 释放连接，回到前台时重连。最后一个订阅者离开时自动 detach 监听器。
+4. **SSE 重连后主动同步**：EventSource error→自动重连后，主动 fetch 最新 canvas 快照 + registry，覆盖断线期间丢失的事件。
+5. **registry-changed 事件防抖**：150ms trailing-edge 防抖，避免项目创建/切换时的连续广播触发 React 重渲染风暴。
+6. **对话框超时 30s→10s**：正常请求 2s 内返回，10s 超时 + 友好错误提示更合理。

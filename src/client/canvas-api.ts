@@ -38,14 +38,30 @@ export type MsOp =
     label: string
     data?: Record<string, unknown>
     position?: { x: number; y: number }
+    /** Region to auto-place into when `position` is omitted (membership
+     *  recorded as data.region). */
+    regionId?: string
     nodeId?: string
   }
   | { op: 'updateNode'; id: string; data: Record<string, unknown> }
   | { op: 'renameNode'; id: string; label: string }
   | { op: 'deleteNode'; id: string }
   | { op: 'moveNode'; id: string; position: { x: number; y: number } }
-  | { op: 'connect'; from: string; to: string }
+  | { op: 'connect'; from: string; to: string; label?: string }
   | { op: 'deleteEdge'; id: string }
+  | {
+    op: 'addRegion'
+    label: string
+    kind?: string
+    id?: string
+    x?: number
+    y?: number
+    w?: number
+    h?: number
+  }
+  | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number }
+  | { op: 'deleteRegion'; id: string }
+  | { op: 'fitRegion'; id: string }
 
 /** Host snapshot shape the SSE stream delivers. */
 export interface MsSnapshot {
@@ -57,7 +73,16 @@ export interface MsSnapshot {
       data: MsData
       position?: { x: number; y: number }
     }>
-    edges: Array<{ id: string; source: string; target: string }>
+    edges: Array<{ id: string; source: string; target: string; label?: string }>
+    regions: Array<{
+      id: string
+      label: string
+      kind?: string
+      x: number
+      y: number
+      w: number
+      h: number
+    }>
   }
   version: number
 }
@@ -146,8 +171,14 @@ export async function postOps(canvasId: string, ops: MsOp[]): Promise<{ ok: bool
  * Host tools store local filesystem paths (e.g. .../web-jobs/x.png) as the
  * node's resultUrl. Browsers can't load those, so we map them onto the
  * host's media-file proxy. http(s)/data:/blob: and same-origin /api/ URLs
- * pass through untouched. */
-export function mediaSrc(raw?: string): string {
+ * pass through untouched.
+ *
+ * Bare relative paths that start with `assets/` (the project-internal
+ * convention, e.g. `assets/characters/xxx.png`) are automatically prefixed
+ * with `projects/<projectId>/` so the server's `resolveMediaTarget()` rewrite
+ * kicks in and maps them to the correct on-disk location. This prevents the
+ * browser from requesting `http://host/assets/...` which always 404s. */
+export function mediaSrc(raw?: string, projectId?: string): string {
   if (!raw) return ''
   if (/^(https?:|data:|blob:)/i.test(raw)) return raw
   if (raw.startsWith('file://')) return `/api/media-studio/media-file?path=${encodeURIComponent(raw.slice('file://'.length))}`
@@ -161,6 +192,14 @@ export function mediaSrc(raw?: string): string {
     // Resolved against workspaceRoot by the media-file proxy, so no extra
     // permissioning is required here.
     return `/api/media-studio/media-file?path=${encodeURIComponent(raw)}`
+  }
+  if (raw.startsWith('assets/')) {
+    // Bare project-internal relative path (e.g. assets/characters/xxx.png).
+    // Prefix with the current project id so the media-file proxy can rewrite
+    // it to the correct sourcePath-backed location. Falls back to the raw
+    // path when projectId is unavailable (legacy / off-canvas usage).
+    const prefixed = projectId ? `projects/${projectId}/${raw}` : raw
+    return `/api/media-studio/media-file?path=${encodeURIComponent(prefixed)}`
   }
   return raw
 }

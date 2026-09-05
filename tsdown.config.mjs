@@ -101,7 +101,9 @@ export default [
       neverBundle: [...CLIENT_EXTERNALS],
       // Always inline @xyflow/react — DSH does not seed it into the loader's
       // module table, so a require() for it would resolve to undefined.
-      alwaysBundle: ['@xyflow/react'],
+      // Also inline html-to-image — pure-browser DOM→canvas utility, not in
+      // the platform module table.
+      alwaysBundle: ['@xyflow/react', 'html-to-image'],
     },
     define: {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),

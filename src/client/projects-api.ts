@@ -88,28 +88,22 @@ export function apiDeleteProject(
   })
 }
 
+import { subscribeRegistry, subscribeProjectOpen } from './canvas-bus'
+
 /**
  * Subscribe to project-level SSE events (registry-changed / project-open /
- * project-deleted). Returns an unsubscribe function. EventSource reconnects
- * automatically; the initial snapshot arrives as registry-changed.
+ * project-deleted). Returns an unsubscribe function.
+ *
+ * Uses the SHARED unified SSE bus (canvas-bus.ts) instead of opening its own
+ * EventSource. See canvas-bus.ts header for why: a second /projects/sse
+ * socket pushed the tab past the HTTP/1.1 six-connection limit and queued
+ * every short REST call behind the SSE sockets.
  */
 export function subscribeProjects(handlers: { onRegistry: (reg: RegistryAPI) => void; onOpen?: (projectId: string, name?: string) => void }): () => void {
-  let es: EventSource | null = null
-  try {
-    es = new EventSource('/api/media-studio/projects/sse')
-  } catch (err) {
-    console.error('[media-studio] failed to open project EventSource:', err)
-    return () => {}
+  const offReg = subscribeRegistry(handlers.onRegistry)
+  const offOpen = handlers.onOpen ? subscribeProjectOpen(handlers.onOpen) : null
+  return () => {
+    offReg()
+    offOpen?.()
   }
-  const handle = (e: MessageEvent) => {
-    try {
-      const data = JSON.parse(e.data) as { registry?: RegistryAPI; projectId?: string; name?: string }
-      if (data.registry) handlers.onRegistry(data.registry)
-      if (e.type === 'project-open' && data.projectId) handlers.onOpen?.(data.projectId, data.name)
-    } catch { /* ignore malformed */ }
-  }
-  es.addEventListener('registry-changed', handle)
-  es.addEventListener('project-open', handle)
-  es.addEventListener('project-deleted', handle)
-  return () => es?.close()
 }

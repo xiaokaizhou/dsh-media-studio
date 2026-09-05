@@ -8,7 +8,7 @@ import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles } from './service-state'
-import { executeNodeRefresh } from './tools'
+import { executeNodeRefresh, postProcessCanvasPatch } from './tools'
 
 const MEDIA_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -152,13 +152,21 @@ export function registerCanvasRoutes(ctx: Context): () => void {
   const store = getMediaStudioHandles().canvasStore
   const sseClients = getMediaStudioHandles().sseClients
 
-  // SSE stream — the canvas tab subscribes here.
+  // Unified SSE endpoint — a single EventSource carries both canvas patches
+  // and project-registry events. Before this, the client opened TWO long-lived
+  // connections (/canvas/sse + /projects/sse); together with DSH core's own
+  // 3-4 SSE streams that hit the HTTP/1.1 six-connection-per-host limit,
+  // every short request (rename, delete, status polling) was queued behind
+  // the SSE sockets and never got a connection — which made dialog buttons
+  // stick in "处理中…" and left the modal backdrop up forever. One socket
+  // here frees a connection for short-lived REST calls.
   wserver.register({
     kind: 'exact',
-    path: '/api/media-studio/canvas/sse',
+    path: '/api/media-studio/sse',
     handler: (req, res) => {
       const url = new URL(req.url ?? '/', 'http://x')
       const canvasId = url.searchParams.get('canvasId') || 'main'
+      const handles = getMediaStudioHandles()
 
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -166,28 +174,37 @@ export function registerCanvasRoutes(ctx: Context): () => void {
         Connection: 'keep-alive',
         'X-Accel-Buffering': 'no',
       })
-      res.write(`: connected to canvas "${canvasId}"\n\n`)
+      res.write(`: connected to unified stream (canvas="${canvasId}")\n\n`)
 
-      // Send the current snapshot so the client can render immediately.
-      // Use a named `event:` so the client's `addEventListener('canvas-patch')`
-      // handler fires (a bare `data:` would dispatch as `message`).
+      // Initial canvas snapshot.
       const snap = store.snapshot(canvasId)
-      const snapBody = JSON.stringify({
-        type: 'canvas-patch',
-        canvasId,
-        version: snap.version,
-        graph: snap.graph,
-        patch: [],
-      })
-      res.write(`event: canvas-patch\ndata: ${snapBody}\n\n`)
+      res.write(`event: canvas-patch\ndata: ${JSON.stringify({
+        type: 'canvas-patch', canvasId, version: snap.version, graph: snap.graph, patch: [],
+      })}\n\n`)
 
+      // Initial registry snapshot. Send immediately if the store exists
+      // (even if still booting — snapshot() returns the current state);
+      // the next broadcast will deliver the fully-loaded registry.
+      const ps = handles.projectStore
+      if (ps) {
+        try {
+          res.write(`event: registry-changed\ndata: ${JSON.stringify({ registry: ps.snapshot(), recentLimit: ps.getRecentLimit() })}\n\n`)
+        } catch { /* store not ready — next broadcast catches it */ }
+      }
+
+      // Register with BOTH broadcast sets so canvas patches and project
+      // events flow down the same socket.
       sseClients.add(res)
+      handles.projectSseClients?.add(res)
+
       const ping = setInterval(() => {
         try { res.write(`data: {"type":"heartbeat"}\n\n`) } catch { /* client gone */ }
       }, 15_000)
+
       req.on('close', () => {
         clearInterval(ping)
         sseClients.delete(res)
+        handles.projectSseClients?.delete(res)
       })
     },
   })
@@ -217,13 +234,53 @@ export function registerCanvasRoutes(ctx: Context): () => void {
       const chunks: Buffer[] = []
       req.on('data', (c: Buffer) => chunks.push(c))
       req.on('end', () => {
+        void (async () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string; ops?: unknown[] }
+            // Support canvasId in both body and query param for API consistency
+            const reqUrl = new URL(req.url || '/', 'http://localhost')
+            const canvasId = body.canvasId || reqUrl.searchParams.get('canvasId') || 'main'
+            const ops = Array.isArray(body.ops) ? body.ops : []
+            const result = store.apply(canvasId, ops as never)
+            // Shared post-processing (pin remote URLs → migrate inaccessible →
+            // auto-register assets). Same code path as the agent tool so REST
+            // patches don't leave provider URLs to expire into broken cards.
+            const issues = await postProcessCanvasPatch(store, canvasId, ops as never, result.issues)
+            // `store.apply` already broadcasts the new graph to every SSE
+            // client (the canvas tab) — no second push here.
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({
+              ok: true,
+              applied: result.patch.length,
+              version: result.version,
+              lintOk: result.lintOk,
+              issues,
+            }))
+          } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: false, error: (e as Error).message }))
+          }
+        })()
+      })
+    },
+  })
+
+  // Auto-arrange — re-layout all nodes by topological flow depth. Same
+  // algorithm as the client's bottom-right wand button and the agent tool
+  // `canvas_auto_arrange`. Exposed as REST so the frontend can call it
+  // without going through the agent tool runtime.
+  wserver.register({
+    kind: 'exact',
+    path: '/api/media-studio/canvas/auto-arrange',
+    handler: (req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', () => {
         try {
-          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string; ops?: unknown[] }
-          const canvasId = body.canvasId || 'main'
-          const ops = Array.isArray(body.ops) ? body.ops : []
-          const result = store.apply(canvasId, ops as never)
-          // `store.apply` already broadcasts the new graph to every SSE
-          // client (the canvas tab) — no second push here.
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string }
+          const reqUrl = new URL(req.url || '/', 'http://localhost')
+          const canvasId = body.canvasId || reqUrl.searchParams.get('canvasId') || 'main'
+          const result = store.autoArrange(canvasId)
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify({
             ok: true,
@@ -231,6 +288,7 @@ export function registerCanvasRoutes(ctx: Context): () => void {
             version: result.version,
             lintOk: result.lintOk,
             issues: result.issues,
+            persistError: result.persistError,
           }))
         } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' })
@@ -283,9 +341,10 @@ export function registerCanvasRoutes(ctx: Context): () => void {
       req.on('end', async () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string; nodeId?: string }
-          const canvasId = body.canvasId || 'main'
-          const nodeId = String(body.nodeId ?? '').trim()
-          console.log(`[media-studio] refresh: canvasId=${canvasId} nodeId=${nodeId}`)
+          const reqUrl = new URL(req.url || '/', 'http://localhost')
+          const canvasId = body.canvasId || reqUrl.searchParams.get('canvasId') || 'main'
+          const nodeId = String(body.nodeId ?? reqUrl.searchParams.get('nodeId') ?? '').trim()
+          getMediaStudioHandles().logger?.debug?.(`[media-studio] refresh: canvasId=${canvasId} nodeId=${nodeId}`)
           if (!nodeId) {
             res.writeHead(400, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify({ ok: false, error: 'nodeId is required' }))
@@ -300,14 +359,14 @@ export function registerCanvasRoutes(ctx: Context): () => void {
           const timeout = setTimeout(() => controller.abort(), 5 * 60_000)
           try {
             const result = await executeNodeRefresh(store, canvasId, nodeId, controller.signal, ctx)
-            console.log(`[media-studio] refresh: done, ok=${result.ok} kind=${result.kind}`)
+            getMediaStudioHandles().logger?.debug?.(`[media-studio] refresh: done, ok=${result.ok} kind=${result.kind}`)
             res.writeHead(200, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify(result))
           } finally {
             clearTimeout(timeout)
           }
         } catch (e) {
-          console.error(`[media-studio] refresh: error ${(e as Error).message}`)
+          getMediaStudioHandles().logger?.error?.(`[media-studio] refresh: error ${(e as Error).message}`)
           if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify({ ok: false, error: (e as Error).message }))

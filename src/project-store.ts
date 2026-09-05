@@ -106,8 +106,8 @@ export interface DeleteResult {
   brokenNodes?: number
 }
 
-/** Project-scoped events pushed to SSE subscribers (registry/open/delete). */
-export type ProjectEventType = 'registry-changed' | 'project-open' | 'project-deleted'
+/** Project-scoped events pushed to SSE subscribers (registry/open/delete/focus). */
+export type ProjectEventType = 'registry-changed' | 'project-open' | 'project-deleted' | 'project-focused'
 
 export interface ProjectEvent {
   type: ProjectEventType
@@ -115,6 +115,10 @@ export interface ProjectEvent {
   projectId?: string
   name?: string
   switchedTo?: string | null
+  /** Why the focus event fired — 'create' | 'open'. The client-side listener
+   *  uses it as a stable "auto-focus" signal independent of `project-open`,
+   *  which also fires for SSE-driven project switches the user did manually. */
+  source?: 'create' | 'open'
 }
 
 export interface ProjectStoreOpts {
@@ -123,6 +127,8 @@ export interface ProjectStoreOpts {
   /** Called after every registry/open/delete mutation so the transport layer
    *  can push the event to project SSE subscribers. */
   onEvent?: (event: ProjectEvent) => void
+  /** Plugin logger. Absent in unit-test environments. */
+  logger?: { info?: (m: string) => void; warn?: (m: string) => void; error?: (m: string) => void; debug?: (m: string) => void }
 }
 
 const REGISTRY_VERSION = 1
@@ -141,6 +147,18 @@ export function validateProjectName(name: string): string | null {
   return null
 }
 
+/** Strip keys whose value is `undefined` from a plain object.
+ *  Required because DSH's lossless-JSON validator rejects objects that carry
+ *  explicit `undefined` properties (they survive in-memory but break on the
+ *  tool return path). Used by create/open/rename/snapshot return values. */
+function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) out[k] = v
+  }
+  return out as T
+}
+
 export class ProjectDeleteBlockedError extends Error {
   constructor(public readonly dependents: DependentsInfo) {
     super(`project is referenced by other projects (${dependents.totalRefs} soft reference(s)); choose a cascade mode`)
@@ -157,11 +175,13 @@ export class ProjectStore {
   private wsRoot: string
   private canvasStore: CanvasStore
   private opts: ProjectStoreOpts
+  private logger?: ProjectStoreOpts['logger']
 
   constructor(wsRoot: string, canvasStore: CanvasStore, opts: ProjectStoreOpts) {
     this.wsRoot = wsRoot
     this.canvasStore = canvasStore
     this.opts = opts
+    this.logger = opts.logger
     this.readyPromise = this.serial(() => this.boot())
   }
 
@@ -178,6 +198,15 @@ export class ProjectStore {
     const projects = Object.values(this.registry.projects)
       .slice()
       .sort((a, b) => (a.lastOpenedAt < b.lastOpenedAt ? 1 : a.lastOpenedAt > b.lastOpenedAt ? -1 : 0))
+      .map((p) => {
+        // Defensive: strip any undefined-valued keys so the lossless-JSON
+        // validator on the tool return path never sees them.
+        const { sourcePath, legacy, ...rest } = p
+        const out: Record<string, unknown> = { ...rest }
+        if (sourcePath !== undefined) out.sourcePath = sourcePath
+        if (legacy !== undefined) out.legacy = legacy
+        return out as unknown as ProjectMeta
+      })
     return { activeId: this.registry.activeId, recent: this.registry.recent, projects }
   }
 
@@ -219,7 +248,7 @@ export class ProjectStore {
           loaded = true
         }
       } catch {
-        console.warn(`[media-studio] projects.json is corrupt (${registryPath}) — starting with an empty registry; the original file is left untouched for manual recovery.`)
+        this.logger?.warn?.(`[media-studio] projects.json is corrupt (${registryPath}) — starting with an empty registry; the original file is left untouched for manual recovery.`)
       }
     }
 
@@ -255,7 +284,7 @@ export class ProjectStore {
       this.registry.activeId = canvasIds[0] ?? null
       await this.persistRegistry()
       if (canvasIds.length > 0) {
-        console.log(`[media-studio] migrated ${canvasIds.length} legacy canvas(es) into project registry: ${canvasIds.join(', ')}`)
+        this.logger?.debug?.(`[media-studio] migrated ${canvasIds.length} legacy canvas(es) into project registry: ${canvasIds.join(', ')}`)
       }
     }
 
@@ -291,7 +320,7 @@ export class ProjectStore {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         lastOpenedAt: new Date().toISOString(),
-        sourcePath: typeof sourcePath === 'string' && sourcePath.trim() ? sourcePath.trim() : undefined,
+        ...(typeof sourcePath === 'string' && sourcePath.trim() ? { sourcePath: sourcePath.trim() } : {}),
       }
       await this.ensureProjectTemplate(meta.id)
       await this.ensureProjectAgentsMd(meta)
@@ -301,7 +330,11 @@ export class ProjectStore {
       this.canvasStore.setCanvasSourcePath(meta.id, meta.sourcePath)
       await this.setActiveLocked(meta.id)
       this.emit({ type: 'registry-changed' })
-      return { ...meta }
+      // Auto-focus hint for the client-side sidebar listener: distinguishes
+      // agent-initiated creates (sidebar should activate) from manual or
+      // SSE-driven opens the user already controls.
+      this.emit({ type: 'project-focused', projectId: meta.id, name: meta.name, source: 'create' })
+      return stripUndefined({ ...meta })
     })
   }
 
@@ -326,7 +359,10 @@ export class ProjectStore {
       // rewritten so the media-file proxy can resolve it.
       await this._migrateCanvasProjectIds(id)
       this.emit({ type: 'project-open', projectId: id, name: meta.name, registry: this.snapshot() })
-      return { ...meta }
+      // Auto-focus hint for the client-side sidebar listener (agent opened
+      // an existing project — sidebar should activate).
+      this.emit({ type: 'project-focused', projectId: id, name: meta.name, source: 'open' })
+      return stripUndefined({ ...meta })
     })
   }
 
@@ -418,7 +454,7 @@ export class ProjectStore {
         this.canvasStore.setCanvasSourcePath(meta.id, nextSourcePath)
       }
       this.emit({ type: 'registry-changed' })
-      return { ...meta }
+      return stripUndefined({ ...meta })
     })
   }
 
@@ -565,7 +601,7 @@ export class ProjectStore {
       await mkdir(dirname(this.registryPath()), { recursive: true })
       await writeFile(this.registryPath(), JSON.stringify(this.registry, null, 2), 'utf8')
     } catch (e) {
-      console.warn(`[media-studio] persist projects.json failed: ${(e as Error).message}`)
+      this.logger?.warn?.(`[media-studio] persist projects.json failed: ${(e as Error).message}`)
     }
   }
 
@@ -598,7 +634,7 @@ export class ProjectStore {
         await writeAssetIndex(root, { version: 1, assets: [] }, '.index.json')
       }
     } catch (e) {
-      console.warn(`[media-studio] ensureProjectTemplate(${projectId}) failed: ${(e as Error).message}`)
+      this.logger?.warn?.(`[media-studio] ensureProjectTemplate(${projectId}) failed: ${(e as Error).message}`)
     }
   }
 
@@ -620,7 +656,7 @@ export class ProjectStore {
       await mkdir(root, { recursive: true })
       await writeFile(dest, renderAgentsMd(meta), 'utf8')
     } catch (e) {
-      console.warn(`[media-studio] seed AGENTS.md at ${dest} failed: ${(e as Error).message}`)
+      this.logger?.warn?.(`[media-studio] seed AGENTS.md at ${dest} failed: ${(e as Error).message}`)
     }
   }
 
@@ -685,14 +721,14 @@ export class ProjectStore {
         await mkdir(trashRoot, { recursive: true })
         const dest = join(trashRoot, `${this.basename(target)}_${Date.now()}`)
         await rename(target, dest)
-        console.log(`[media-studio] moved to trash: ${dest}`)
+        this.logger?.debug?.(`[media-studio] moved to trash: ${dest}`)
       } else {
         await rm(target, { recursive: true, force: true })
       }
     } catch (e) {
       // Missing source is fine; real errors are logged but non-fatal.
       const code = (e as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT') console.warn(`[media-studio] disposeFile(${target}) failed: ${(e as Error).message}`)
+      if (code !== 'ENOENT') this.logger?.warn?.(`[media-studio] disposeFile(${target}) failed: ${(e as Error).message}`)
     }
   }
 
@@ -732,7 +768,7 @@ export class ProjectStore {
         await copyFile(source, join(destDir, entry.file))
         files += 1
       } catch (e) {
-        console.warn(`[media-studio] migrate-shared: could not copy ${source}: ${(e as Error).message}`)
+        this.logger?.warn?.(`[media-studio] migrate-shared: could not copy ${source}: ${(e as Error).message}`)
       }
       const migrated: Asset = { ...entry, origin: { type: 'migrated', fromProject: ownerId }, updatedAt: new Date().toISOString() }
       migratedAssets.push(migrated)
@@ -761,7 +797,7 @@ export class ProjectStore {
         this.canvasStore.apply(canvasId, ops)
         rewrittenNodes += ops.length
       } catch (e) {
-        console.warn(`[media-studio] migrate-shared: rewriting refs on "${canvasId}" failed: ${(e as Error).message}`)
+        this.logger?.warn?.(`[media-studio] migrate-shared: rewriting refs on "${canvasId}" failed: ${(e as Error).message}`)
       }
     }
     return { assets: uniqueAssetIds.length, files, rewrittenNodes }
@@ -787,7 +823,7 @@ export class ProjectStore {
         this.canvasStore.apply(canvasId, ops)
         brokenNodes += ops.length
       } catch (e) {
-        console.warn(`[media-studio] break-refs on "${canvasId}" failed: ${(e as Error).message}`)
+        this.logger?.warn?.(`[media-studio] break-refs on "${canvasId}" failed: ${(e as Error).message}`)
       }
     }
     return brokenNodes
@@ -821,7 +857,7 @@ function renderAgentsMd(meta: ProjectMeta): string {
 | 跨项目复制资产 | \`POST /api/media-studio/assets/copy\` \`{projectId, assetId, targetProjectId}\` |
 | 看当前注册表 | \`GET /api/media-studio/projects\` |
 | 创建/打开/删除项目 | \`POST /api/media-studio/projects/{create,open,delete}\` |
-| 订阅注册表变更 | \`EventSource('/api/media-studio/projects/sse')\` |
+| 订阅注册表变更 | \`EventSource('/api/media-studio/sse')\`（统一端点，同时承载画布事件） |
 
 ## 项目内资产约定
 

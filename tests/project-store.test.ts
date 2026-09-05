@@ -348,3 +348,36 @@ describe('registry file durability', () => {
     expect(deps.totalRefs).toBe(0)
   })
 })
+
+describe('lossless JSON round-trip (Issue B regression)', () => {
+  it('createProject without sourcePath produces snapshot without undefined sourcePath key', async () => {
+    await makeStore()
+    const p = await store.createProject('无源路径项目')
+    expect(p.sourcePath).toBeUndefined()
+    // The snapshot must not contain any undefined-valued keys
+    const snap = store.snapshot()
+    const snapJson = JSON.stringify(snap)
+    // Re-parse to confirm no undefined leaked
+    const parsed = JSON.parse(snapJson) as ReturnType<ProjectStore['snapshot']>
+    for (const proj of parsed.projects) {
+      expect(proj).not.toHaveProperty('sourcePath')
+    }
+    // The tool-like return value must also be clean
+    const returnVal = { ok: true, ...snap }
+    const returnJson = JSON.stringify(returnVal)
+    expect(returnJson).not.toContain('"sourcePath":undefined')
+    expect(JSON.parse(returnJson)).toEqual(returnVal)
+  })
+
+  it('openProject without sourcePath preserves clean snapshot', async () => {
+    await makeStore()
+    const p = await store.createProject('开放测试')
+    expect(p.sourcePath).toBeUndefined()
+    const opened = await store.openProject(p.id)
+    expect(opened.sourcePath).toBeUndefined()
+    const snap = store.snapshot()
+    for (const proj of snap.projects) {
+      expect(proj).not.toHaveProperty('sourcePath')
+    }
+  })
+})

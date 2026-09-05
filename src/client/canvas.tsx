@@ -35,11 +35,13 @@ import {
   MiniMap,
   ReactFlow,
   ReactFlowProvider,
+  ViewportPortal,
   getBezierPath,
   useEdgesState,
   useNodesState,
   useReactFlow,
   useStore as useFlowStore,
+  useStoreApi as useFlowStoreApi,
   type Connection,
   type Edge as FlowEdge,
   type EdgeProps,
@@ -62,7 +64,6 @@ import { injectMediaStudioStyles } from './canvas-styles'
 import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn, IconEraser, IconX } from './icons'
 import { apiRegisterAsset, type AssetKind } from './assets-api'
 import { resolveLang, translate } from './i18n'
-import { recordRevision, setController, latestRevision } from './revision-bus'
 import { subscribeFull, subscribeConn } from './canvas-bus'
 
 export interface CanvasProps {
@@ -75,6 +76,7 @@ type ConnState = 'connecting' | 'open' | 'reconnecting'
 // ── Snapshot helpers ─────────────────────────────────────────────────────
 
 type SNode = MsSnapshot['graph']['nodes'][number]
+type SRegion = MsSnapshot['graph']['regions'][number]
 type SGraph = MsSnapshot['graph']
 
 function nodeToken(n: SNode): string {
@@ -85,10 +87,14 @@ function nodeToken(n: SNode): string {
 function graphToken(graph: SGraph): string {
   const nodes = [...graph.nodes].sort((a, b) => (a.id < b.id ? -1 : 1)).map(nodeToken).join('|')
   const edges = graph.edges
-    .map((e) => `${e.source}->${e.target}`)
+    .map((e) => `${e.source}->${e.target}${e.label ? `:${e.label}` : ''}`)
     .sort()
     .join('|')
-  return `${nodes}##${edges}`
+  const regions = (graph.regions ?? [])
+    .map((r) => `${r.id}:${r.label}:${r.kind ?? ''}:${r.x},${r.y},${r.w},${r.h}`)
+    .sort()
+    .join('|')
+  return `${nodes}##${edges}##${regions}`
 }
 
 function cloneGraph(graph: SGraph): SGraph {
@@ -104,6 +110,19 @@ function msSnapshotOf(graph: SGraph, version: number): MsSnapshot {
 function restoreOps(target: MsSnapshot): MsOp[] {
   const ops: MsOp[] = []
   for (const n of target.graph.nodes) ops.push({ op: 'deleteNode', id: n.id })
+  for (const r of target.graph.regions ?? []) ops.push({ op: 'deleteRegion', id: r.id })
+  for (const r of target.graph.regions ?? []) {
+    ops.push({
+      op: 'addRegion',
+      id: r.id,
+      label: r.label,
+      ...(r.kind ? { kind: r.kind } : {}),
+      x: r.x,
+      y: r.y,
+      w: r.w,
+      h: r.h,
+    })
+  }
   for (const n of target.graph.nodes) {
     ops.push({
       op: 'addNode',
@@ -114,7 +133,7 @@ function restoreOps(target: MsSnapshot): MsOp[] {
       data: n.data,
     })
   }
-  for (const e of target.graph.edges) ops.push({ op: 'connect', from: e.source, to: e.target })
+  for (const e of target.graph.edges) ops.push({ op: 'connect', from: e.source, to: e.target, ...(e.label ? { label: e.label } : {}) })
   return ops
 }
 
@@ -205,7 +224,7 @@ function mergeEdges(prev: FlowEdge[], edges: SGraph['edges']): FlowEdge[] {
   const out: FlowEdge[] = []
   for (const e of edges) {
     const existing = byId.get(e.id)
-    if (existing && existing.source === e.source && existing.target === e.target) {
+    if (existing && existing.source === e.source && existing.target === e.target && existing.data?.label === e.label) {
       out.push(existing)
     } else {
       out.push({
@@ -215,6 +234,7 @@ function mergeEdges(prev: FlowEdge[], edges: SGraph['edges']): FlowEdge[] {
         sourceHandle: `${e.source}-out`,
         targetHandle: `${e.target}-in`,
         type: 'flow',
+        data: { label: e.label },
       })
     }
   }
@@ -229,15 +249,49 @@ function projectEdges(graph: SGraph): FlowEdge[] {
     sourceHandle: `${e.source}-out`,
     targetHandle: `${e.target}-in`,
     type: 'flow',
+    data: { label: e.label },
   }))
+}
+
+function regionToken(r: SRegion): string {
+  return `${r.id}:${r.label}:${r.kind ?? ''}:${r.x},${r.y},${r.w},${r.h}`
+}
+
+/** Reference-preserving merge for regions: unchanged boxes keep their object
+ *  identity so a live resize drag isn't reset by the SSE echo of the same
+ *  values. */
+function mergeRegions(prev: SRegion[], next: SRegion[]): SRegion[] {
+  if (prev.length === 0 || next.length === 0) return next.map((r) => ({ ...r }))
+  const byId = new Map(prev.map((r) => [r.id, r]))
+  const out: SRegion[] = []
+  for (const r of next) {
+    const existing = byId.get(r.id)
+    if (existing && regionToken(existing) === regionToken(r)) {
+      out.push(existing)
+    } else {
+      out.push({ ...r })
+    }
+  }
+  return out
+}
+
+function projectRegions(graph: SGraph): SRegion[] {
+  return (graph.regions ?? []).map((r) => ({ ...r }))
 }
 
 /** Deterministic local mirror of the host apply() for UI-fired ops, so the
  *  optimistic state matches the SSE echo. Edge ids are client placeholders —
- *  content comparison ignores them. */
-function applyLocalOps(nodes: FlowNode[], edges: FlowEdge[], ops: MsOp[]): { nodes: FlowNode[]; edges: FlowEdge[] } {
+ *  content comparison ignores them. Region ops mirror the host rules
+ *  (auto-stack / shallow patch / delete box only). */
+function applyLocalOps(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+  regions: SRegion[],
+  ops: MsOp[],
+): { nodes: FlowNode[]; edges: FlowEdge[]; regions: SRegion[] } {
   let ns = nodes.map((n) => ({ ...n, data: { ...(n.data as object) } }))
   let es = edges.map((e) => ({ ...e }))
+  let rs = regions.map((r) => ({ ...r }))
   let edgeSeq = es.length
   for (const op of ops) {
     switch (op.op) {
@@ -278,6 +332,7 @@ function applyLocalOps(nodes: FlowNode[], edges: FlowEdge[], ops: MsOp[]): { nod
           sourceHandle: `${op.from}-out`,
           targetHandle: `${op.to}-in`,
           type: 'flow',
+          data: { label: op.label },
         }]
         break
       }
@@ -285,9 +340,43 @@ function applyLocalOps(nodes: FlowNode[], edges: FlowEdge[], ops: MsOp[]): { nod
         es = es.filter((e) => e.id !== op.id)
         break
       }
+      case 'addRegion': {
+        if (rs.some((r) => r.id === op.id)) break
+        const bottom = rs.reduce((m, r) => Math.max(m, r.y + r.h), 0)
+        rs = [...rs, {
+          id: op.id ?? `r-ui-${Date.now().toString(36)}`,
+          label: op.label,
+          ...(op.kind ? { kind: op.kind } : {}),
+          x: op.x ?? 60,
+          y: op.y ?? (bottom === 0 ? 60 : bottom + 60),
+          w: op.w ?? 640,
+          h: op.h ?? 400,
+        }]
+        break
+      }
+      case 'updateRegion': {
+        rs = rs.map((r) => (r.id === op.id ? {
+          ...r,
+          ...(op.label !== undefined ? { label: op.label } : {}),
+          ...(op.kind !== undefined ? { kind: op.kind } : {}),
+          ...(op.x !== undefined ? { x: op.x } : {}),
+          ...(op.y !== undefined ? { y: op.y } : {}),
+          ...(op.w !== undefined ? { w: op.w } : {}),
+          ...(op.h !== undefined ? { h: op.h } : {}),
+        } : r))
+        break
+      }
+      case 'deleteRegion': {
+        rs = rs.filter((r) => r.id !== op.id)
+        break
+      }
+      case 'fitRegion':
+        // Geometry is computed server-side from node positions; the SSE echo
+        // reconciles it. No optimistic mirror (button click → echo is fast).
+        break
     }
   }
-  return { nodes: ns, edges: es }
+  return { nodes: ns, edges: es, regions: rs }
 }
 
 /** Deterministic free-slot placement mirroring the host's defaultSlot. */
@@ -326,7 +415,10 @@ function estimateDocHeight(id: string, cardW: number): number | null {
   return Math.max(minH, Math.min(cap, Math.round(raw)))
 }
 
-// ── Custom edge (bezier gradient) ────────────────────────────────────────
+// ── Custom edge (bezier gradient) ─────────────────────────────────────────
+// Edge `data.label` is still carried through the graph (semantics for
+// refresh / skill sync) but is intentionally NOT rendered — per product
+// decision, edge labels are removed from the canvas UI.
 function FlowEdgeView(props: EdgeProps) {
   const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, selected, style } = props
   const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
@@ -355,6 +447,122 @@ function FlowEdgeView(props: EdgeProps) {
 }
 
 const EDGE_TYPES = { flow: FlowEdgeView }
+
+// ── Region layer (partition containers, rendered inside the viewport) ─────
+// Hosted via <ViewportPortal>, which portals into the transformed
+// .react-flow__viewport — so region boxes pan and zoom with the canvas for
+// free. z-index 1 keeps them above the dot-grid background (0) and below
+// edges (2) / nodes (6). The layer itself is pointer-events: none; only the
+// title bar and resize handle opt back in (marked nopan/nodrag so xyflow's
+// pane never turns a region click into a canvas pan).
+function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange }: {
+  regions: SRegion[]
+  onFit: (id: string) => void
+  onDelete: (id: string) => void
+  /** Live drag feedback — local optimistic geometry update (no history). */
+  onResizeLocal: (id: string, w: number, h: number) => void
+  /** Drag end — commit the final geometry to the host. */
+  onResizeCommit: (id: string, w: number, h: number) => void
+  /** Drag start/end signal (used to pause SSE region reconciliation so a
+   *  concurrent agent op can't snap the box back mid-drag). */
+  onDragStateChange: (dragging: boolean) => void
+}) {
+  const flowStoreApi = useFlowStoreApi()
+  if (regions.length === 0) return null
+  return (
+    <ViewportPortal>
+      <div className="ms-region-layer" aria-hidden>
+        {regions.map((r) => (
+          <RegionBox
+            key={r.id}
+            region={r}
+            flowStoreApi={flowStoreApi}
+            onFit={onFit}
+            onDelete={onDelete}
+            onResizeLocal={onResizeLocal}
+            onResizeCommit={onResizeCommit}
+            onDragStateChange={onDragStateChange}
+          />
+        ))}
+      </div>
+    </ViewportPortal>
+  )
+}
+
+function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange }: {
+  region: SRegion
+  flowStoreApi: ReturnType<typeof useFlowStoreApi>
+  onFit: (id: string) => void
+  onDelete: (id: string) => void
+  onResizeLocal: (id: string, w: number, h: number) => void
+  onResizeCommit: (id: string, w: number, h: number) => void
+  onDragStateChange: (dragging: boolean) => void
+}) {
+  const onResizeStart = (e: React.PointerEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    onDragStateChange(true)
+    const startX = e.clientX
+    const startY = e.clientY
+    const startW = region.w
+    const startH = region.h
+    // Flow-space deltas: pointer deltas divided by the current zoom.
+    const zoom = flowStoreApi.getState().transform[2] || 1
+    let lastW = startW
+    let lastH = startH
+    const move = (ev: PointerEvent) => {
+      lastW = Math.max(120, Math.round(startW + (ev.clientX - startX) / zoom))
+      lastH = Math.max(96, Math.round(startH + (ev.clientY - startY) / zoom))
+      onResizeLocal(region.id, lastW, lastH)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      onDragStateChange(false)
+      onResizeCommit(region.id, lastW, lastH)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+
+  return (
+    <div
+      className="ms-region"
+      data-kind={region.kind ?? 'generic'}
+      style={{ left: region.x, top: region.y, width: region.w, height: region.h }}
+    >
+      <div className="ms-region-title nopan nodrag">
+        <span className="ms-region-label">{region.label}</span>
+        {region.kind && <span className="ms-region-kind">{region.kind}</span>}
+        <span className="ms-region-title-spacer" />
+        <button
+          type="button"
+          className="ms-region-btn"
+          title="贴合内容（自动包裹所有子节点）"
+          aria-label={`Fit region ${region.label} to content`}
+          onClick={(e) => { e.stopPropagation(); onFit(region.id) }}
+        >
+          <IconMaximize2 size={11} strokeWidth={2} />
+        </button>
+        <button
+          type="button"
+          className="ms-region-btn ms-region-btn-danger"
+          title="删除分区（不删除内部节点）"
+          aria-label={`Delete region ${region.label}`}
+          onClick={(e) => { e.stopPropagation(); onDelete(region.id) }}
+        >
+          <IconX size={11} strokeWidth={2.2} />
+        </button>
+      </div>
+      <div
+        className="ms-region-resize nopan nodrag"
+        title="拖动调整分区大小"
+        aria-hidden
+        onPointerDown={onResizeStart}
+      />
+    </div>
+  )
+}
 
 // ── SSE subscription ─────────────────────────────────────────────────────
 
@@ -397,6 +605,13 @@ function CanvasView({ canvasId }: CanvasProps) {
   nodesRef.current = nodes
   const edgesRef = useRef(edges)
   edgesRef.current = edges
+
+  // Regions are host-authoritative but rendered + edited locally (optimistic
+  // resize drag), then reconciled from SSE snapshots. The ref lets
+  // non-render callbacks (clear-canvas) read the latest set.
+  const [regions, setRegions] = useState<SRegion[]>([])
+  const regionsRef = useRef(regions)
+  regionsRef.current = regions
 
   const interactingRef = useRef(false)
   const restoringRef = useRef(false)
@@ -532,15 +747,16 @@ function CanvasView({ canvasId }: CanvasProps) {
     return id
   }, [])
 
-  /** Optimistic mutation + history snapshot + host commit (UI's one funnel). */
+  /** Optimistic mutation + undo snapshot + host commit (UI's one funnel). */
   const mutate = useCallback((ops: MsOp[], then?: () => void) => {
     if (ops.length === 0) { then?.(); return }
     previewingRef.current = false // user is editing → leave playback preview
     const cur = appliedRef.current
     if (cur) queueHistory(cur)
-    const next = applyLocalOps(nodesRef.current, edgesRef.current, ops)
+    const next = applyLocalOps(nodesRef.current, edgesRef.current, regionsRef.current, ops)
     setNodes(next.nodes)
     setEdges(next.edges)
+    setRegions(next.regions)
     postLocal(ops)
     then?.()
   }, [postLocal, queueHistory])
@@ -555,6 +771,7 @@ function CanvasView({ canvasId }: CanvasProps) {
       appliedRef.current = msSnapshotOf(snap.graph, snap.version)
       setNodes(projectNodes(snap.graph))
       setEdges(projectEdges(snap.graph))
+      setRegions(projectRegions(snap.graph))
       return
     }
     const prev = appliedRef.current
@@ -566,11 +783,6 @@ function CanvasView({ canvasId }: CanvasProps) {
     if (!isFirst && prev.version === snap.version) return
     const nextSnap = msSnapshotOf(snap.graph, snap.version)
     appliedRef.current = nextSnap
-    // Revision bus (M3b): record every accepted version for the history
-    // dropdown even while a playback preview is on screen. `nextSnap` is a
-    // fresh object never mutated afterwards — the bus stores it as-is
-    // (no second deep clone; deep clones on every patch were a jank source).
-    recordRevision(canvasId, nextSnap)
     if (previewingRef.current) return // playback owns the screen for now
 
     if (!isFirst) queueHistory(prev)
@@ -579,6 +791,9 @@ function CanvasView({ canvasId }: CanvasProps) {
     // whole canvas no longer remounts on every version tick.
     setNodes((cur) => mergeNodes(cur, snap.graph, nodeTokenCacheRef.current))
     setEdges((cur) => mergeEdges(cur, snap.graph.edges))
+    if (!draggingRegionRef.current) {
+      setRegions((cur) => mergeRegions(cur, snap.graph.regions ?? []))
+    }
 
     // Structural change → softly frame the new content. Purely data-level
     // updates (status toggles while media streams in) keep the camera put.
@@ -586,6 +801,8 @@ function CanvasView({ canvasId }: CanvasProps) {
       snap.graph.nodes.map((n) => `${n.id}@${n.position?.x ?? 0},${n.position?.y ?? 0}`).sort().join('|')
       + '#'
       + snap.graph.edges.map((e) => `${e.source}->${e.target}`).sort().join('|')
+      + '#'
+      + (snap.graph.regions ?? []).map((r) => `${r.id}:${r.x},${r.y},${r.w},${r.h}`).sort().join('|')
     if (snap.version !== lastPanTargetRef.current || structToken !== lastFitStructRef.current) {
       lastPanTargetRef.current = snap.version
       lastFitStructRef.current = structToken
@@ -602,30 +819,6 @@ function CanvasView({ canvasId }: CanvasProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap])
-
-  // Revision-bus controller (M3b): the top-bar version badge plays history by
-  // previewing a recorded snapshot locally (SSE echo is suppressed while a
-  // preview is on screen); calling with null exits back to the live canvas.
-  useEffect(() => {
-    setController(canvasId, (snapOrNull) => {
-      previewingRef.current = !!snapOrNull
-      if (snapOrNull) {
-        setNodes(projectNodes(snapOrNull.graph))
-        setEdges(projectEdges(snapOrNull.graph))
-      } else {
-        const latest = latestRevision(canvasId)
-        if (latest) {
-          setNodes(projectNodes(latest.snap.graph))
-          setEdges(projectEdges(latest.snap.graph))
-        }
-      }
-    })
-    return () => {
-      setController(canvasId, null)
-      previewingRef.current = false
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvasId])
 
   // Initial fit on the first non-empty snapshot (skipped when a remembered
   // viewport is being restored).
@@ -719,6 +912,7 @@ function CanvasView({ canvasId }: CanvasProps) {
     restoringRef.current = true
     setNodes(projectNodes(target.graph))
     setEdges(projectEdges(target.graph))
+    setRegions(projectRegions(target.graph))
     postLocal(restoreOps(target))
     lastLocalPostRef.current = Date.now()
   }, [postLocal])
@@ -732,6 +926,7 @@ function CanvasView({ canvasId }: CanvasProps) {
     restoringRef.current = true
     setNodes(projectNodes(target.graph))
     setEdges(projectEdges(target.graph))
+    setRegions(projectRegions(target.graph))
     postLocal(restoreOps(target))
     lastLocalPostRef.current = Date.now()
   }, [postLocal])
@@ -894,6 +1089,45 @@ function CanvasView({ canvasId }: CanvasProps) {
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutate, nextId, rf])
+
+  // ── Region interactions ─────────────────────────────────────────────────
+  const onToolbarAddRegion = useCallback(() => {
+    const id = nextId('region')
+    mutate([{ op: 'addRegion', label: '新分区', id }])
+    const bottom = regionsRef.current.reduce((m, r) => Math.max(m, r.y + r.h), 0)
+    requestAnimationFrame(() => {
+      try { rf.setCenter(60 + 320, (bottom === 0 ? 60 : bottom + 60) + 200, { zoom: 1, duration: 220 }) } catch { /* ignore */ }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mutate, nextId, rf])
+
+  const fitRegionBox = useCallback((id: string) => {
+    mutate([{ op: 'fitRegion', id }])
+  }, [mutate])
+
+  const deleteRegionBox = useCallback((id: string) => {
+    mutate([{ op: 'deleteRegion', id }])
+  }, [mutate])
+
+  // Live drag feedback: optimistic local geometry only (no history churn).
+  const resizeRegionLocal = useCallback((id: string, w: number, h: number) => {
+    setRegions((cur) => cur.map((r) => (r.id === id ? { ...r, w, h } : r)))
+  }, [])
+
+  // While a resize drag is live, pause SSE region reconciliation so a
+  // concurrent agent op (echoing the pre-drag geometry) can't snap the box
+  // back under the cursor. The post-drag echo reconciles everything.
+  const draggingRegionRef = useRef(false)
+  const setRegionDragging = useCallback((dragging: boolean) => {
+    draggingRegionRef.current = dragging
+  }, [])
+
+  // Drag end: commit the final geometry through mutate() — one host op, one
+  // history entry (undo returns the box to its pre-drag size). SSE echo
+  // reconciles with token-equal geometry, keeping the local object identity.
+  const resizeRegionCommit = useCallback((id: string, w: number, h: number) => {
+    mutate([{ op: 'updateRegion', id, w, h }])
+  }, [mutate])
 
   // Auto-arrange: columns by edge depth (view-bar wand). Also
   // auto-wraps text/note cards to their content (capped) before layout, so
@@ -1064,15 +1298,18 @@ function CanvasView({ canvasId }: CanvasProps) {
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
   const doClearCanvas = useCallback(() => {
     previewingRef.current = false
-    if (nodesRef.current.length === 0) return
+    if (nodesRef.current.length === 0 && regionsRef.current.length === 0) return
     const cur = appliedRef.current
     if (cur) queueHistory(cur)
-    // Local-optimistic clear — no history push on the SSE ack so we don't
+    // Local-optimistic clear — no undo push on the SSE ack so we don't
     // double-record the empty state. SSE will reconcile anyway.
     setNodes([])
     setEdges([])
     appliedRef.current = null
-    postLocal(nodesRef.current.map((n) => ({ op: 'deleteNode' as const, id: n.id })))
+    postLocal([
+      ...regionsRef.current.map((r) => ({ op: 'deleteRegion' as const, id: r.id })),
+      ...nodesRef.current.map((n) => ({ op: 'deleteNode' as const, id: n.id })),
+    ])
   }, [queueHistory, postLocal])
 
   return (
@@ -1127,14 +1364,21 @@ function CanvasView({ canvasId }: CanvasProps) {
           >
             <Background
               variant={BackgroundVariant.Dots}
-              gap={22}
-              size={1.4}
-              color="rgba(165,180,215,0.62)"
+              gap={20}
+              size={1.8}
+            />
+            <RegionLayer
+              regions={regions}
+              onFit={fitRegionBox}
+              onDelete={deleteRegionBox}
+              onResizeLocal={resizeRegionLocal}
+              onResizeCommit={resizeRegionCommit}
+              onDragStateChange={setRegionDragging}
             />
             <MiniMapWrap />
           </ReactFlow>
 
-          {nodes.length === 0 && <EmptyHint conn={conn} />}
+          {nodes.length === 0 && regions.length === 0 && <EmptyHint conn={conn} />}
 
           {/* Vertical "add a node" capsule dock — left-middle of the canvas. */}
           <div className="ms-fab-dock" role="toolbar" aria-label="Add a node">
@@ -1154,6 +1398,18 @@ function CanvasView({ canvasId }: CanvasProps) {
                 </button>
               )
             })}
+            <button
+              type="button"
+              className="ms-fab-dock-btn ms-fab-dock-region"
+              onClick={onToolbarAddRegion}
+              title="新增分区（容器盒，节点可拖入）"
+              aria-label="Add a region"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
+                <rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.5" />
+                <path d="M4.5 1.75v3.75M11.5 1.75v3.75M4.5 14.25v-3.75M11.5 14.25v-3.75" />
+              </svg>
+            </button>
           </div>
 
           {menu && <CreateMenu menu={menu} onClose={dismissMenu} onPick={onPickCreate} />}
@@ -1171,12 +1427,12 @@ function CanvasView({ canvasId }: CanvasProps) {
                 className="ms-clear-confirm-dialog"
                 role="alertdialog"
                 aria-modal="true"
-                aria-label="Clear canvas"
+                aria-label="清空画布"
                 onClick={(e) => e.stopPropagation()}
               >
-                <div className="ms-clear-confirm-title">Clear canvas?</div>
+                <div className="ms-clear-confirm-title">确定清空画布？</div>
                 <div className="ms-clear-confirm-body">
-                  This will delete all nodes and edges. This action cannot be undone.
+                  此操作将删除所有节点和连线，且无法撤销。
                 </div>
                 <div className="ms-clear-confirm-actions">
                   <button
@@ -1184,7 +1440,7 @@ function CanvasView({ canvasId }: CanvasProps) {
                     className="ms-btn-cancel"
                     onClick={() => setClearConfirmOpen(false)}
                   >
-                    Cancel
+                    取消
                   </button>
                   <button
                     type="button"
@@ -1194,7 +1450,7 @@ function CanvasView({ canvasId }: CanvasProps) {
                       doClearCanvas()
                     }}
                   >
-                    Clear all
+                    全部清空
                   </button>
                 </div>
               </div>
@@ -1289,7 +1545,7 @@ function SaveToLibraryDialog({ canvasId, node, onClose }: {
   }
 
   return createPortal(
-    <div className="ms-menu-backdrop" onClick={onClose}>
+    <div className="ms-menu-backdrop is-modal" onClick={onClose}>
       <div className="ms-pb-dialog" role="dialog" aria-modal="true" aria-label={t('save.title')} onClick={(e) => e.stopPropagation()}>
         <div className="ms-pb-dialog-head">
           <span>{t('save.title')}</span>
@@ -1335,15 +1591,15 @@ function EmptyHint({ conn }: { conn: ConnState }) {
     <div className="ms-empty">
       {conn === 'open' ? (
         <>
-          <div className="ms-empty-title">Canvas is empty</div>
+          <div className="ms-empty-title">画布为空</div>
           <div className="ms-empty-sub">
-            Double-click or right-click anywhere to drop a node — or let the agent start the pipeline.
+            双击或右键任意位置添加节点，或让 agent 启动创作流程。
           </div>
         </>
       ) : conn === 'reconnecting' ? (
-        <div className="ms-empty-title">Lost the stream — retrying…</div>
+        <div className="ms-empty-title">连接中断，正在重连…</div>
       ) : (
-        <div className="ms-empty-title">Connecting to canvas…</div>
+        <div className="ms-empty-title">正在连接画布…</div>
       )}
     </div>
   )
@@ -1359,15 +1615,46 @@ function CreateMenu({ menu, onClose, onPick }: {
   const isConnect = menu.kind === 'connect'
   const left = Math.max(8, Math.min(menu.x, window.innerWidth - 240))
   const top = Math.max(8, Math.min(menu.y, window.innerHeight - 330))
+  const menuRef = useRef<HTMLDivElement | null>(null)
   // Portal to <body>: the canvas host carries `contain: layout style` and can
   // live inside transformed/containing sidebar shells, both of which hijack
   // `position: fixed` descendants (the popup would be laid out from the
   // canvas origin while `left/top` are viewport coordinates → way off the
-  // "+"/cursor). On <body> fixed is truly viewport-relative. The backdrop is
-  // the token host for the popup's colors, so it matches the DSH theme.
+  // "+"/cursor). On <body> fixed is truly viewport-relative.
+  //
+  // Outside-click to dismiss is handled by a window-level pointerdown listener
+  // rather than a backdrop <div onClick>: a full-viewport backdrop would have
+  // to sit above the top bar (z-index 900) to swallow clicks on the canvas
+  // pane, which made it eat clicks meant for the top bar's "项目" button,
+  // the "download canvas" icon, etc. — leaving users with the impression the
+  // canvas was blocking UI. With pointer-events: none on the backdrop, the
+  // top bar stays clickable; this listener closes the menu only when the
+  // pointer lands outside the popup AND outside the canvas pane (so right-
+  // click / double-click on the pane reopens it without flicker).
+  useEffect(() => {
+    const onPointerDown = (ev: PointerEvent) => {
+      const t = ev.target as Node | null
+      if (!t) return
+      const menuEl = menuRef.current
+      if (menuEl && menuEl.contains(t)) return
+      const pane = document.querySelector('.react-flow__pane')
+      if (pane && pane.contains(t)) return
+      onClose()
+    }
+    // Defer one frame so the same pointerdown that opened the menu doesn't
+    // immediately close it again.
+    const id = window.setTimeout(() => {
+      window.addEventListener('pointerdown', onPointerDown, true)
+    }, 0)
+    return () => {
+      window.clearTimeout(id)
+      window.removeEventListener('pointerdown', onPointerDown, true)
+    }
+  }, [onClose])
   return createPortal(
-    <div className="ms-menu-backdrop" onClick={onClose}>
+    <div className="ms-menu-backdrop">
       <div
+        ref={menuRef}
         className="ms-connect-menu"
         style={{ left, top }}
         role="menu"
@@ -1375,7 +1662,7 @@ function CreateMenu({ menu, onClose, onPick }: {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="ms-connect-menu-section">
-          {isConnect ? 'Add a connected node' : 'Add a node'}
+          {isConnect ? '添加关联节点' : '添加节点'}
         </div>
         {CREATE_ORDER.map((kind) => {
           const meta = NODE_CATALOG.find((m) => m.type === kind)!
@@ -1413,6 +1700,8 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
   onClearCanvas: () => void
 }) {
   const rf = useReactFlow()
+  const lang = resolveLang()
+  const t = (key: string, vars?: Record<string, string | number>) => translate(lang, key, vars)
   const doFit = () => { try { rf.fitView({ padding: 0.18, duration: 260 }) } catch { /* ignore */ } }
 
   return (
@@ -1421,8 +1710,8 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
         type="button"
         className="ms-view-bar-btn"
         onClick={autoArrange}
-        title="Auto-arrange nodes by flow"
-        aria-label="Auto-arrange nodes by flow"
+        title={t('view.autoArrange')}
+        aria-label={t('view.autoArrange')}
       >
         <IconWand size={15} strokeWidth={1.8} />
       </button>
@@ -1430,12 +1719,12 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
         type="button"
         className={`ms-view-bar-btn ${minimapOn ? 'is-active' : ''}`}
         onClick={onToggleMinimap}
-        title={minimapOn ? 'Hide minimap' : 'Show minimap'}
+        title={minimapOn ? t('view.minimap.hide') : t('view.minimap.show')}
         aria-pressed={minimapOn}
       >
         <IconMap size={15} strokeWidth={1.8} />
       </button>
-      <button type="button" className="ms-view-bar-btn" onClick={doFit} title="Fit to content">
+      <button type="button" className="ms-view-bar-btn" onClick={doFit} title={t('view.fit')}>
         <IconMaximize2 size={14} strokeWidth={1.8} />
       </button>
       <span className="ms-view-bar-divider" aria-hidden />
@@ -1445,8 +1734,8 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
         type="button"
         className="ms-view-bar-btn"
         onClick={onClearCanvas}
-        title="Clear canvas"
-        aria-label="Clear canvas"
+        title={t('view.clear')}
+        aria-label={t('view.clear')}
       >
         <IconEraser size={14} strokeWidth={1.8} />
       </button>

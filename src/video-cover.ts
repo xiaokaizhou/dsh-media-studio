@@ -33,6 +33,7 @@ import { spawn } from 'node:child_process'
 import { mkdir, writeFile, unlink, rename } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { getMediaStudioHandles, log } from './service-state'
 
 const FFMPEG = (): string => process.env.FFMPEG_PATH || 'ffmpeg'
 
@@ -51,7 +52,7 @@ async function probeFfmpeg(): Promise<boolean> {
     ffmpegProbed = { binary, ok: true }
   } catch {
     ffmpegProbed = { binary, ok: false }
-    console.warn('[media-studio] ffmpeg not available — video cards will fall back to <video preload="metadata">')
+    log.warn('[media-studio] ffmpeg not available — video cards will fall back to <video preload="metadata">')
   }
   return ffmpegProbed.ok
 }
@@ -142,7 +143,7 @@ export async function prepareVideoForCanvas(
   try {
     await downloadTo(videoUrl, localVideo)
   } catch (e) {
-    console.warn(`[media-studio] video-cover: download failed (${(e as Error).message}); keeping original URL`)
+    log.warn(`[media-studio] video-cover: download failed (${(e as Error).message}); keeping original URL`)
     return { url: videoUrl, poster: null }
   }
 
@@ -177,7 +178,7 @@ export async function prepareVideoForCanvas(
       // Clean partials; we'll try extract below.
       await unlink(coverTmp).catch(() => {})
       await unlink(outTmp).catch(() => {})
-      console.warn(`[media-studio] video-cover: embed failed (${(e as Error).message}); falling back to extract`)
+      log.warn(`[media-studio] video-cover: embed failed (${(e as Error).message}); falling back to extract`)
     }
   }
 
@@ -196,7 +197,7 @@ export async function prepareVideoForCanvas(
       return { url: localVideo, poster: thumb }
     } catch (e) {
       await unlink(thumb).catch(() => {})
-      console.warn(`[media-studio] video-cover: extract failed (${(e as Error).message}); poster disabled`)
+      log.warn(`[media-studio] video-cover: extract failed (${(e as Error).message}); poster disabled`)
     }
   }
 

@@ -22,14 +22,16 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "dev": "node scripts/dev-watch.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepare": "tsdown && bash scripts/setup-preset.sh",
-    "typecheck:client": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --jsx react-jsx --lib ES2022,DOM,DOM.Iterable --strict --skipLibCheck src/client/canvas.tsx src/client/nodes.tsx src/client/canvas-api.ts src/client/icons.tsx src/client/lightbox.tsx src/client/canvas-styles.ts src/client/project-bar.tsx src/client/projects-api.ts src/client/i18n.ts src/client/assets-api.ts src/client/asset-panel.tsx src/client/http-shared.ts src/client/use-i18n-hook.ts src/client/global-search.tsx src/client/search-api.ts"
+    "typecheck:client": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --jsx react-jsx --lib ES2022,DOM,DOM.Iterable --strict --skipLibCheck src/client/canvas.tsx src/client/nodes.tsx src/client/canvas-api.ts src/client/icons.tsx src/client/lightbox.tsx src/client/canvas-styles.ts src/client/project-bar.tsx src/client/projects-api.ts src/client/i18n.ts src/client/assets-api.ts src/client/asset-panel.tsx src/client/http-shared.ts src/client/use-i18n-hook.ts src/client/global-search.tsx src/client/search-api.ts src/client/sidebar-focus-listener.tsx"
   },
   "dependencies": {
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0",
     "@xyflow/react": "^12.4.0",
+    "html-to-image": "^1.11.13",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tsdown": "^0.22.14",
