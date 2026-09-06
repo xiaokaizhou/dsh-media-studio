@@ -285,6 +285,99 @@ describe('media-studio HTTP endpoints — canvas surface (after multimodal refac
     const refused = await get(projectDir + '-evil/secret.mp4')
     expect(refused.status).toBe(403)
   })
+
+  it('media-file render-fallback serves llm-multimodal temp outputs but the migration probe keeps denying them', async () => {
+    // Regression: dsh-llm-multimodal writes generated media to
+    // /tmp/llm-multimodal-<kind>-<timestamp>.<ext>. The HTTP handler must
+    // still render those cards (fallback), while resolveMediaTarget — the
+    // migration probe — must keep treating them as inaccessible so the
+    // canvas patch post-process copies them into the project asset
+    // directory instead of leaving them in /tmp.
+    const { resolveMediaTarget } = await import('../src/routes')
+    const wsDir = join(tmpdir(), 'media-studio-ws-' + Date.now())
+    const tmpFile = `/tmp/llm-multimodal-${Date.now()}.png`
+    await writeFile(tmpFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]))
+
+    setMediaStudioHandles({
+      workspaceRoot: wsDir,
+      defaultCanvasId: 'main',
+      canvasStore: new (await import('../src/canvas-store')).CanvasStore(wsDir),
+      sseClients: new Set(),
+    })
+
+    // Probe (migration) view: /tmp is NOT a persistent root → must deny,
+    // regardless of whether the filename carries a timestamp or a label.
+    expect(resolveMediaTarget(tmpFile, wsDir).ok).toBe(false)
+    expect(resolveMediaTarget(`/tmp/llm-multimodal-tts-${Date.now()}.mp3`, wsDir).ok).toBe(false)
+    expect(resolveMediaTarget('/tmp/llm-multimodal-i2v-fixed.mp4', wsDir).ok).toBe(false)
+    expect(resolveMediaTarget('/tmp/llm-multimodal-keyframe.mp4', wsDir).ok).toBe(false)
+
+    // HTTP render view: trusted temp outputs are served — both timestamped
+    // and descriptively named (E2E harnesses / callers pick labels).
+    const r = await new Promise<{ status: number; bytes: number }>((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port: testServer.port,
+        path: '/api/media-studio/media-file?path=' + encodeURIComponent(tmpFile),
+        method: 'GET',
+      }, (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, bytes: Buffer.concat(chunks).length }))
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    expect(r.status).toBe(200)
+    expect(r.bytes).toBe(9)
+
+    // Descriptively named outputs (the regression that prompted the regex
+    // relaxation) must also render.
+    for (const labeled of ['/tmp/llm-multimodal-i2v-fixed.mp4', '/tmp/llm-multimodal-keyframe.mp4', '/tmp/llm-multimodal-secret.png']) {
+      const rr = await new Promise<{ status: number }>((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port: testServer.port,
+          path: '/api/media-studio/media-file?path=' + encodeURIComponent(labeled),
+          method: 'GET',
+        }, (res) => {
+          res.resume()
+          res.on('end', () => resolve({ status: res.statusCode ?? 0 }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      // File may or may not exist on disk in this test environment; what
+      // matters is that the allow-list gate let it through (NOT 403).
+      expect(rr.status).not.toBe(403)
+    }
+
+    // Actual attacks must still be refused at the handler — wrong prefix,
+    // path-traversal, subdirs, missing extension, and /private/tmp variant.
+    for (const bad of [
+      '/tmp/other-' + Date.now() + '.png',
+      '/tmp/llm-multimodal-../../etc/passwd',
+      '/tmp/llm-multimodal-' + Date.now() + '.png/..%2f..%2fetc',
+      '/tmp/llm-multimodal-sub/dir.mp4',
+      '/tmp/llm-multimodal-' + Date.now(),
+      '/private/tmp/llm-multimodal-' + Date.now() + '.png',
+    ]) {
+      const rr = await new Promise<{ status: number }>((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port: testServer.port,
+          path: '/api/media-studio/media-file?path=' + encodeURIComponent(bad),
+          method: 'GET',
+        }, (res) => {
+          res.resume()
+          res.on('end', () => resolve({ status: res.statusCode ?? 0 }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      expect(rr.status).toBe(403)
+    }
+  })
 })
 
 /**
@@ -369,6 +462,65 @@ describe('canvas_refresh_node delegates to dsh-llm-multimodal', () => {
       const img = snap.graph.nodes.find((n) => n.id === 'i9')
       expect(img?.data.status).toBe('done')
       expect(img?.data.resultUrl).toBe('file:///tmp/refreshed.png')
+    } finally {
+      testServer.close()
+    }
+  })
+
+  it('music nodes dispatch to generate_tts when data.dub is true, else generate_music', async () => {
+    // dsh-llm-multimodal separates TTS from music models: dialogue /
+    // voice-over music nodes (data.dub === true) must be refreshed through
+    // generate_tts (TTS model), BGM / sound-effect nodes through
+    // generate_music (music model) — and the voice-clone seed fields are
+    // carried through for per-character dubbing.
+    const exec = vi.fn(async (input: { name: string; arguments: unknown; signal: AbortSignal }) => {
+      if (input.name === 'generate_tts' || input.name === 'generate_music') {
+        return { value: { success: true, url: 'file:///tmp/refreshed-audio.mp3', model: 'x' } }
+      }
+      return { value: { success: false, message: 'unexpected tool: ' + input.name } }
+    })
+    const testServer = await startTestServer(exec as never)
+
+    try {
+      const { getMediaStudioHandles } = await import('../src/service-state')
+      const store = getMediaStudioHandles().canvasStore
+      store.apply('main', [
+        { op: 'addNode', type: 'text', label: 'dub-script', nodeId: 't1', data: { text: '三年了，苏家欠我的。' } },
+        { op: 'addNode', type: 'music', label: 'dub', nodeId: 'm1', data: { dub: true, voice: 'v1', voice_name: '沈渊' } },
+        { op: 'connect', from: 't1', to: 'm1' },
+        { op: 'addNode', type: 'text', label: 'bgm-brief', nodeId: 't2', data: { text: '紧张悬疑的弦乐' } },
+        { op: 'addNode', type: 'music', label: 'bgm', nodeId: 'm2', data: {} },
+        { op: 'connect', from: 't2', to: 'm2' },
+      ])
+
+      // Dub node → generate_tts with voice + voice_name (clone seed).
+      const r1 = await httpReq(testServer.port, '/api/media-studio/canvas/refresh', 'POST', {
+        canvasId: 'main', nodeId: 'm1',
+      })
+      expect(r1.status).toBe(200)
+      const j1 = JSON.parse(r1.body)
+      expect(j1.ok).toBe(true)
+      const dubCall = (exec.mock.calls.at(-1) as unknown as unknown[])[0] as { name: string; arguments: { text?: string; voice?: string; voice_name?: string } }
+      expect(dubCall.name).toBe('generate_tts')
+      expect(dubCall.arguments.text).toContain('三年了')
+      expect(dubCall.arguments.voice).toBe('v1')
+      expect(dubCall.arguments.voice_name).toBe('沈渊')
+
+      // BGM node → generate_music; no dub fields leaked into the args.
+      const r2 = await httpReq(testServer.port, '/api/media-studio/canvas/refresh', 'POST', {
+        canvasId: 'main', nodeId: 'm2',
+      })
+      expect(r2.status).toBe(200)
+      const j2 = JSON.parse(r2.body)
+      expect(j2.ok).toBe(true)
+      const bgmCall = (exec.mock.calls.at(-1) as unknown as unknown[])[0] as { name: string; arguments: { text?: string; voice_name?: string } }
+      expect(bgmCall.name).toBe('generate_music')
+      expect(bgmCall.arguments.text).toContain('紧张悬疑')
+      expect(bgmCall.arguments.voice_name).toBeUndefined()
+
+      const snap = store.snapshot('main')
+      expect(snap.graph.nodes.find((n) => n.id === 'm1')?.data.status).toBe('done')
+      expect(snap.graph.nodes.find((n) => n.id === 'm2')?.data.status).toBe('done')
     } finally {
       testServer.close()
     }

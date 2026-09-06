@@ -23,7 +23,7 @@
  */
 
 import { readFile, writeFile, mkdir, copyFile, rm, stat } from 'node:fs/promises'
-import { join, dirname, extname } from 'node:path'
+import { join, dirname, extname, basename, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import type { CanvasStore, CanvasOp } from './canvas-store'
 import { resolveMediaTarget } from './routes'
@@ -179,12 +179,19 @@ export function assetExtFor(raw: string | undefined, kind: AssetKind): string {
 }
 
 /** Decode a media source to bytes. Returns null when unresolvable / out of
- *  the allow-list (`roots` = workspaceRoot + mediaRoots). */
+ *  the allow-list (`roots` = workspaceRoot + mediaRoots). `projectRoots`
+ *  (canvasId → sourcePath) is forwarded to the media-file proxy resolver so
+ *  `projects/<id>/assets/…` URLs whose bytes live inside a user-owned project
+ *  directory resolve to that directory instead of the workspace layout.
+ *  `localPath` (when set) is the absolute on-disk file the bytes came from —
+ *  callers use it to detect "already inside the library directory" and
+ *  register in place instead of copying a duplicate. */
 export async function readSourceBytes(
   wsRoot: string,
   roots: string[],
   raw: string,
-): Promise<{ bytes: Buffer; ext: string } | null> {
+  projectRoots: Record<string, string> = {},
+): Promise<{ bytes: Buffer; ext: string; localPath?: string } | null> {
   const src = raw.trim()
   if (!src) return null
   if (src.startsWith('data:')) {
@@ -217,14 +224,14 @@ export async function readSourceBytes(
   if (target.startsWith('file://')) target = target.slice('file://'.length)
   const proxy = /^\/api\/media-studio\/media-file\?path=([^&]+)/i.exec(target)
   if (proxy) target = decodeURIComponent(proxy[1])
-  const resolved = resolveMediaTarget(target, wsRoot, roots)
+  const resolved = resolveMediaTarget(target, wsRoot, roots, projectRoots)
   if (!resolved.ok) return null
   try {
     const st = await stat(resolved.target)
     if (!st.isFile()) return null
     const bytes = await readFile(resolved.target)
     if (bytes.length === 0) return null
-    return { bytes, ext: extname(resolved.target).replace(/^\./, '').toLowerCase() }
+    return { bytes, ext: extname(resolved.target).replace(/^\./, '').toLowerCase(), localPath: resolved.target }
   } catch {
     return null
   }
@@ -264,14 +271,24 @@ export async function registerCanvasAsset(input: RegisterInput): Promise<{ asset
   )
   if (existing) return { asset: existing, created: false }
 
-  const read = await readSourceBytes(input.wsRoot, input.roots, raw)
+  const read = await readSourceBytes(input.wsRoot, input.roots, raw, input.canvasStore.allSourcePaths())
   if (!read) throw new Error('register: source media could not be read (unresolvable path/URL or out of workspace scope)')
-  const ext = read.ext || assetExtFor(raw, input.kind)
-  const id = newAssetId()
-  const file = newAssetFileName(id, ext)
+
   const catDir = join(root, ASSET_CATEGORY_DIR[input.kind])
-  await mkdir(catDir, { recursive: true })
-  await writeFile(join(catDir, file), read.bytes)
+  const id = newAssetId()
+  // When the node's media file already lives inside this kind's library
+  // directory (e.g. a refresh/prepare step that wrote straight into
+  // <sourcePath>/assets/clips/ or wsRoot/projects/<id>/assets/…), register it
+  // in place instead of copying a duplicate — the bytes are already where the
+  // library expects them, only the index entry is missing.
+  const alreadyInLibrary = !!read.localPath && resolve(dirname(read.localPath)) === resolve(catDir)
+  const file = alreadyInLibrary
+    ? basename(read.localPath!)
+    : newAssetFileName(id, read.ext || assetExtFor(raw, input.kind))
+  if (!alreadyInLibrary) {
+    await mkdir(catDir, { recursive: true })
+    await writeFile(join(catDir, file), read.bytes)
+  }
 
   const now = new Date().toISOString()
   const label = (input.name?.trim() || node.label || '').trim().slice(0, 64) || `${input.kind}-${id.slice(2, 6)}`
@@ -512,7 +529,7 @@ export async function syncAssetFromCanvas(
   if (!node) throw new Error('syncAsset: source canvas node no longer exists')
   const raw = (node.data as { resultUrl?: unknown }).resultUrl
   if (typeof raw !== 'string' || !raw) throw new Error('syncAsset: source node has no resultUrl')
-  const read = await readSourceBytes(wsRoot, roots, raw)
+  const read = await readSourceBytes(wsRoot, roots, raw, canvasStore.allSourcePaths())
   if (!read) throw new Error('syncAsset: source media could not be read')
 
   const existingFile = join(root, ASSET_CATEGORY_DIR[a.kind], a.file)

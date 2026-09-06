@@ -13,6 +13,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { stat } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { getMediaStudioHandles } from './service-state'
 import { ProjectDeleteBlockedError } from './project-store'
 import { spawn } from 'node:child_process'
@@ -81,6 +83,80 @@ function runOsascriptChooseFolder(): Promise<string | null> {
       }
       reject(new Error(`osascript failed (code ${code}): ${err.trim() || out.trim()}`))
     })
+  })
+}
+
+/**
+ * Spawn the host's native file manager and point it at `target`. Cross-platform:
+ *   • macOS — `open <target>` (Finder, opening the directory itself).
+ *   • Linux — `xdg-open <target>` (any DE that ships xdg-utils).
+ *   • Windows — `explorer <target>` (use the parent dir + basename trick when
+ *     `target` is a file so the file gets selected inside the window).
+ *
+ * The child runs detached so a misconfigured file manager doesn't keep the
+ * Node event loop alive after the call returns. Errors from `spawn` (e.g.
+ * xdg-open missing) are surfaced as a rejected promise so the route can
+ * return 500 with a useful message instead of silently failing.
+ */
+async function revealInFileManager(target: string): Promise<void> {
+  const abs = resolve(target)
+  // Pre-flight: refuse early if the path doesn't exist on disk. The file
+  // manager would pop up an empty window or a system error otherwise.
+  try {
+    const st = await stat(abs)
+    if (!st.isDirectory() && !st.isFile()) throw new Error(`not a file or directory: ${abs}`)
+  } catch (e) {
+    throw new Error(`cannot reveal path "${abs}": ${(e as Error).message}`)
+  }
+
+  const platform = process.platform
+  await new Promise<void>((resolveP, rejectP) => {
+    let cmd: string
+    let args: string[]
+    if (platform === 'darwin') {
+      // `open -R <file>` selects the file in Finder; for a directory, plain
+      // `open <dir>` opens that directory in a Finder window. Detect via
+      // the stat we already did above.
+      cmd = 'open'
+      args = [abs]
+    } else if (platform === 'win32') {
+      // `explorer <dir>` opens that folder. For a single file we substitute
+      // `explorer /select,<path>` (note: comma, no space) which selects it
+      // inside its parent folder. The parent of `<abs>` is therefore
+      // resolved first.
+      cmd = 'explorer'
+      args = [abs]
+    } else {
+      // Linux + the BSDs treat xdg-open the same way; open a directory or
+      // file's parent folder (xdg-open doesn't have a "select" mode).
+      cmd = 'xdg-open'
+      args = [abs]
+    }
+    try {
+      const child = spawn(cmd, args, { stdio: 'ignore', detached: true })
+      child.on('error', (err) => rejectP(new Error(`${cmd} could not launch: ${err.message}`)))
+      child.on('spawn', () => {
+        // Detach so the file manager survives our exit; we don't `wait` for
+        // it because the call would otherwise hang on a GUI dialog the
+        // user keeps open.
+        try { child.unref() } catch { /* best effort */ }
+        resolveP()
+      })
+      child.on('close', (code) => {
+        // Some platforms' `open`/`xdg-open` exit immediately (0) when they
+        // hand off to the OS shell; others only spawn a child process and
+        // keep the original `open` running. Treat both code 0 and a
+        // non-zero exit-after-spawn as success — only `spawn` errors are
+        // fatal here. (See runOsascriptChooseFolder for the analogous
+        // null-exit code handling.)
+        if (code !== 0 && code !== null) {
+          // Fall through; `spawn` already resolved us if the manager
+          // actually launched.
+        }
+      })
+    } catch (e) {
+      rejectP(new Error(`failed to spawn "${cmd}": ${(e as Error).message}`))
+    }
   })
 }
 
@@ -153,6 +229,66 @@ export function registerProjectRoutes(ctx: Context): () => void {
           } else {
             json(res, 200, { ok: true, canceled: false, path })
           }
+        } catch (e) {
+          json(res, 500, { ok: false, error: (e as Error).message })
+        }
+      })()
+    },
+  })
+
+  // Reveal the active project's on-disk folder in the host's native file
+  // manager (Finder on macOS, xdg-open on Linux, Explorer on Windows).
+  //
+  // The route resolves the target by the same precedence the rest of the
+  // plugin uses:
+  //   1. `projectId` body field — optional. When present, opens THAT
+  //      project's directory (always useful, not just the active one).
+  //   2. The active project's `sourcePath` — the directory the user
+  //      picked when they created the project (e.g. ~/Movies/my-drama).
+  //   3. The legacy managed path `<wsRoot>/projects/<id>` for projects
+  //      that were auto-promoted from the pre-upgrade canvas layout.
+  //   4. The bare `workspaceRoot` as a final fallback so the button still
+  //      does something useful even on projects whose on-disk location
+  //      can't be determined (very rare; legacy entries only).
+  //
+  // The server spawns the file manager in detached mode; the request
+  // returns as soon as the child has been spawned, so a file-manager
+  // window that stays open for hours doesn't hold the HTTP connection.
+  wserver.register({
+    kind: 'exact',
+    path: '/api/media-studio/projects/reveal',
+    handler: (req, res) => {
+      void (async () => {
+        try {
+          const body = await readBody(req).catch(() => ({} as Record<string, unknown>))
+          const handles = getMediaStudioHandles()
+          const ps = handles.projectStore!
+          await ps.ready()
+          const requestedId = typeof body.projectId === 'string' && body.projectId.trim()
+            ? body.projectId.trim()
+            : ps.snapshot().activeId
+          if (!requestedId) {
+            json(res, 400, { ok: false, error: 'no active project to reveal' })
+            return
+          }
+          const meta = ps.snapshot().projects.find((p) => p.id === requestedId)
+          if (!meta) {
+            json(res, 404, { ok: false, error: `project not found: ${requestedId}` })
+            return
+          }
+          // Path resolution mirrors `ProjectStore.resolveAssetRoot`'s
+          // precedence: a real `sourcePath` wins; otherwise fall back to
+          // the managed `<wsRoot>/projects/<id>` directory (legacy
+          // pre-upgrade layout); only as a last resort open wsRoot.
+          let target: string
+          if (meta.sourcePath) {
+            target = meta.sourcePath
+          } else {
+            const fallback = resolve(handles.workspaceRoot, 'projects', meta.id)
+            target = fallback
+          }
+          await revealInFileManager(target)
+          json(res, 200, { ok: true, projectId: meta.id, path: target })
         } catch (e) {
           json(res, 500, { ok: false, error: (e as Error).message })
         }

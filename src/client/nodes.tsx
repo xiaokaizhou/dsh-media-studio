@@ -839,16 +839,18 @@ function MediaCardBody({ kind, nodeId, d }: {
 
   // Video/music running guard: if the server never writes a result, drop
   // back to an error state so the user sees a clear "stuck" treatment
-  // instead of an infinite spinner. The refreshNode path has its own
-  // 120s timeout — this covers the agent-patch path (e.g. generate_video
-  // that timed out on the server).
+  // instead of an infinite spinner. This covers the agent-patch path (e.g. a
+  // node left in status=running after generate_video timed out on the
+  // server). The threshold matches the server's refresh timeout (5 min,
+  // routes.ts) so the guard can never race a still-running generation and
+  // flash a false error before the SSE 'done' lands.
   const startedAtRef = useRef<number | null>(null)
   useEffect(() => {
     if (status !== 'running') { startedAtRef.current = null; return }
     if (raw) return
     if (startedAtRef.current == null) startedAtRef.current = Date.now()
     const elapsed = Date.now() - (startedAtRef.current ?? Date.now())
-    const remaining = Math.max(0, 60_000 - elapsed)
+    const remaining = Math.max(0, 330_000 - elapsed)
     const t = setTimeout(() => {
       api.patchData(nodeId, { status: 'error' as const, errorMsg: 'Generation timed out — refresh to retry' })
     }, remaining)

@@ -10,16 +10,15 @@
  *   (1) "embed" — preferred. The provider response carries a separate
  *       thumbnail URL (Sora / Veo / Kling / Seedance all do); we download
  *       both, then ffmpeg-mux the JPG into the MP4 as `attached_pic`. The
- *       browser renders the attached pic as the first-frame automatically
- *       and `data.poster` stays unset. Project directory ends up holding
- *       exactly one file: the .mp4.
+ *       cover image is ALSO kept as a sibling `.poster.jpg` under web-jobs/
+ *       and returned via `poster` — the frontend LazyVideo renders a plain
+ *       `<img>` before the first click (no `<video>` element is mounted),
+ *       so the MP4-attached_pic stream alone is never visible there.
  *
  *   (2) "extract" — fallback when the provider gave no cover (or step 1
  *       failed). We run `ffmpeg -ss 0 -frames:v 1` to pull the real first
  *       frame from the video and write it next to the .mp4 as a sibling
- *       `.thumb.jpg`. `data.poster` then points at it. Slightly less clean
- *       (one extra hidden file per video) but still hidden on macOS Finder
- *       and never enters the project's asset index.
+ *       `.thumb.jpg`. `data.poster` then points at it.
  *
  * Both steps degrade silently when ffmpeg is missing or the input is
  * unreadable — the caller still gets back a working `{ url }` pair.
@@ -113,6 +112,12 @@ export interface PreparedVideo {
 
 export interface PrepareOptions {
   wsRoot: string
+  /** The canvas id — used to build `projects/<id>/assets/clips/<file>`
+   *  URLs when `sourcePath` is set. */
+  projectId?: string
+  /** The project's sourcePath, if it has one. When set, the video is
+   *  written to `<sourcePath>/assets/clips/<file>` instead of web-jobs/. */
+  sourcePath?: string
   /** Direct cover URL — preferred over scanning `providerExtras`. The
    *  multimodal plugin now returns this as a typed `coverUrl` field. */
   coverUrl?: string
@@ -124,21 +129,32 @@ export interface PrepareOptions {
 }
 
 /**
- * Download the video to a stable path under `<wsRoot>/web-jobs/`, then try
- * to attach (or extract) a cover. The returned `url` always points to a
- * locally-served file so the existing media-file proxy can hand it back.
+ * Download the video to a stable local path, then try to attach (or extract)
+ * a cover.
+ *
+ *   • When `sourcePath` is set → write to `<sourcePath>/assets/clips/` and
+ *     return `projects/<id>/assets/clips/<file>` (the convention
+ *     `resolveMediaTarget()` rewrites to the user's project tree).
+ *   • When `sourcePath` is absent → fall back to `<wsRoot>/web-jobs/` and
+ *     return a `file://` URL.
+ *
+ * The returned `url` always points to a locally-served file so the
+ * existing media-file proxy can hand it back.
  */
 export async function prepareVideoForCanvas(
   videoUrl: string,
   opts: PrepareOptions,
 ): Promise<PreparedVideo> {
-  const jobsDir = join(opts.wsRoot, 'web-jobs')
-  await mkdir(jobsDir, { recursive: true })
+  const useSourcePath = !!opts.sourcePath
+  const baseDir = useSourcePath
+    ? join(opts.sourcePath!, 'assets', 'clips')
+    : join(opts.wsRoot, 'web-jobs')
+  await mkdir(baseDir, { recursive: true })
 
   // Stable filename — re-running prepareVideoForCanvas on the same source
   // re-uses the same path so existing nodes don't dangle.
   const id = randomBytes(8).toString('hex')
-  const localVideo = join(jobsDir, `v-${id}.mp4`)
+  const localVideo = join(baseDir, `v-${id}.mp4`)
 
   try {
     await downloadTo(videoUrl, localVideo)
@@ -152,8 +168,8 @@ export async function prepareVideoForCanvas(
   // ── Strategy 1: embed provider cover into MP4 metadata ────────────────
   const coverUrl = opts.coverUrl || pickCoverUrl(opts.providerExtras)
   if (ffmpegOk && coverUrl) {
-    const coverTmp = join(jobsDir, `c-${id}.jpg`)
-    const outTmp = join(jobsDir, `o-${id}.mp4`)
+    const coverTmp = join(baseDir, `c-${id}.jpg`)
+    const outTmp = join(baseDir, `o-${id}.mp4`)
     try {
       await downloadTo(coverUrl, coverTmp)
       await runFfmpeg([
@@ -167,13 +183,17 @@ export async function prepareVideoForCanvas(
         '-metadata:s:v:1', 'title=cover',
         outTmp,
       ])
-      // Replace original with embedded; delete the sidecar.
+      // Replace original with embedded; keep the cover image as an
+      // external poster (see module header for why attached_pic alone
+      // is not enough for the frontend card renderer).
       await unlink(localVideo).catch(() => {})
-      await unlink(coverTmp).catch(() => {})
       await rename(outTmp, localVideo)
-      // Success — browsers render attached_pic as the first frame; no
-      // separate poster file needed, project dir stays one .mp4.
-      return { url: localVideo, poster: null }
+      const posterPath = join(baseDir, `v-${id}.poster.jpg`)
+      await rename(coverTmp, posterPath)
+      const urlForNode = useSourcePath
+        ? `projects/${opts.projectId}/assets/clips/v-${id}.mp4`
+        : `file://${localVideo}`
+      return { url: urlForNode, poster: `file://${posterPath}` }
     } catch (e) {
       // Clean partials; we'll try extract below.
       await unlink(coverTmp).catch(() => {})
@@ -184,7 +204,7 @@ export async function prepareVideoForCanvas(
 
   // ── Strategy 2: extract first frame with ffmpeg ────────────────────────
   if (ffmpegOk) {
-    const thumb = join(jobsDir, `v-${id}.thumb.jpg`)
+    const thumb = join(baseDir, `v-${id}.thumb.jpg`)
     try {
       await runFfmpeg([
         '-y',
@@ -194,7 +214,10 @@ export async function prepareVideoForCanvas(
         '-q:v', '2',
         thumb,
       ])
-      return { url: localVideo, poster: thumb }
+      const urlForNode = useSourcePath
+        ? `projects/${opts.projectId}/assets/clips/v-${id}.mp4`
+        : `file://${localVideo}`
+      return { url: urlForNode, poster: `file://${thumb}` }
     } catch (e) {
       await unlink(thumb).catch(() => {})
       log.warn(`[media-studio] video-cover: extract failed (${(e as Error).message}); poster disabled`)
@@ -202,5 +225,8 @@ export async function prepareVideoForCanvas(
   }
 
   // ── Final fallback: just the local video, no poster ────────────────────
-  return { url: localVideo, poster: null }
+  const fallbackUrl = useSourcePath
+    ? `projects/${opts.projectId}/assets/clips/v-${id}.mp4`
+    : `file://${localVideo}`
+  return { url: fallbackUrl, poster: null }
 }

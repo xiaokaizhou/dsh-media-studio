@@ -20,6 +20,7 @@ import {
   apiOpenProject,
   apiPickFolder,
   apiRenameProject,
+  apiRevealProject,
   fetchProjects,
   subscribeProjects,
   type DependentsAPI,
@@ -48,6 +49,19 @@ function FolderIcon({ size = 12 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+    </svg>
+  )
+}
+// Lucide "external-link" — semantic match for "open the project's on-disk
+// folder in the host's native file manager". Uses an open square + arrow
+// so it reads as "go to / open in another app" rather than the "plus"
+// / "folder" iconography the rest of the menu uses for project creation.
+function ExternalLinkIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
     </svg>
   )
 }
@@ -109,7 +123,7 @@ export interface ProjectAppProps {
 
 type LiveConn = 'connecting' | 'open' | 'reconnecting'
 
-function LiveBadge({ canvasId }: { canvasId: string }) {
+function LiveBadge({ canvasId }: { canvasId: string | null }) {
   const [version, setVersion] = useState(0)
   const [conn, setConn] = useState<LiveConn>('connecting')
 
@@ -119,6 +133,7 @@ function LiveBadge({ canvasId }: { canvasId: string }) {
   // work for every patch and (more importantly) were a measurable source
   // of UI jank just from *opening* an empty canvas tab.
   useEffect(() => {
+    if (!canvasId) { setConn('connecting'); setVersion(0); return }
     const offSummary = subscribeSummary(canvasId, (info) => {
       setVersion(info.version)
     })
@@ -395,6 +410,12 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-muted { color:var(--ms-fg-faint); font-size:11.5px; }
 .ms-pb-host { flex:1; min-height:0; position:relative; display:flex; }
 .ms-pb-host > div { flex:1; min-width:0; }
+.ms-pb-empty-state { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; color:var(--ms-fg-faint); user-select:none; }
+.ms-pb-empty-icon { opacity:0.5; margin-bottom:4px; }
+.ms-pb-empty-title { font:700 15px/1.2 system-ui,sans-serif; color:var(--ms-fg-dim); }
+.ms-pb-empty-desc { font-size:12px; color:var(--ms-fg-faint); text-align:center; max-width:280px; line-height:1.5; }
+.ms-pb-empty-btn { display:inline-flex; align-items:center; gap:6px; margin-top:6px; padding:7px 16px; border:none; border-radius:8px; background:var(--ms-accent); color:#0b0d12; font:600 12px/1 system-ui,sans-serif; cursor:pointer; }
+.ms-pb-empty-btn:hover { filter:brightness(1.1); }
 .ms-pb-menu { position:fixed; width:276px; max-height:min(560px, calc(100vh - 96px)); display:flex; flex-direction:column; background:var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border:1px solid var(--ms-border-strong); border-radius:12px; box-shadow:var(--ms-shadow-lg); padding:6px; z-index:60; color:var(--ms-fg); font-size:12.5px; }
 .ms-pb-menu-item { display:flex; align-items:center; gap:8px; width:100%; padding:7px 8px; border:none; border-radius:8px; background:transparent; color:var(--ms-fg-dim); font:inherit; cursor:pointer; text-align:left; }
 .ms-pb-menu-item[aria-busy="true"] { opacity: 0.75; }
@@ -423,7 +444,8 @@ body:not([data-ds-dark-theme]) .media-studio-project .ms-menu-backdrop {
 .ms-pb-chip { flex:none; padding:1px 6px; border-radius:99px; background:var(--ms-panel-soft); color:var(--ms-fg-faint); font-size:10px; }
 .ms-pb-empty { padding:14px 10px; color:var(--ms-fg-faint); font-size:12px; text-align:center; }
 .ms-pb-menu-err { margin: 4px 6px 2px; padding: 6px 8px; border-radius: 8px; background: rgba(239,68,68,0.10); border: 1px solid rgba(239,68,68,0.35); color: var(--ms-error); font-size: 11.5px; line-height: 1.4; }
-.ms-pb-submenu { position: fixed; width: 276px; max-height: min(440px, calc(100vh - 110px)); display: flex; flex-direction: column; background: var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border: 1px solid var(--ms-border-strong); border-radius: 12px; box-shadow: var(--ms-shadow-lg); padding: 6px; z-index: 70; color: var(--ms-fg); font-size: 12.5px; }
+.ms-pb-submenu { position: fixed; width: 276px; max-height: min(440px, calc(100vh - 110px)); display: flex; flex-direction: column; background: var(--dsw-alias-bg-overlay, rgba(26, 29, 38, 1)); border: 1px solid var(--ms-border-strong); border-left: none; border-radius: 0 12px 12px 0; box-shadow: none; padding: 6px; z-index: 60; color: var(--ms-fg); font-size: 12.5px; }
+.ms-pb-submenu.is-flipped { border-left: 1px solid var(--ms-border-strong); border-right: none; border-radius: 12px 0 0 12px; }
 .ms-pb-submenu .ms-pb-scroll { margin-top: 4px; }
 .ms-pb-lang-row { display:flex; align-items:center; justify-content:space-between; padding:2px 8px 4px; }
 .ms-pb-lang-btns { display:flex; gap:2px; }
@@ -525,7 +547,9 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
 
   const activeId = registry?.activeId ?? null
   const activeProject = registry?.projects.find((p) => p.id === activeId) ?? null
-  const canvasId = activeId || fallbackCanvasId
+  // When no project is active (e.g. after deleting the active project), show
+  // an empty state instead of falling back to the legacy "main" canvas.
+  const canvasId: string | null = activeId
 
   // Initial registry + follow the projects SSE stream.
   useEffect(() => {
@@ -701,6 +725,51 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
     }
   }, [commitOpen, pickerRunning])
 
+  // Reveal the active project's on-disk folder in the host's file manager
+  // (Finder / Explorer / xdg-open). The server spawns the manager detached
+  // so the HTTP call returns as soon as the child launches — the file
+  // manager window can stay open indefinitely without holding the request.
+  //
+  // We mirror handlePickNative's "show feedback in the menu, don't tear it
+  // down immediately" pattern: while the request is in flight the menu
+  // stays open with a pulsing "处理中…" label so a click that spawns no
+  // visible window (e.g. `open` failing on a sandboxed host) doesn't
+  // leave the user staring at a menu that disappeared on click. A 10s
+  // `Promise.race` timeout also caps the wait so the menu never gets
+  // stuck mid-flight.
+  const [revealRunning, setRevealRunning] = useState(false)
+  const [revealErr, setRevealErr] = useState<string | null>(null)
+  const handleReveal = useCallback(async () => {
+    if (revealRunning) return
+    if (!activeId) return
+    setRevealRunning(true)
+    setRevealErr(null)
+    try {
+      const res = await Promise.race([
+        apiRevealProject(activeId),
+        new Promise<{ ok: false; error: string }>((resolve) =>
+          setTimeout(() => resolve({ ok: false, error: 'reveal timed out' }), 10_000),
+        ),
+      ])
+      if (!res.ok) {
+        // Most common failure: project has no on-disk directory yet (a
+        // legacy entry that never got promoted). The server returns a
+        // descriptive 500 in that case; we surface it inline so the user
+        // sees the click registered instead of guessing what went wrong.
+        setRevealErr(res.error || t('project.revealInFolder.err'))
+        return
+      }
+      // Success — close the menu so the user sees the file manager
+      // foreground instead of our chrome.
+      setMenuOpen(false)
+    } finally {
+      setRevealRunning(false)
+    }
+    // `activeId` is the project to reveal; t() is captured via closure but
+    // never changes inside the request lifetime, so the dep array only
+    // needs to track the things we actually read from React state.
+  }, [activeId, revealRunning, t])
+
   // Export canvas as PNG — moved from the bottom view bar to the top bar
   // right corner for better discoverability. Auto-fits the view first so
   // all nodes are visible, then uses html-to-image to rasterize the
@@ -794,7 +863,15 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
       <SidebarFocusListener />
       <div className="ms-pb-bar">
         <div className="ms-pb-left">
-          <button ref={rootBtnRef} type="button" className="ms-pb-root" onClick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen}>
+          <button
+            ref={rootBtnRef}
+            type="button"
+            className="ms-pb-root"
+            onClick={toggleMenu}
+            onMouseDown={(e) => e.stopPropagation()}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+          >
             <FolderIcon size={13} />
             <span>{t('project.menu')}</span>
             <span className="ms-pb-caret">▾</span>
@@ -825,7 +902,25 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
           <LiveBadge canvasId={canvasId} />
         </div>
       </div>
-      <div className="ms-pb-host">{props.renderCanvas(canvasId)}</div>
+      <div className="ms-pb-host">
+        {canvasId ? props.renderCanvas(canvasId) : (
+          <div className="ms-pb-empty-state">
+            <div className="ms-pb-empty-icon">
+              <FolderIcon size={36} />
+            </div>
+            <div className="ms-pb-empty-title">{t('project.empty.title')}</div>
+            <div className="ms-pb-empty-desc">{t('project.empty.desc')}</div>
+            <button
+              type="button"
+              className="ms-pb-empty-btn"
+              onClick={() => { setMenuOpen(true); setView('home') }}
+            >
+              <IconPlus size={14} />
+              {t('project.empty.action')}
+            </button>
+          </div>
+        )}
+      </div>
 
       {menuOpen && anchor && createPortal(
         <div className="ms-menu-backdrop">
@@ -859,6 +954,23 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
                   <span>{pickerRunning ? t('project.open.local.busy') : t('project.open.local')}</span>
                 </button>
                 {pickerErr && <div className="ms-pb-menu-err" role="alert">{pickerErr}</div>}
+                {/* "Show in file manager" — opens the active project's
+                    on-disk folder in the host's native file manager
+                    (Finder / Explorer / xdg-open). Mirrors the picker
+                    affordance above so the same feedback shape (busy
+                    pill + inline error) covers both file-manager flows. */}
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="ms-pb-menu-item"
+                  onClick={() => void handleReveal()}
+                  disabled={!activeId || revealRunning}
+                  aria-busy={revealRunning}
+                >
+                  <ExternalLinkIcon size={13} />
+                  <span>{revealRunning ? t('project.revealInFolder.busy') : t('project.revealInFolder')}</span>
+                </button>
+                {revealErr && <div className="ms-pb-menu-err" role="alert">{revealErr}</div>}
                 <button
                   type="button"
                   role="menuitem"
@@ -920,18 +1032,39 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
                     of the parent instead of overflowing. */}
                 {recentHover && recentItems.length > 0 && anchor && (() => {
                   const MENU_W = 276
-                  const GAP = 8
-                  let subLeft = anchor.x + MENU_W + GAP
+                  // Align the submenu as an *extension* of the parent menu:
+                  // left edge = the "最近打开" item's right edge, top edge =
+                  // the item's top edge. No gap — the submenu visually flows
+                  // out of the parent menu rather than floating beside it.
+                  let subLeft = anchor.x + MENU_W
+                  let subTop = anchor.y
+                  let flipped = false
+                  let parentRight = 0
+                  if (typeof document !== 'undefined') {
+                    const parentItem = Array.from(document.querySelectorAll('.ms-pb-menu .ms-pb-menu-item'))
+                      .find((el) => el.textContent?.includes('最近打开'))
+                    if (parentItem) {
+                      const r = parentItem.getBoundingClientRect()
+                      subLeft = r.right
+                      subTop = r.top
+                      parentRight = r.right
+                    }
+                  }
+                  // If extending right would overflow the viewport, flip to the
+                  // left side: right edge = parent item's left edge.
                   if (subLeft + MENU_W > window.innerWidth - 6) {
-                    // Open to the left of the parent menu instead.
-                    subLeft = Math.max(6, anchor.x - MENU_W - GAP)
+                    const parentItem = Array.from(document.querySelectorAll('.ms-pb-menu .ms-pb-menu-item'))
+                      .find((el) => el.textContent?.includes('最近打开'))
+                    const parentLeft = parentItem ? parentItem.getBoundingClientRect().left : anchor.x
+                    subLeft = Math.max(6, parentLeft - MENU_W)
+                    flipped = true
                   }
                   return (
                     <div
-                      className="ms-pb-submenu"
+                      className={`ms-pb-submenu${flipped ? ' is-flipped' : ''}`}
                       role="menu"
                       aria-label={t('project.recent.title')}
-                      style={{ left: subLeft, top: anchor.y }}
+                      style={{ left: subLeft, top: subTop }}
                       onMouseEnter={() => setRecentHover(true)}
                       onMouseLeave={() => setRecentHover(false)}
                     >
@@ -945,6 +1078,14 @@ export default function ProjectApp(props: ProjectAppProps): ReactNode {
                             </span>
                             <span className="ms-pb-row-actions" onClick={(e) => e.stopPropagation()}>
                               {p.legacy && <span className="ms-pb-chip">{t('project.legacy')}</span>}
+                              <button
+                                type="button"
+                                className="ms-pb-icon-btn is-danger"
+                                title={t('project.delete')}
+                                onClick={() => { setRecentHover(false); setMenuOpen(false); setDialog({ kind: 'delete', projectId: p.id, name: p.name }) }}
+                              >
+                                <IconTrash2 size={12} />
+                              </button>
                             </span>
                           </div>
                         ))}

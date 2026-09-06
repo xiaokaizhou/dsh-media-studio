@@ -159,6 +159,10 @@ export type CanvasOp =
       regionId?: string
       /** Optional explicit id; if absent we generate one. */
       nodeId?: string
+      /** Video-only: provider-supplied cover / thumbnail URL. Passed
+       *  through to prepareVideoForCanvas in post-processing so the card
+       *  can display a real first-frame poster. */
+      coverUrl?: string
     }>
   }
 

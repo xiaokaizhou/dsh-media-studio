@@ -61,6 +61,11 @@ interface BusState {
   pendingRegistry: RegistryAPI | null
   // Reconnect resync guard.
   resyncTimer: ReturnType<typeof setTimeout> | null
+  // Canvas-switch guard: after a canvasId change (e.g. project deletion
+  // auto-switches activeId), the SSE initial snapshot may race with
+  // server-side canvas loading and deliver an empty v0 graph. While this
+  // flag is set, v0 snapshots are ignored until the active fetch resolves.
+  switchPending: boolean
 }
 
 const state: BusState = {
@@ -78,6 +83,7 @@ const state: BusState = {
   registryTimer: null,
   pendingRegistry: null,
   resyncTimer: null,
+  switchPending: false,
 }
 
 function emitConn(s: 'connecting' | 'open' | 'reconnecting') {
@@ -156,8 +162,12 @@ function ensureConnection(canvasId: string) {
     try { state.es.close() } catch { /* ignore */ }
     state.es = null
     state.canvasId = null
-    state.last.snap = null
+    // Intentionally do NOT clear last.snap here: keeping the old graph
+    // visible avoids a blank-canvas flash while the new socket's initial
+    // snapshot is in flight. The switchPending flag below prevents a
+    // raced v0 empty snapshot from overwriting it.
     state.last.conn = 'connecting'
+    state.switchPending = true
     emitConn('connecting')
   }
   state.canvasId = canvasId
@@ -183,6 +193,11 @@ function ensureConnection(canvasId: string) {
       const data = JSON.parse(e.data) as { type?: string; graph?: MsSnapshot['graph']; version?: number }
       if (data?.type !== 'canvas-patch' || !data.graph) return
       const snap: MsSnapshot = { graph: data.graph, version: data.version ?? 0 }
+      // While switchPending is set, the SSE initial snapshot may race with
+      // server-side canvas loading and deliver an empty v0 graph. Ignore it
+      // — the active fetch in subscribeFull will deliver the real state.
+      if (state.switchPending && snap.version === 0) return
+      state.switchPending = false
       // Cheap dedupe: same version → nothing to do (echoes from the host
       // often carry the version we already applied).
       if (state.last.snap && state.last.snap.version === snap.version) return
@@ -234,6 +249,7 @@ function closeConnection() {
   state.last.snap = null
   state.last.registry = null
   state.last.conn = 'connecting'
+  state.switchPending = false
   if (state.resyncTimer) { clearTimeout(state.resyncTimer); state.resyncTimer = null }
 }
 
@@ -291,20 +307,24 @@ function fetchCanvasSnapshot(canvasId: string) {
     .then((data: { graph?: MsSnapshot['graph']; version?: number }) => {
       if (!data?.graph) return
       const snap: MsSnapshot = { graph: data.graph, version: data.version ?? 0 }
-      // Only apply if newer than what we have (SSE may have already delivered
-      // a fresher patch by the time fetch resolves).
-      if (!state.last.snap || state.last.snap.version < snap.version) {
-        state.last.snap = snap
-        emitSummary(snap)
-        for (const fn of state.full) fn(snap)
-      }
+      // Fetch is authoritative after a switch — clear the pending flag and
+      // apply regardless of version (the new canvas may have a lower version
+      // than the old one we were displaying).
+      state.switchPending = false
+      state.last.snap = snap
+      emitSummary(snap)
+      for (const fn of state.full) fn(snap)
     })
-    .catch(() => { /* SSE will deliver the next event anyway */ })
+    .catch(() => {
+      // Fetch failed — clear the flag so subsequent SSE events can apply.
+      state.switchPending = false
+    })
 }
 
 /** Subscribe to the full snapshot stream (canvas.tsx path). */
 export function subscribeFull(canvasId: string, fn: FullListener): () => void {
-  const wasNewCanvas = state.canvasId !== canvasId
+  // True only when switching FROM an existing different canvas (not first connect).
+  const isSwitch = state.canvasId !== null && state.canvasId !== canvasId
   state.full.add(fn)
   attachVisibilityHandler()
   ensureConnection(canvasId)
@@ -312,7 +332,7 @@ export function subscribeFull(canvasId: string, fn: FullListener): () => void {
   // at "connecting" forever.
   if (state.last.snap && state.canvasId === canvasId) {
     fn(state.last.snap)
-  } else if (wasNewCanvas) {
+  } else if (isSwitch) {
     // Canvas just switched (e.g. after project deletion). The SSE initial
     // snapshot may race with server-side canvas loading and deliver an empty
     // graph — actively fetch to get the fully-loaded state.

@@ -66,6 +66,25 @@ export function apiPickFolder(): Promise<ApiResult<{ canceled: boolean; path: st
   return requestJson('/api/media-studio/projects/pick-folder', { method: 'POST' })
 }
 
+/**
+ * Reveal a project's on-disk folder in the host's native file manager
+ * (Finder / Explorer / xdg-open). The server resolves the path from the
+ * project's `sourcePath` (preferred) or the legacy managed
+ * `<workspaceRoot>/projects/<id>` location and spawns the platform's
+ * file-manager command detached — so the request returns as soon as the
+ * child has launched even if the GUI window stays open.
+ *
+ * Pass `projectId` to reveal a non-active project (e.g. from a recent
+ * list); omit it to reveal the currently active project. Returns the
+ * resolved absolute path on success so the UI can show a confirmation.
+ */
+export function apiRevealProject(projectId?: string): Promise<ApiResult<{ projectId: string; path: string }>> {
+  return requestJson('/api/media-studio/projects/reveal', {
+    method: 'POST',
+    body: JSON.stringify(projectId ? { projectId } : {}),
+  })
+}
+
 export function apiOpenProject(projectId: string): Promise<ApiResult<{ project: ProjectMetaAPI; registry: RegistryAPI }>> {
   return requestJson('/api/media-studio/projects/open', { method: 'POST', body: JSON.stringify({ projectId }) })
 }

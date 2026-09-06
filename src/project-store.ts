@@ -545,13 +545,10 @@ export class ProjectStore {
         }
       }
 
-      // Determine the next active project before removal.
+      // Deleting the active project leaves the workspace empty — we do NOT
+      // auto-advance to the next recent project. The client shows an empty
+      // state and the user explicitly opens another project.
       const wasActive = this.registry.activeId === id
-      let switchedTo: string | null = null
-      if (wasActive) {
-        const candidates = this.registry.recent.filter((rid) => rid !== id && this.registry.projects[rid])
-        switchedTo = candidates[0] ?? Object.keys(this.registry.projects).find((pid) => pid !== id) ?? null
-      }
 
       // Physically remove: project asset dir → trash/permanent.
       await this.disposeProjectAssets(id, mode)
@@ -561,16 +558,15 @@ export class ProjectStore {
 
       delete this.registry.projects[id]
       this.registry.recent = this.registry.recent.filter((rid) => rid !== id)
-      if (switchedTo) this.registry.activeId = switchedTo
-      else if (this.registry.activeId === id) this.registry.activeId = null
+      if (wasActive) this.registry.activeId = null
       await this.persistRegistry()
 
-      this.emit({ type: 'project-deleted', projectId: id, name: meta.name, switchedTo })
+      this.emit({ type: 'project-deleted', projectId: id, name: meta.name, switchedTo: null })
       this.emit({ type: 'registry-changed' })
 
       return {
         deletedId: id,
-        switchedTo,
+        switchedTo: null,
         mode,
         cascade: cascade as DeleteCascade,
         migratedFiles,

@@ -7,6 +7,7 @@ import { mkdir, writeFile, stat } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { getMediaStudioHandles, log } from './service-state'
 import { prepareVideoForCanvas } from './video-cover'
+import { prepareImageForCanvas, prepareAudioForCanvas } from './image-cover'
 import {
   registerCanvasAsset,
   type AssetKind,
@@ -252,11 +253,105 @@ export async function migrateInaccessibleResultUrl(
   try {
     canvasStore.apply(projectId, [updateOp])
     log.debug(`[media-studio] migrated node "${nodeId}" resultUrl → ${projectRelative}`)
-    return null // success
   } catch (e) {
     log.warn(`[media-studio] migrateInaccessibleResultUrl: failed to apply update for "${nodeId}": ${(e as Error).message}`)
     return `node "${nodeId}" migrated to assets but failed to update node: ${(e as Error).message}`
   }
+
+  // Video nodes also need a cover/poster — without one the canvas card
+  // shows a blank thumbnail (LazyVideo renders only the poster image before
+  // the first click, never the <video> element). Previously this step was
+  // skipped here, so any /tmp video file moved by the media-file proxy
+  // fallback landed in the project without a poster. Run prepareVideoForCanvas
+  // against the freshly-copied local path to attach (or extract) a poster.
+  if (nodeType === 'video') {
+    try {
+      const localTarget = sourcePath
+        ? join(sourcePath, 'assets', ASSET_CATEGORY_DIR[kind], fileName)
+        : join(wsRoot, 'projects', projectId, 'assets', ASSET_CATEGORY_DIR[kind], fileName)
+      const prepared = await prepareVideoForCanvas(localTarget, {
+        wsRoot,
+        projectId,
+        sourcePath,
+      })
+      const posterUpdate: CanvasOp = { op: 'updateNode', id: nodeId, data: {} }
+      const data = posterUpdate.data as Record<string, unknown>
+      // If prepareVideoForCanvas rewrote to a stable filename, propagate it;
+      // otherwise keep the projectRelative path we just wrote.
+      if (prepared.url && prepared.url !== projectRelative) {
+        data.resultUrl = prepared.url
+      }
+      if (prepared.poster) {
+        data.poster = prepared.poster
+      }
+      if (Object.keys(data).length > 0) {
+        canvasStore.apply(projectId, [posterUpdate])
+        log.debug(`[media-studio] migrated video "${nodeId}" attached cover poster=${prepared.poster ?? '(none)'} url=${prepared.url}`)
+      }
+    } catch (e) {
+      log.warn(`[media-studio] migrateInaccessibleResultUrl: video cover prep failed for "${nodeId}": ${(e as Error).message}`)
+      // Non-fatal — the video file is already in place and playable.
+    }
+  }
+
+  return null // success
+}
+
+/**
+ * Backfill missing posters for every video node in a canvas. Designed to be
+ * called as a one-shot recovery after a session discovers that video cards
+ * have no data.poster (typically because the videos were written to the
+ * project directory by a path that bypassed `prepareVideoForCanvas`).
+ *
+ * For each video node:
+ *   • If `data.poster` is already set, skip (idempotent).
+ *   • Otherwise resolve the local file the node points at, copy/normalize it
+ *     into `<sourcePath>/assets/clips/<id>.mp4` (or web-jobs/ for projects
+ *     without a sourcePath), run ffmpeg to extract the first frame as a
+ *     sibling .thumb.jpg, then patch the node with both the new resultUrl
+ *     and the new poster.
+ *
+ * Returns per-node advisory strings so the caller can surface failures in
+ * the response payload.
+ */
+export async function backfillVideoPosters(
+  projectId: string,
+  wsRoot: string,
+  sourcePath: string | undefined,
+  canvasStore: CanvasStore,
+): Promise<{ processed: number; succeeded: number; issues: string[] }> {
+  const snap = canvasStore.snapshot(projectId)
+  const issues: string[] = []
+  let processed = 0
+  let succeeded = 0
+  for (const node of snap.graph.nodes) {
+    if (node.type !== 'video') continue
+    const data = node.data as Record<string, unknown>
+    const poster = data.poster
+    if (typeof poster === 'string' && poster.trim()) continue // already set
+    const raw = data.resultUrl
+    if (typeof raw !== 'string' || !raw.trim()) continue
+    processed++
+    try {
+      const prepared = await prepareVideoForCanvas(raw, {
+        wsRoot,
+        projectId,
+        sourcePath,
+      })
+      const updateData: Record<string, unknown> = {}
+      if (prepared.url && prepared.url !== raw) updateData.resultUrl = prepared.url
+      if (prepared.poster) updateData.poster = prepared.poster
+      if (Object.keys(updateData).length === 0) {
+        issues.push(`warn: backfillVideoPosters could not produce a poster for "${node.id}" (${raw})`)
+        continue
+      }
+      canvasStore.apply(projectId, [{ op: 'updateNode', id: node.id, data: updateData }])
+      succeeded++
+    } catch (e) {
+      issues.push(`warn: backfillVideoPosters failed for "${node.id}" (${raw}): ${(e as Error).message}`)
+    }
+  }
+  return { processed, succeeded, issues }
 }
 
 /**
@@ -489,13 +584,16 @@ export function collectUpstreamImageUrls(
 
 /**
  * Map a canvas node type to the multimodal tool name. The dsh-llm-multimodal
- * plugin owns all five generators — `generate_image` etc.
+ * plugin owns the generators — `generate_image` / `generate_video` /
+ * `generate_tts` / `generate_music`. Music nodes split by role: dub nodes
+ * (data.dub === true) go to generate_tts (dialogue voice-over), everything
+ * else to generate_music (BGM / sound effects).
  */
-function toolNameForNodeType(kind: 'image' | 'video' | 'music'): string {
+function toolNameForNodeType(kind: 'image' | 'video' | 'music', data?: Record<string, unknown>): string {
   switch (kind) {
     case 'image': return 'generate_image'
     case 'video': return 'generate_video'
-    case 'music': return 'generate_music'
+    case 'music': return data?.dub === true ? 'generate_tts' : 'generate_music'
   }
 }
 
@@ -605,27 +703,54 @@ export async function executeNodeRefresh(
       newPrompt = basePrompt
         ? `${basePrompt}\n\nContext from upstream nodes:\n${context || '(no upstream text content)'}\n\nRegenerate the image keeping the original style and subject.`
         : `Generate an image that illustrates: ${context || '(empty)'}`
-      const imageArgs: Record<string, unknown> = {
-        prompt: newPrompt,
-        model: (node.data.model as string | undefined) || undefined,
-      }
+      const imageArgs: Record<string, unknown> = { prompt: newPrompt }
+      // dsh-tools' snapshot validator rejects `undefined` property values
+      // ("tool execution arguments must be losslessly JSON-serializable"),
+      // so only attach keys that actually have a value.
+      const imgModel = node.data.model as string | undefined
+      if (imgModel) imageArgs.model = imgModel
       // Pass upstream images as I2I reference when available.
       if (upstreamImageUrls.length > 0) {
         imageArgs.image = upstreamImageUrls
       }
       const r = await callMultimodal(ctx, 'generate_image', imageArgs, signal)
       if (!r.ok || !r.url) return fail(r.code || 'image-failed', r.message || 'no url')
-      resultUrl = r.url
+      // Drop whatever the multimodal plugin returned (CDN URL / base64 /
+      // file:// path) into a stable local file. When the project has a
+      // sourcePath set, this lands the bytes inside the user's project
+      // tree under `<sourcePath>/assets/<kind>/`; otherwise we fall back
+      // to `<wsRoot>/web-jobs/` (same shape as videos).
+      //
+      // Kind inference: explicit `data.assetKind` → tag scan → characterRef
+      // → misc fallback. See `inferImageKindDir` in image-cover.ts for the
+      // priority chain. New asset categories are added by extending the
+      // `AssetKindDir` union there — nothing else needs to change.
+      const preparedImg = await prepareImageForCanvas(r.url, {
+        wsRoot,
+        projectId: canvasId,
+        sourcePath: store.getSourcePath(canvasId),
+        nodeHints: {
+          characterRef: node.data.characterRef,
+          tags: node.data.tags as readonly string[] | undefined,
+          category: node.data.assetKind as string | undefined,
+          // Prompt + upstream text drives the last-resort semantic scan —
+          // e.g. "character design sheet" prompts land in characters/ even
+          // when the agent never set data.assetKind.
+          content: `${basePrompt}\n${context}`,
+        },
+      })
+      resultUrl = preparedImg.url
     } else if (kind === 'video') {
       newPrompt = basePrompt
         ? `${basePrompt}\n\nContext from upstream nodes:\n${context || '(no upstream text content)'}\n\nRegenerate the video keeping the original style and subject.`
         : `Generate a short video that illustrates: ${context || '(empty)'}`
       const videoArgs: Record<string, unknown> = {
         prompt: newPrompt,
-        model: (node.data.model as string | undefined) || undefined,
         duration: (node.data.duration as number | undefined) || 5,
         size: (node.data.size as string | undefined) || '1280x720',
       }
+      const vidModel = node.data.model as string | undefined
+      if (vidModel) videoArgs.model = vidModel
       // Pass upstream images as I2V first-frame reference when available.
       if (upstreamImageUrls.length > 0) {
         videoArgs.image = upstreamImageUrls[0]
@@ -638,6 +763,11 @@ export async function executeNodeRefresh(
       const wsRoot = getMediaStudioHandles().workspaceRoot
       const prepared = await prepareVideoForCanvas(r.url, {
         wsRoot,
+        projectId: canvasId,
+        // When the project has a sourcePath, the video lands in
+        // `<sourcePath>/assets/clips/<file>` and we return the
+        // `projects/<id>/assets/clips/<file>` URL convention.
+        sourcePath: store.getSourcePath(canvasId),
         // Prefer the typed `coverUrl` field returned by dsh-llm-multimodal;
         // `providerExtras` is a belt-and-suspenders fallback for providers
         // that stuff the cover URL into an unmodeled JSON field.
@@ -648,12 +778,35 @@ export async function executeNodeRefresh(
       videoPoster = prepared.poster
     } else if (kind === 'music') {
       newPrompt = context || basePrompt || '(no upstream text content)'
-      const r = await callMultimodal(ctx, 'generate_music', {
-        text: newPrompt,
-        voice: (node.data.voice as string | undefined) || undefined,
-      }, signal)
+      // dsh-llm-multimodal separates TTS from music models: dialogue /
+      // voice-over nodes (data.dub === true) are dubbed via generate_tts,
+      // BGM / sound-effect nodes go through generate_music.
+      const isDub = node.data?.dub === true
+      const musicTool = isDub ? 'generate_tts' : 'generate_music'
+      const audioArgs: Record<string, unknown> = { text: newPrompt }
+      const voice = node.data.voice as string | undefined
+      if (voice) audioArgs.voice = voice
+      if (isDub) {
+        // Per-character dubbing: carry the voice-clone seed + stable name so
+        // the character's own voice is cloned once and reused by name.
+        for (const k of ['clone_audio', 'voice_name', 'clone_voice_id'] as const) {
+          const v = node.data[k] as string | undefined
+          if (v) audioArgs[k] = v
+        }
+      }
+      const r = await callMultimodal(ctx, musicTool, audioArgs, signal)
       if (!r.ok || !r.url) return fail(r.code || 'music-failed', r.message || 'no url')
-      resultUrl = r.url
+      // Persist the audio into a stable local file (same as the image/video
+      // refresh paths): provider URLs from TTS / music models expire quickly
+      // (OpenAI ~2h), so keeping the raw URL would leave the card broken as
+      // soon as the link dies. Falls back to the original URL on download
+      // failure so a transient network error never blanks the node.
+      const preparedAudio = await prepareAudioForCanvas(r.url, {
+        wsRoot,
+        projectId: canvasId,
+        sourcePath: store.getSourcePath(canvasId),
+      })
+      resultUrl = preparedAudio.url
     } else {
       return fail('not-supported', `refresh not supported for kind "${kind}"`)
     }
@@ -750,28 +903,42 @@ export async function postProcessCanvasPatch(
   const issues = [...baseIssues]
   const mst = getMediaStudioHandles()
   const projectStore = mst.projectStore
-  const projectId = projectStore?.activeCanvasId?.() ?? null
+
+  // The target canvas id IS the project id for registered projects (canvas
+  // files live at canvases/<id>.json and project ids are stable). Resolve
+  // against the registry first so patching a non-active canvas pins / migrates
+  // / registers into THAT project — previously we always used
+  // `activeCanvasId()`, which misplaced files and rewrote node URLs to the
+  // wrong project whenever an agent passed an explicit canvasId for a
+  // non-active project. Unregistered canvases (legacy `main`) fall back to the
+  // active project to preserve the old behaviour.
+  const projectId = (() => {
+    if (!projectStore) return null
+    const snap = projectStore.snapshot?.()
+    if (snap && snap.projects.some((p) => p.id === canvasId)) return canvasId
+    return projectStore.activeCanvasId?.() ?? null
+  })()
   if (!projectId) return issues
 
-  const sourcePath = (() => {
-    if (!projectStore) return undefined
-    const snap = projectStore.snapshot?.()
-    if (!snap) return undefined
-    const meta = snap.projects.find((p) => p.id === projectId)
-    return meta?.sourcePath
-  })()
+  const sourcePath = projectStore?.resolveSourcePath?.(projectId)
 
-  // 1. Pin remote https URLs from batchAddMedia items
+  // 1. Pin remote https URLs from batchAddMedia items.
+  //    Videos are intentionally skipped here — they go through
+  //    prepareVideoForCanvas in step 1.5 below, which downloads the file
+  //    into web-jobs/ AND produces a poster in one pass.
+  const pinnedNodeIds = new Set<string>()
   for (const op of ops) {
     if (op.op !== 'batchAddMedia') continue
     for (const item of op.items) {
+      if (item.kind === 'video') continue
       if (typeof item.url !== 'string' || !/^https?:\/\//i.test(item.url)) continue
-      const kind: AssetKind | null = item.kind === 'audio' ? 'audio' : item.kind === 'image' ? 'character' : item.kind === 'video' ? 'clip' : null
+      const kind: AssetKind | null = item.kind === 'audio' ? 'audio' : item.kind === 'image' ? 'character' : null
       if (!kind) continue
       const pinned = await pinRemoteResultUrl(item.url, projectId, mst.workspaceRoot, sourcePath, kind)
       if (pinned.ok && pinned.url) {
         const nid = item.nodeId
         if (nid) {
+          pinnedNodeIds.add(nid)
           try {
             store.apply(canvasId, [{ op: 'updateNode', id: nid, data: { resultUrl: pinned.url } }])
           } catch (e) {
@@ -786,6 +953,82 @@ export async function postProcessCanvasPatch(
     }
   }
 
+  // 1.5 Prepare video covers for batchAddMedia video nodes.
+  //     prepareVideoForCanvas downloads the video into web-jobs/ and either
+  //     embeds the provider cover + keeps an external poster, or extracts
+  //     the first frame as a .thumb.jpg. Without this step, video cards
+  //     created via batchAddMedia have no data.poster and the frontend
+  //     LazyVideo renders a blank card (it never mounts <video> before the
+  //     first click, so even an embedded attached_pic is invisible).
+  //     sourcePath/projectId are passed so sourcePath projects keep their
+  //     media inside the user's project tree (assets/clips/) instead of the
+  //     shared web-jobs/ directory.
+  for (const op of ops) {
+    if (op.op !== 'batchAddMedia') continue
+    for (const item of op.items) {
+      if (item.kind !== 'video') continue
+      if (typeof item.url !== 'string' || !item.url.trim()) continue
+      const nid = item.nodeId
+      if (!nid) continue
+      // Read the current resultUrl in case an earlier step rewrote it.
+      const curSnap = store.snapshot(canvasId)
+      const node = curSnap.graph.nodes.find((n) => n.id === nid)
+      const rawUrl = (node?.data.resultUrl as string | undefined) ?? item.url
+      try {
+        const prepared = await prepareVideoForCanvas(rawUrl, {
+          wsRoot: mst.workspaceRoot,
+          projectId: canvasId,
+          sourcePath,
+          coverUrl: item.coverUrl,
+          providerExtras: item,
+        })
+        const updateData: Record<string, unknown> = { resultUrl: prepared.url }
+        if (prepared.poster) updateData.poster = prepared.poster
+        store.apply(canvasId, [{ op: 'updateNode', id: nid, data: updateData }])
+      } catch (e) {
+        issues.push(`warn: video cover preparation failed for node "${nid}": ${(e as Error).message} (card will show without a poster)`)
+      }
+    }
+  }
+
+  // 1.6 Backfill missing video posters when an existing video node's
+  //     `resultUrl` was rewritten via `updateNode` (or via the migration in
+  //     step 2) but no `poster` was attached. This catches the common agent
+  //     flow where a video node is created empty, then later filled by a
+  //     separate patch that just sets `data.resultUrl` to the local file
+  //     path — without this step the canvas card shows blank until the user
+  //     manually refreshes the node.
+  for (const op of ops) {
+    if (op.op !== 'updateNode') continue
+    const nid = op.id
+    if (!nid) continue
+    const curSnap = store.snapshot(canvasId)
+    const node = curSnap.graph.nodes.find((n) => n.id === nid)
+    if (!node || node.type !== 'video') continue
+    const data = node.data as Record<string, unknown>
+    const newResultUrl = (op.data?.resultUrl as string | undefined) ?? (data.resultUrl as string | undefined)
+    if (!newResultUrl || typeof newResultUrl !== 'string' || !newResultUrl.trim()) continue
+    // Already has a poster and the resultUrl didn't change — nothing to do.
+    const hasPoster = typeof data.poster === 'string' && (data.poster as string).trim() !== ''
+    const urlChanged = op.data?.resultUrl !== undefined
+    if (hasPoster && !urlChanged) continue
+    try {
+      const prepared = await prepareVideoForCanvas(newResultUrl, {
+        wsRoot: mst.workspaceRoot,
+        projectId: canvasId,
+        sourcePath,
+      })
+      const updateData: Record<string, unknown> = {}
+      if (prepared.url && prepared.url !== newResultUrl) updateData.resultUrl = prepared.url
+      if (prepared.poster && !hasPoster) updateData.poster = prepared.poster
+      if (Object.keys(updateData).length > 0) {
+        store.apply(canvasId, [{ op: 'updateNode', id: nid, data: updateData }])
+      }
+    } catch (e) {
+      issues.push(`warn: video cover backfill failed for node "${nid}": ${(e as Error).message}`)
+    }
+  }
+
   // 2. Migrate inaccessible resultUrls + 3. auto-register assets
   const postSnap = store.snapshot(canvasId)
   const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
@@ -795,7 +1038,12 @@ export async function postProcessCanvasPatch(
     )
     if (adv) issues.push(adv)
   }
+  // Nodes whose https URL was already pinned in step 1 are already indexed
+  // (origin: pinned) by pinRemoteResultUrl — re-registering them here would
+  // copy the bytes a second time into the library and produce duplicate
+  // assets. Skip them.
   for (const { nodeId, nodeType } of mediaNodes) {
+    if (pinnedNodeIds.has(nodeId)) continue
     const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
     if (adv) issues.push(adv)
   }
@@ -930,7 +1178,8 @@ export function registerCanvasRefreshNodeTool(ctx: Context): void {
     defineTool({
       name: 'canvas_refresh_node',
       description:
-        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_music). For image/video nodes, gathers upstream prompts and regenerates; for music nodes, regathers upstream text and re-runs TTS. Sets status to "running" during generation and updates resultUrl on completion.\n\n' +
+        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_tts / generate_music). For image/video nodes, gathers upstream prompts and regenerates; for music nodes, regathers upstream text — dialogue/voice-over nodes (data.dub: true) re-run generate_tts (TTS model), other music nodes re-run generate_music (music model). Sets status to "running" during generation and updates resultUrl on completion.\n\n' +
+        'ASSET CLASSIFICATION (image nodes only, optional but recommended): before/after refreshing an image node, set data.assetKind to the asset-library bucket the generated image belongs to — "character" (人物设定/立绘), "scene" (场景/背景), "prop" (道具), "conceptart" (概念设计), "reference" (参考图). When set, the downloaded file lands in the matching <project>/assets/<kind>/ subdirectory (or <wsRoot>/web-jobs/ for projects without a sourcePath). The file is NOT auto-registered into the asset-library index — the project library only tracks character/scene/audio/clip categories, so refresh-produced media stays visible on the canvas and in cross-project search (catalog "canvas") but appears in the library panel only after media_studio_register_asset. Video nodes always land in assets/clips/; music/TTS in assets/audio/.\n\n' +
         CANVAS_RULES,
       parameters: {
         canvasId: { type: 'string', description: 'Canvas id. Blank → the plugin default.' },
@@ -1020,7 +1269,7 @@ export function registerCanvasNodeAddTool(ctx: Context): void {
         data: {
           type: 'object' as const,
           additionalProperties: true as const,
-          description: 'Free-form data attached to the node. Defaults to {}.',
+          description: 'Free-form data attached to the node. Defaults to {}. For image nodes, set data.assetKind to classify the output into a library bucket — "character" (人物设定/立绘), "scene" (场景/背景), "prop" (道具), "conceptart" (概念设计), "reference" (参考图). Files land in <project>/assets/<assetKind>s/ and are indexed as library assets. Optional data.tags (string array) and data.characterRef (legacy) also influence bucket choice when assetKind is unset.',
         },
         position: {
           type: 'object' as const,

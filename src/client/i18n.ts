@@ -40,8 +40,14 @@ const DICT = {
     'project.open': '打开',
     'project.open.title': '打开项目',
     'project.open.empty': '还没有任何项目',
+    'project.empty.title': '未打开项目',
+    'project.empty.desc': '创建一个新项目，或从最近打开中选择一个项目开始工作',
+    'project.empty.action': '新建项目',
     'project.open.local': '打开本地',
     'project.open.local.busy': '正在打开文件夹…',
+    'project.revealInFolder': '在文件管理器中显示',
+    'project.revealInFolder.busy': '正在打开文件管理器…',
+    'project.revealInFolder.err': '无法打开文件管理器',
     'project.recent': '最近打开',
     'project.recent.title': '最近打开',
     'project.recent.empty': '暂无最近打开记录',
@@ -152,8 +158,14 @@ const DICT = {
     'project.open': 'Open',
     'project.open.title': 'Open Project',
     'project.open.empty': 'No projects yet',
+    'project.empty.title': 'No project open',
+    'project.empty.desc': 'Create a new project or open one from recent projects to get started',
+    'project.empty.action': 'New Project',
     'project.open.local': 'Open local folder…',
     'project.open.local.busy': 'Opening folder…',
+    'project.revealInFolder': 'Show in file manager',
+    'project.revealInFolder.busy': 'Opening file manager…',
+    'project.revealInFolder.err': 'Could not open file manager',
     'project.recent': 'Recent',
     'project.recent.title': 'Recent Projects',
     'project.recent.empty': 'No recent projects',
@@ -300,14 +312,75 @@ export function translate(lang: Lang, key: string, vars?: Record<string, string 
   return s
 }
 
+// Idempotency guard for the host LocaleRuntime. Two layers:
+//   1. Module-level cache — repeated applies of the SAME module instance
+//      reuse the first registration.
+//   2. Window-level flag — the DSH web runtime hot-reloads a plugin's client
+//      bundle by re-executing the module, which resets module state while
+//      the host LocaleRuntime keeps the dictionaries registered by the
+//      previous instance. A module-level cache alone then misses, and the
+//      second `register()` throws `locale namespace "media-studio" already
+//      has locale "zh"`. The window flag makes every module instance agree
+//      that the dictionaries are already registered and stay quiet.
+let registered: { source: LocaleSource; dispose: () => void } | null = null
+
+const GLOBAL_FLAG = '__dshMediaStudioLocaleRegistered'
+
+// `globalThis` instead of `window`: this module is also type-checked under
+// the root tsconfig's ES2022-only lib (no DOM), where `window` is undeclared;
+// in the browser globalThis IS the window object, so the flag is shared
+// across hot-reloaded module instances the same way.
+//
+// The flag stores the LocaleSource instance (not a boolean): a hot reload
+// re-registers against the SAME host instance, so comparing identities lets
+// us skip only that case while different host instances still register.
+function readGlobalFlag(): unknown {
+  try {
+    return (globalThis as Record<string, unknown>)[GLOBAL_FLAG]
+  } catch {
+    return undefined
+  }
+}
+
+function clearGlobalFlag(source: LocaleSource): void {
+  try {
+    if ((globalThis as Record<string, unknown>)[GLOBAL_FLAG] === source) {
+      delete (globalThis as Record<string, unknown>)[GLOBAL_FLAG]
+    }
+  } catch { /* ignore */ }
+}
+
 /** Register the media-studio dictionaries into a host LocaleSource under
- *  the {@link LOCALE_NS} namespace. Safe to call multiple times (the
- *  LocaleRuntime rejects duplicates); the disposer is returned for
+ *  the {@link LOCALE_NS} namespace. Safe to call multiple times against the
+ *  same host (repeated calls are idempotent no-ops that reuse the first
+ *  registration, across module reloads too); the disposer is returned for
  *  ctx.effect wiring. The fallback path (no LocaleSource) is a no-op. */
 export function registerLocaleDictionaries(source: LocaleSource | undefined | null): () => void {
   if (!source) return () => {}
+  if (registered?.source === source) {
+    // Already registered against this host instance — nothing to do.
+    return registered.dispose
+  }
+  if (readGlobalFlag() === source) {
+    // A previous module instance (hot reload / duplicate bundle) already
+    // holds the registration on this SAME host — keep quiet instead of
+    // re-registering and letting the host throw on the duplicate.
+    return () => {}
+  }
   try {
-    return source.register(LOCALE_NS, { zh: DICT.zh as Record<string, string>, en: DICT.en as Record<string, string> })
+    const dispose = source.register(LOCALE_NS, { zh: DICT.zh as Record<string, string>, en: DICT.en as Record<string, string> })
+    ;(globalThis as Record<string, unknown>)[GLOBAL_FLAG] = source
+    // The wrapped disposer doubles as the cached value, so repeated calls
+    // against the same host return the exact same function reference.
+    const wrap = (): void => {
+      // Only clear the cache when this exact registration is disposed, so a
+      // later re-apply can register fresh if the first one was torn down.
+      if (registered?.source === source) registered = null
+      clearGlobalFlag(source)
+      dispose()
+    }
+    registered = { source, dispose: wrap }
+    return wrap
   } catch (e) {
     // Duplicate (ns, locale) is the only realistic failure here — we keep
     // the dictionaries on the first call; second callers stay silent rather

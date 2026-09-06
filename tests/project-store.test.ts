@@ -263,14 +263,15 @@ describe('deletion dependency analysis & cascades', () => {
     expect(trashed).toBeTruthy()
   })
 
-  it('active switches to another project when the active one is deleted', async () => {
+  it('deleting the active project leaves activeId null (no auto-switch)', async () => {
     await makeStore()
     const a = await store.createProject('A')
     const b = await store.createProject('B')
     await store.openProject(a.id)
     const result = await store.deleteProject(a.id)
-    expect(result.switchedTo).toBe(b.id)
-    expect(store.snapshot().activeId).toBe(b.id)
+    expect(result.switchedTo).toBeNull()
+    expect(store.snapshot().activeId).toBeNull()
+    expect(store.snapshot().projects.find((p) => p.id === b.id)).toBeTruthy()
     expect(events).toContain('project-deleted')
   })
 

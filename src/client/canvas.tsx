@@ -1257,12 +1257,14 @@ function CanvasView({ canvasId }: CanvasProps) {
       // Safety net: if the server never responds (hang, network issue) the
       // SSE 'done'/'error' broadcast will still update the node — but if
       // SSE is also broken we need a client-side timeout to avoid the
-      // node being stuck on 'running' forever. 120 s is well above normal
-      // generation latency (10–60 s for images, up to 90 s for video).
+      // node being stuck on 'running' forever. Must stay ABOVE the server's
+      // refresh timeout (5 min, routes.ts) so a long video generation
+      // (30–90 s + download + ffmpeg) never gets yanked to idle before the
+      // server finishes; 5.5 min leaves margin for the SSE round-trip.
       const timeoutHandle = setTimeout(() => {
         console.warn('[media-studio] refreshNode: timeout, forcing status=idle')
         mutate([{ op: 'updateNode', id, data: { status: 'idle' as const, errorMsg: 'Refresh timed out' } }])
-      }, 120_000)
+      }, 330_000)
 
       try {
         const res = await fetch('/api/media-studio/canvas/refresh', {

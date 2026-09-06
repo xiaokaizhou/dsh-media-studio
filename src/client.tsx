@@ -46,11 +46,17 @@ export function apply(ctx: unknown): void {
     locale?: LocaleSource
   }
 
-  // Register the media-studio dictionary into the host LocaleSource under
-  // our own namespace. The host's lookup chain (active → en → common → key)
-  // then handles missing keys; we just hand over both languages and a
-  // disposer for ctx.effect wiring.
-  const disposeLocale = registerLocaleDictionaries(c.locale)
+  // Resolve the soft locale dependency ONCE while this context is still
+  // active. `c.locale` is a Cordis service getter that re-checks the fiber
+  // state on EVERY access and throws `cannot get required service "locale"
+  // in inactive context` once this context is marked inactive (hot reload /
+  // runtime lifecycle management). Tab renders happen later, on the
+  // betterSidebar render path, and must not re-enter the getter — caching
+  // the resolved reference keeps them independent of the context lifecycle
+  // (the LocaleRuntime methods we use — getSnapshot/subscribe/translate/
+  // register — never touch the context).
+  const locale = c.locale ?? null
+  const disposeLocale = registerLocaleDictionaries(locale)
 
   if (c.betterSidebar) {
     c.betterSidebar.registerTab({
@@ -60,7 +66,7 @@ export function apply(ctx: unknown): void {
       order: 40,
       component: () =>
         createElement(ProjectApp, {
-          locale: c.locale ?? null,
+          locale,
           fallbackCanvasId: DEFAULT_CANVAS_ID,
           renderCanvas: (canvasId: string) => createElement(Canvas, { canvasId, key: canvasId }),
         }),

@@ -7,8 +7,8 @@ import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import type { CanvasStore } from './canvas-store'
-import { getMediaStudioHandles } from './service-state'
-import { executeNodeRefresh, postProcessCanvasPatch } from './tools'
+import { getMediaStudioHandles, log, type MediaStudioHandles } from './service-state'
+import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch } from './tools'
 
 const MEDIA_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -88,6 +88,76 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
 function isUnderRoot(target: string, root: string): boolean {
   const r = resolve(root)
   return target === r || target.startsWith(r + sep)
+}
+
+/**
+ * Trusted tool-output allow-list: the sibling dsh-llm-multimodal plugin
+ * writes produced media to `/tmp/llm-multimodal-<kind>-<timestamp>.<ext>`
+ * (kind optional, e.g. `llm-multimodal-1788633784331.png` or
+ * `llm-multimodal-tts-1788634334017.mp3`). These are host-tool outputs, not
+ * user-supplied paths, so the media proxy serves them even though they sit
+ * outside workspaceRoot / mediaRoots. Filenames may carry a numeric
+ * timestamp (`llm-multimodal-1788633784331.png`), a kind prefix
+ * (`llm-multimodal-tts-1788634334017.mp3`), or a descriptive label chosen
+ * by callers / E2E harnesses (`llm-multimodal-i2v-fixed.mp4`). We accept
+ * any single-level filename under the fixed prefix and reject path
+ * separators, `..` segments, and `/private/tmp` symlink variants.
+ */
+const LLM_MULTIMODAL_TMP_RE = /^\/tmp\/llm-multimodal-[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.\w{2,6}$/
+
+/** Whether `requested` is a trusted dsh-llm-multimodal temp output path. */
+export function isLlmMultimodalTmpPath(requested: string): boolean {
+  return LLM_MULTIMODAL_TMP_RE.test(requested)
+}
+
+/**
+ * In-flight dedupe for background /tmp migrations: the same node is often
+ * requested repeatedly (multiple media elements, re-mounts), and
+ * migrateInaccessibleResultUrl is not idempotent between two concurrent
+ * runs (it would copy the file twice and write the index twice). One
+ * migration per path at a time is enough.
+ */
+const tmpMigrateInflight = new Map<string, Promise<void>>()
+
+/**
+ * Migrate a rendered multimodal temp output into the ACTIVE project's asset
+ * directory in the background. Reuses the same machinery the canvas patch
+ * post-process runs, so the URL ends up rewritten to
+ * `projects/<id>/assets/<kind>/<file>` — persistent and searchable.
+ *
+ * Non-fatal: any failure is logged and the served bytes are unaffected.
+ */
+async function migrateTmpMediaNode(path: string, handles: MediaStudioHandles): Promise<void> {
+  const projectId = handles.projectStore?.activeCanvasId?.()
+  if (!projectId) return
+  const pending = tmpMigrateInflight.get(path)
+  if (pending) return pending
+  const run = (async (): Promise<void> => {
+    const store = handles.canvasStore
+    const snap = store.snapshot(projectId)
+    const node = snap.graph.nodes.find((n) => {
+      const raw = (n.data as Record<string, unknown> | undefined)?.resultUrl
+      return typeof raw === 'string' && (raw === path || raw === `file://${path}`)
+    })
+    if (!node || !['image', 'video', 'music'].includes(node.type)) return
+    const meta = handles.projectStore?.snapshot?.()?.projects.find((p) => p.id === projectId)
+    await migrateInaccessibleResultUrl(
+      projectId,
+      handles.workspaceRoot,
+      handles.mediaRoots ?? [],
+      store,
+      node.id,
+      node.type,
+      meta?.sourcePath,
+    )
+  })()
+  const guarded = run
+    .catch((e: unknown) => {
+      log.warn(`[media-studio] background /tmp migration failed: ${(e as Error)?.message ?? String(e)}`)
+    })
+    .finally(() => { tmpMigrateInflight.delete(path) })
+  tmpMigrateInflight.set(path, guarded)
+  return guarded
 }
 
 /**
@@ -303,6 +373,13 @@ export function registerCanvasRoutes(ctx: Context): () => void {
   // client maps stored resultUrls onto this route (see canvas-api mediaSrc).
   // Scope-locked to the plugin workspace root; Range-enabled so <video>
   // seeking works.
+  //
+  // Trusted dsh-llm-multimodal temp outputs (/tmp/llm-multimodal-*) are
+  // served as a RENDER fallback only — resolveMediaTarget deliberately does
+  // NOT include them, because the canvas patch post-process reuses that
+  // function as its migration probe and must keep /tmp "inaccessible" so
+  // produced media gets copied into the project's asset directory
+  // (persistent + searchable) instead of lingering in a temp dir.
   wserver.register({
     kind: 'exact',
     path: '/api/media-studio/media-file',
@@ -318,11 +395,18 @@ export function registerCanvasRoutes(ctx: Context): () => void {
       const projectRoots = handles.projectStore?.allSourcePaths?.() ?? {}
       const resolved = resolveMediaTarget(requested, handles.workspaceRoot, handles.mediaRoots ?? [], projectRoots)
       if (!resolved.ok) {
-        res.writeHead(403, { 'Content-Type': 'application/json' })
-        res.end('{"ok":false,"error":"forbidden: path is outside workspaceRoot and every configured mediaRoots entry"}')
-        return
+        if (!isLlmMultimodalTmpPath(requested)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' })
+          res.end('{"ok":false,"error":"forbidden: path is outside workspaceRoot and every configured mediaRoots entry"}')
+          return
+        }
+        // Render fallback for a multimodal temp output. Serve the bytes
+        // immediately, then migrate the node into the project assets in the
+        // background (idempotent, deduped, non-fatal) so the canvas stops
+        // depending on /tmp as soon as the node is rendered.
+        void migrateTmpMediaNode(requested, handles)
       }
-      void serveMediaFile(resolved.target, req, res)
+      void serveMediaFile(resolved.ok ? resolved.target : resolve(requested), req, res)
     },
   })
 
@@ -330,8 +414,8 @@ export function registerCanvasRoutes(ctx: Context): () => void {
   // on a node with upstream connections. Delegates to the same logic as the
   // agent tool (executeNodeRefresh) so both paths share one implementation.
   // executeNodeRefresh now reaches the dsh-llm-multimodal plugin's
-  // generate_image / generate_video / generate_music tools via
-  // ctx.tools.execute().
+  // generate_image / generate_video / generate_tts / generate_music tools
+  // via ctx.tools.execute().
   wserver.register({
     kind: 'exact',
     path: '/api/media-studio/canvas/refresh',
