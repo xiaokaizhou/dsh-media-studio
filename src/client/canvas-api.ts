@@ -131,12 +131,6 @@ export interface MediaCanvasApi {
   /** Node ids that have at least one upstream (incoming) edge. Equivalent
    *  to `edgesLeft`, kept as a separate name for readability at call sites. */
   hasUpstreamById: ReadonlySet<string>
-  /** Node ids that are connected to the currently selected node (upstream +
-   *  downstream). Empty when no node is selected. */
-  highlightedNodeIds?: ReadonlySet<string>
-  /** Edge ids that are connected to the currently selected node's component.
-   *  Empty when no node is selected. */
-  highlightedEdgeIds?: ReadonlySet<string>
 }
 
 export const MediaCanvasContext = createContext<MediaCanvasApi | null>(null)
