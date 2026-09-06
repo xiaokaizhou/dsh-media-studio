@@ -14,10 +14,11 @@
 //     override so smoke previews still render.
 
 import type {} from 'dsh-better-sidebar' // triggers `ctx.betterSidebar` cordis augmentation
-import { createElement } from 'react'
+import { createElement, type ReactNode } from 'react'
 import { Canvas } from './client/canvas'
 import ProjectApp from './client/project-bar'
-import { registerLocaleDictionaries, type LocaleSource } from './client/i18n'
+import { registerLocaleDictionaries, translate, resolveLang, LOCALE_NS, type LocaleSource } from './client/i18n'
+import { IconCanvas } from './client/icons'
 
 /**
  * Runtime services we need. Both are soft dependencies — without them we
@@ -35,13 +36,49 @@ export const inject = ['betterSidebar', 'locale']
 export const DEFAULT_CANVAS_ID = 'main'
 
 /**
+ * Resolve the tab's display title from the host language. `title` supports a
+ * function form so the + menu and freshly opened tabs pick up the current
+ * DSH Settings → Language (zh → 「媒体工作室」, anything else → "Media Studio")
+ * instead of being hardcoded to English.
+ *
+ * The dictionaries are registered against the host LocaleRuntime under
+ * LOCALE_NS by registerLocaleDictionaries(); `translate(ns, key)` answers
+ * with the active locale. When no LocaleSource is wired (standalone smoke
+ * previews / tests) fall back to the module-level resolveLang() path.
+ */
+function resolveTabTitle(source: LocaleSource | null | undefined): string {
+  if (source) {
+    try {
+      return source.translate(LOCALE_NS, 'tab.title')
+    } catch {
+      // host translate can throw on a torn-down runtime — fall through
+    }
+  }
+  return translate(resolveLang(), 'tab.title')
+}
+
+/** Sidebar-tab glyph: the canvas grid mark, sized to the tab strip. */
+function renderTabIcon(size: number): ReactNode {
+  return createElement(IconCanvas, { size })
+}
+
+/**
  * Plugin entry point — called by the DSH client runtime once all declared
  * services are available.
  */
 export function apply(ctx: unknown): void {
   const c = ctx as {
     /** Provided by dsh-better-sidebar (soft dependency). */
-    betterSidebar?: { registerTab(descriptor: { id: string; title: string; single?: boolean; order?: number; component: () => unknown }): () => void }
+    betterSidebar?: {
+      registerTab(descriptor: {
+        id: string
+        title: string | (() => string)
+        icon?: (size: number) => ReactNode
+        single?: boolean
+        order?: number
+        component: () => unknown
+      }): () => void
+    }
     /** Provided by @deepseek-ai/dsh-client-locale (soft dependency). */
     locale?: LocaleSource
   }
@@ -61,7 +98,8 @@ export function apply(ctx: unknown): void {
   if (c.betterSidebar) {
     c.betterSidebar.registerTab({
       id: 'media-studio:canvas',
-      title: 'Media Studio',
+      title: () => resolveTabTitle(locale),
+      icon: renderTabIcon,
       single: true,
       order: 40,
       component: () =>

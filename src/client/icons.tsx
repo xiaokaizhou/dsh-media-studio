@@ -34,6 +34,17 @@ function makeIcon(children: ReactNode, _label: string) {
   }
 }
 
+/** Canvas / layout grid icon — used as the Media Studio sidebar-tab glyph. */
+export const IconCanvas = makeIcon(
+  <>
+    <rect x="3" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="14" width="7" height="7" rx="1" />
+    <rect x="3" y="14" width="7" height="7" rx="1" />
+  </>,
+  'Canvas',
+)
+
 export const IconImage = makeIcon(
   <>
     <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />

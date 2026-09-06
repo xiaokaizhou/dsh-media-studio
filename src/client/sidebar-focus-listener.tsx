@@ -57,7 +57,10 @@ export function SidebarFocusListener(): null {
       const sb = resolveSidebar()
       if (!sb) return
       try {
-        sb.openTab?.({ type: TAB_ID, id: TAB_ID, title: 'Media Studio' })
+        // No hardcoded title: betterSidebar fills it from the registered
+        // descriptor's locale-aware `title` so the tab keeps the current UI
+        // language (zh → 「媒体工作室」) instead of English.
+        sb.openTab?.({ type: TAB_ID, id: TAB_ID })
         sb.activateTab?.(TAB_ID)
       } catch (err) {
         // best-effort: a broken host shouldn't tear down the canvas.

@@ -34,6 +34,7 @@ const STORAGE_KEY = 'dsh-media-studio:lang'
 
 const DICT = {
   zh: {
+    'tab.title': '媒体工作室',
     'project.menu': '项目',
     'project.menu.title': '项目管理',
     'project.new': '新建项目',
@@ -152,6 +153,7 @@ const DICT = {
     'export.loading': '导出中…',
   },
   en: {
+    'tab.title': 'Media Studio',
     'project.menu': 'Project',
     'project.menu.title': 'Projects',
     'project.new': 'New Project',
