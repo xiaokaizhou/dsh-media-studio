@@ -458,6 +458,21 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   box-shadow: var(--ms-shadow-lg), 0 0 0 1px var(--ms-accent);
 }
 
+/* ── Dim non-connected nodes/edges ─────────────────────────────────── */
+/* When a node is selected, the connected component (upstream + downstream)
+ * stays at full opacity while all other nodes and edges fade to 30% so the
+ * dependency chain is instantly readable. */
+.ms-stage .canvas-card-wrap.is-dimmed {
+  opacity: 0.3;
+  transition: opacity 0.18s ease;
+  pointer-events: none; /* prevent interacting with dimmed cards */
+}
+/* Edges not connected to the selected node's component also fade. */
+.ms-stage .react-flow__edge.is-dimmed {
+  opacity: 0.3;
+  transition: opacity 0.18s ease;
+}
+
 /* ────────────────────────────────────────────────────────────────
    4b. Region layer (partition containers, inside the viewport)
    ──────────────────────────────────────────────────────────────── */

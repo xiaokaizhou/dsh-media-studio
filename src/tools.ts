@@ -474,21 +474,21 @@ export async function pinRemoteResultUrl(
 /**
  * Assemble a regeneration prompt from the upstream nodes of `nodeId`.
  *
- * Strategy:
- *   • text  nodes → concatenate `text` (or `content`) from upstream text/note
- *                   nodes, prefixed by each label so the LLM knows which
- *                   source each chunk came from.
- *   • image nodes → reuse `prompt` from upstream image nodes as the new
- *                   prompt; if no image upstreams exist, fall back to
- *                   concatenating text upstreams and appending "Generate an
- *                   image that illustrates: <context>".
- *   • video nodes → same strategy as image but with "Generate a short video: "
- *   • music nodes → concatenate text upstreams as the TTS `text`.
+ * Only the **first layer** of upstreams is read (edges whose target is this
+ * node) — grandparents must be connected explicitly if their content should
+ * reach this node.
+ *
+ * `labelPrefix: true` (default) emits `[<label>]: <content>` per upstream so
+ * an image/video model can tell which source each chunk came from.
+ * `labelPrefix: false` emits the raw content — **required for TTS / music**,
+ * where the prefix would be read aloud ("[剧本]: 我还是来晚了").
  */
 export function buildRefreshContext(
   nodeId: string,
   graph: CanvasSnapshot['graph'],
+  opts?: { labelPrefix?: boolean },
 ): string {
+  const withLabels = opts?.labelPrefix !== false
   const node = graph.nodes.find((n) => n.id === nodeId)
   if (!node) return ''
 
@@ -508,18 +508,116 @@ export function buildRefreshContext(
     if (up.type === 'text' || up.type === 'note') {
       content = (up.data.text as string | undefined) ?? (up.data.content as string | undefined) ?? ''
     } else if (up.type === 'image' || up.type === 'video') {
-      content = (up.data.prompt as string | undefined) ?? ''
+      // Prefer the authored intent; `prompt` is what agents write.
+      content = (up.data.deltaIntent as string | undefined) ?? (up.data.prompt as string | undefined) ?? ''
     } else if (up.type === 'music') {
-      content = (up.data.text as string | undefined) ?? ''
+      content = (up.data.text as string | undefined) ?? (up.data.deltaIntent as string | undefined) ?? ''
     }
-    if (content) {
-      parts.push(`[${label}]: ${content}`)
-    } else {
-      parts.push(`[${label}]: (no text content)`)
+    if (withLabels) {
+      parts.push(content ? `[${label}]: ${content}` : `[${label}]: (no text content)`)
+    } else if (content) {
+      parts.push(content)
     }
   }
 
   return parts.join('\n')
+}
+
+/**
+ * Resolve a stored media reference (`http(s)://`, `data:`, `file://`,
+ * `projects/...` project-relative, or absolute path) to something the
+ * multimodal provider can consume.
+ *
+ * `asDataUri: true` reads the file from disk and inlines it as a Base64 Data
+ * URI — required for image inputs because upstream APIs cannot reach
+ * localhost or filesystem paths.
+ * `asDataUri: false` returns an absolute local path (or the original URL) —
+ * used for `clone_audio`, which accepts local paths directly.
+ */
+function resolveMediaRef(raw: string, wsRoot: string, asDataUri: boolean): string | null {
+  if (!raw) return null
+  if (raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('data:')) {
+    return raw
+  }
+
+  let filePath: string | null = null
+  if (raw.startsWith('file://')) {
+    filePath = raw.slice(7)
+  } else if (raw.startsWith('projects/')) {
+    // projects/<canvasId>/<relativePath> → <wsRoot>/<relativePath>
+    filePath = join(wsRoot, raw.split('/').slice(2).join('/'))
+  } else if (raw.startsWith('/')) {
+    filePath = raw
+  }
+  if (!filePath) return null
+
+  if (!asDataUri) return filePath
+  try {
+    const buf = readFileSync(filePath)
+    const ext = extname(filePath).toLowerCase().replace('.', '') || 'png'
+    const isAudio = ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(ext)
+    const mime = isAudio
+      ? `audio/${ext === 'mp3' ? 'mpeg' : ext}`
+      : (ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png')
+    return `data:${mime};base64,${buf.toString('base64')}`
+  } catch {
+    return null
+  }
+}
+
+/** One resolvable media reference contributed by a first-layer upstream node. */
+export interface UpstreamRef {
+  /** Id of the upstream node that owns the media. */
+  nodeId: string
+  /** Resolved URL (http(s) / data URI / absolute path). */
+  url: string
+  /** Semantic edge label, e.g. '首帧参考' | '尾帧衔接' | '角色锚'. */
+  label?: string
+  /** `data.role` of the upstream node, e.g. 'keyframe' | 'character-sheet'. */
+  role?: string
+  /** True when the media is a video poster rather than a real image node. */
+  poster?: boolean
+}
+
+/**
+ * Collect **every** first-layer upstream media reference of `nodeId`.
+ *
+ * Images come from upstream `image` nodes (`resultUrl`) plus `video` nodes'
+ * `data.poster` (first frame) — both are valid visual references. Audios come
+ * from upstream `music` nodes (`resultUrl`) and are used as TTS voice-clone
+ * seeds so a character's timbre propagates down the graph.
+ *
+ * Ordering follows edge order; callers pick first/last frame by edge label.
+ */
+export function collectUpstreamRefs(
+  nodeId: string,
+  graph: CanvasSnapshot['graph'],
+  wsRoot: string,
+): { images: UpstreamRef[]; audios: string[] } {
+  const images: UpstreamRef[] = []
+  const audios: string[] = []
+
+  for (const e of graph.edges) {
+    if (e.target !== nodeId) continue
+    const up = graph.nodes.find((n) => n.id === e.source)
+    if (!up) continue
+    const role = up.data.role as string | undefined
+
+    if (up.type === 'image') {
+      const url = resolveMediaRef((up.data.resultUrl as string | undefined) ?? '', wsRoot, true)
+      if (url) images.push({ nodeId: up.id, url, label: e.label, role })
+    } else if (up.type === 'video') {
+      // A video's poster is its first frame — usable as a visual reference
+      // (e.g. chaining clip N's opening frame into clip N+1).
+      const url = resolveMediaRef((up.data.poster as string | undefined) ?? '', wsRoot, true)
+      if (url) images.push({ nodeId: up.id, url, label: e.label, role, poster: true })
+    } else if (up.type === 'music') {
+      const url = resolveMediaRef((up.data.resultUrl as string | undefined) ?? '', wsRoot, false)
+      if (url) audios.push(url)
+    }
+  }
+
+  return { images, audios }
 }
 
 /**
@@ -535,51 +633,7 @@ export function collectUpstreamImageUrls(
   graph: CanvasSnapshot['graph'],
   wsRoot: string,
 ): string[] {
-  const upstreamIds = graph.edges
-    .filter((e) => e.target === nodeId)
-    .map((e) => e.source)
-
-  if (upstreamIds.length === 0) return []
-
-  const urls: string[] = []
-  for (const id of upstreamIds) {
-    const up = graph.nodes.find((n) => n.id === id)
-    if (!up) continue
-    // Only image nodes can serve as I2I/I2V reference (video nodes are not
-    // valid `image` inputs for the current multimodal plugin).
-    if (up.type !== 'image') continue
-    const resultUrl = (up.data.resultUrl as string | undefined) ?? ''
-    if (!resultUrl) continue
-
-    if (resultUrl.startsWith('http://') || resultUrl.startsWith('https://')) {
-      urls.push(resultUrl)
-    } else if (resultUrl.startsWith('data:')) {
-      urls.push(resultUrl)
-    } else if (resultUrl.startsWith('file://')) {
-      // Convert local file to Base64
-      const filePath = resultUrl.replace('file://', '')
-      try {
-        const buf = readFileSync(filePath)
-        const ext = extname(filePath).toLowerCase().replace('.', '') || 'png'
-        const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png'
-        urls.push(`data:${mime};base64,${buf.toString('base64')}`)
-      } catch { /* skip unreadable files */ }
-    } else if (resultUrl.startsWith('projects/')) {
-      // Project-relative path: projects/<canvasId>/<relativePath>
-      // Resolve to workspace root and convert to Base64
-      try {
-        const parts = resultUrl.split('/')
-        // parts[0] = 'projects', parts[1] = canvasId, rest = relative path
-        const relativePath = parts.slice(2).join('/')
-        const filePath = join(wsRoot, relativePath)
-        const buf = readFileSync(filePath)
-        const ext = extname(filePath).toLowerCase().replace('.', '') || 'png'
-        const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png'
-        urls.push(`data:${mime};base64,${buf.toString('base64')}`)
-      } catch { /* skip unreadable files */ }
-    }
-  }
-  return urls
+  return collectUpstreamRefs(nodeId, graph, wsRoot).images.map((r) => r.url)
 }
 
 /**
@@ -663,6 +717,9 @@ export async function executeNodeRefresh(
   const kind = node.type as 'image' | 'video' | 'music'
   const basePrompt = ((node.data.prompt as string | undefined) ?? '').trim()
   const context = buildRefreshContext(nodeId, snap.graph)
+  // Label-free variant for TTS / music — otherwise the spoken output would
+  // literally include "[剧本]: " prefixes.
+  const rawContext = buildRefreshContext(nodeId, snap.graph, { labelPrefix: false })
   if (!basePrompt && !context) {
     return {
       ok: false,
@@ -695,9 +752,13 @@ export async function executeNodeRefresh(
     /** Video-only: optional poster path produced by prepareVideoForCanvas */
     let videoPoster: string | null = null
 
-    // Collect upstream image URLs for I2I / I2V workflows.
+    // Collect **all** first-layer upstream media references — every upstream
+    // image (and video poster) is a valid visual reference, and upstream
+    // audio can seed a TTS voice clone.
     const wsRoot = getMediaStudioHandles().workspaceRoot
-    const upstreamImageUrls = collectUpstreamImageUrls(nodeId, snap.graph, wsRoot)
+    const upstream = collectUpstreamRefs(nodeId, snap.graph, wsRoot)
+    const upstreamImageUrls = upstream.images.map((r) => r.url)
+    const negativePrompt = (node.data.negativePrompt as string | undefined)?.trim()
 
     if (kind === 'image') {
       newPrompt = basePrompt
@@ -709,10 +770,15 @@ export async function executeNodeRefresh(
       // so only attach keys that actually have a value.
       const imgModel = node.data.model as string | undefined
       if (imgModel) imageArgs.model = imgModel
-      // Pass upstream images as I2I reference when available.
+      // Pass **every** upstream image as I2I / multi-image composition
+      // reference — `generate_image.image` is an array.
       if (upstreamImageUrls.length > 0) {
         imageArgs.image = upstreamImageUrls
       }
+      // Keep the whole film on one canvas size (consistency anchor).
+      const imgSize = node.data.size as string | undefined
+      if (imgSize) imageArgs.size = imgSize
+      if (negativePrompt) imageArgs.negative_prompt = negativePrompt
       const r = await callMultimodal(ctx, 'generate_image', imageArgs, signal)
       if (!r.ok || !r.url) return fail(r.code || 'image-failed', r.message || 'no url')
       // Drop whatever the multimodal plugin returned (CDN URL / base64 /
@@ -751,9 +817,35 @@ export async function executeNodeRefresh(
       }
       const vidModel = node.data.model as string | undefined
       if (vidModel) videoArgs.model = vidModel
-      // Pass upstream images as I2V first-frame reference when available.
-      if (upstreamImageUrls.length > 0) {
-        videoArgs.image = upstreamImageUrls[0]
+      if (negativePrompt) videoArgs.negative_prompt = negativePrompt
+
+      // ── Multi-frame I2V ──────────────────────────────────────────────
+      // NOT just the first image: every first-layer upstream image is a
+      // valid reference. Edge labels pick out the special ones:
+      //   '首帧参考' → first frame (defaults to the first upstream image)
+      //   '尾帧衔接' → last frame  (enables native first+last-frame mode,
+      //                            i.e. real shot-to-shot continuity)
+      // Everything else becomes a multi-image reference set.
+      //
+      // generate_video supports: image (single I2V), keyframes (array) and
+      // mode = 'text' | 'ti2vid' | 'keyframe' | 'keyframes' | 'reference'.
+      const explicitMode = node.data.videoMode as string | undefined
+      const imgs = upstream.images
+      const firstFrame =
+        imgs.find((r) => r.label === '首帧参考' || r.label === 'first-frame') ?? imgs[0]
+      const lastFrame =
+        imgs.find((r) => r.label === '尾帧衔接' || r.label === '尾帧' || r.label === 'last-frame')
+      const refFrames = imgs.filter((r) => r !== firstFrame && r !== lastFrame)
+
+      if (firstFrame) videoArgs.image = firstFrame.url
+      if (lastFrame && firstFrame) {
+        videoArgs.mode = explicitMode ?? 'keyframes'
+        videoArgs.keyframes = [firstFrame.url, lastFrame.url]
+      } else if (refFrames.length > 0 && firstFrame) {
+        videoArgs.mode = explicitMode ?? 'reference'
+        videoArgs.keyframes = [firstFrame.url, ...refFrames.map((r) => r.url)]
+      } else if (explicitMode) {
+        videoArgs.mode = explicitMode
       }
       const r = await callMultimodal(ctx, 'generate_video', videoArgs, signal)
       if (!r.ok || !r.url) return fail(r.code || 'video-failed', r.message || 'no url')
@@ -777,7 +869,10 @@ export async function executeNodeRefresh(
       resultUrl = prepared.url
       videoPoster = prepared.poster
     } else if (kind === 'music') {
-      newPrompt = context || basePrompt || '(no upstream text content)'
+      // Upstream text wins over the node's own `data.prompt` (this is the
+      // documented music contract). Raw, unlabelled text — the labels exist
+      // only to disambiguate sources for vision models, not to be spoken.
+      newPrompt = rawContext || basePrompt || '(no upstream text content)'
       // dsh-llm-multimodal separates TTS from music models: dialogue /
       // voice-over nodes (data.dub === true) are dubbed via generate_tts,
       // BGM / sound-effect nodes go through generate_music.
@@ -786,12 +881,24 @@ export async function executeNodeRefresh(
       const audioArgs: Record<string, unknown> = { text: newPrompt }
       const voice = node.data.voice as string | undefined
       if (voice) audioArgs.voice = voice
-      if (isDub) {
-        // Per-character dubbing: carry the voice-clone seed + stable name so
-        // the character's own voice is cloned once and reused by name.
-        for (const k of ['clone_audio', 'voice_name', 'clone_voice_id'] as const) {
-          const v = node.data[k] as string | undefined
-          if (v) audioArgs[k] = v
+      const speed = node.data.speed as number | undefined
+      if (speed) audioArgs.speed = speed
+      // Per-character dubbing: carry the voice-clone seed + stable name so
+      // the character's own voice is cloned once and reused by name.
+      for (const k of ['clone_audio', 'voice_name', 'clone_voice_id'] as const) {
+        const v = node.data[k] as string | undefined
+        if (v) audioArgs[k] = v
+      }
+      // No explicit seed → inherit the timbre from an upstream audio node
+      // (e.g. a reference dub node the character's voice was cloned from).
+      // Only the first upstream audio is used; cloning from many at once is
+      // not supported by the provider.
+      if (isDub && !audioArgs.clone_audio && upstream.audios.length > 0) {
+        audioArgs.clone_audio = upstream.audios[0]
+        // Reuse the same cloned voice by name so later shots stay on-timbre.
+        if (!audioArgs.voice_name) {
+          audioArgs.voice_name =
+            (node.data.characterRef as string | undefined) || (node.data.voice_name as string | undefined) || nodeId
         }
       }
       const r = await callMultimodal(ctx, musicTool, audioArgs, signal)
@@ -811,13 +918,25 @@ export async function executeNodeRefresh(
       return fail('not-supported', `refresh not supported for kind "${kind}"`)
     }
 
+    // ── Write-back policy ────────────────────────────────────────────────
+    // Refresh is strictly one-way: it consumes upstream nodes and writes
+    // ONLY to `nodeId`. Upstream nodes are never mutated — not even when the
+    // generated result differs from what their prompt asked for. Consistency
+    // is fixed by editing the upstream *source* intentionally (which then
+    // requires a downstream re-run), never by back-writing from a child.
+    //
+    // The compiled prompt lands in `data.lastPrompt` (audit trail) while
+    // `data.prompt` keeps the authored intent. Previously the compiled
+    // prompt overwrote `data.prompt`, so every re-refresh re-ingested the
+    // previous "Context from upstream nodes:" block and the prompt grew
+    // without bound.
     const updateOp: CanvasOp = {
       op: 'updateNode',
       id: nodeId,
       data: {
         status: 'done' as const,
         resultUrl,
-        prompt: newPrompt,
+        lastPrompt: newPrompt,
         ...(kind === 'video' && videoPoster ? { poster: videoPoster } : {}),
         ...(kind === 'music' ? { text: newPrompt } : {}),
       },
@@ -1178,7 +1297,11 @@ export function registerCanvasRefreshNodeTool(ctx: Context): void {
     defineTool({
       name: 'canvas_refresh_node',
       description:
-        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_tts / generate_music). For image/video nodes, gathers upstream prompts and regenerates; for music nodes, regathers upstream text — dialogue/voice-over nodes (data.dub: true) re-run generate_tts (TTS model), other music nodes re-run generate_music (music model). Sets status to "running" during generation and updates resultUrl on completion.\n\n' +
+        'Refresh a canvas node by regenerating its media through the dsh-llm-multimodal plugin (generate_image / generate_video / generate_tts / generate_music). Sets status to "running" during generation and updates resultUrl on completion.\n\n' +
+        'UPSTREAM-DRIVEN, ONE-WAY: the node is recompiled from ALL of its first-layer upstream nodes (edges whose target is this node) — upstream text/prompt is concatenated as context, upstream IMAGES are all passed as visual references, and upstream AUDIO seeds a TTS voice clone. Refresh NEVER writes to any upstream node; it only writes the target node. The compiled prompt is stored in data.lastPrompt; data.prompt keeps the authored intent and is NOT overwritten (so repeated refreshes are idempotent).\n\n' +
+        'IMAGE nodes: prompt = data.prompt + upstream context; every upstream image node (and video poster) is passed as generate_image.image[] (multi-image I2I / composition). Honors data.size and data.negativePrompt.\n\n' +
+        'VIDEO nodes: prompt = data.prompt + upstream context; duration/size from data. Multi-frame I2V via edge labels — the upstream image labelled "首帧参考" is the first frame, the one labelled "尾帧衔接" is the last frame (native first+last-frame generation, produces real shot continuity); any remaining upstream images are passed as a reference set (mode "reference"). Set data.videoMode to force "text" | "ti2vid" | "keyframe" | "keyframes" | "reference". Honors data.negativePrompt.\n\n' +
+        'MUSIC nodes: upstream text (raw, unlabelled) wins over data.prompt — dialogue/voice-over nodes (data.dub: true) re-run generate_tts, other music nodes re-run generate_music. Honors data.voice, data.speed, data.voice_name, data.clone_audio, data.clone_voice_id; when a dub node has an upstream music node and no explicit data.clone_audio, that upstream audio is used as the voice-clone seed so the character timbre propagates.\n\n' +
         'ASSET CLASSIFICATION (image nodes only, optional but recommended): before/after refreshing an image node, set data.assetKind to the asset-library bucket the generated image belongs to — "character" (人物设定/立绘), "scene" (场景/背景), "prop" (道具), "conceptart" (概念设计), "reference" (参考图). When set, the downloaded file lands in the matching <project>/assets/<kind>/ subdirectory (or <wsRoot>/web-jobs/ for projects without a sourcePath). The file is NOT auto-registered into the asset-library index — the project library only tracks character/scene/audio/clip categories, so refresh-produced media stays visible on the canvas and in cross-project search (catalog "canvas") but appears in the library panel only after media_studio_register_asset. Video nodes always land in assets/clips/; music/TTS in assets/audio/.\n\n' +
         CANVAS_RULES,
       parameters: {

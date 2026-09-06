@@ -311,6 +311,11 @@ function NodeShell({ id, kind, status, title, toolbar, children, selected = fals
   // per-gesture `s.nodes.find(...)` cost was a measurable jank source.
   const visible = hover || selected
 
+  // Highlight state: read from context to avoid per-node store subscriptions.
+  // When no node is selected (highlightedNodeIds is empty), show all nodes.
+  // When a node is selected, only show connected nodes; dim the rest.
+  const isHighlighted = !api.highlightedNodeIds || api.highlightedNodeIds.size === 0 || api.highlightedNodeIds.has(id)
+
   const [draft, setDraft] = useState<string | null>(null)
   const shown = draft ?? title
   const commitTitle = () => {
@@ -322,7 +327,7 @@ function NodeShell({ id, kind, status, title, toolbar, children, selected = fals
   const showPill = visible && !!toolbar && toolbar.length > 0
 
   return (
-    <div className="canvas-card-wrap" style={cardWidthVar(cardW)} data-ms-id={id}>
+    <div className={`canvas-card-wrap${isHighlighted ? '' : ' is-dimmed'}`} style={cardWidthVar(cardW)} data-ms-id={id}>
       <Handle type="target" position={Position.Left} id={`${id}-in`} className="ms-handle" />
       <div
         className="node-frame-wrap"

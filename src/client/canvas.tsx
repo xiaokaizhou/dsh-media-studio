@@ -59,6 +59,7 @@ import {
   type MsSnapshot,
   type NodeKind,
   type OpenConnectOpts,
+  useMediaCanvas,
 } from './canvas-api'
 import { injectMediaStudioStyles } from './canvas-styles'
 import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn, IconEraser, IconX } from './icons'
@@ -423,6 +424,11 @@ function FlowEdgeView(props: EdgeProps) {
   const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, selected, style } = props
   const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
   const gradId = `ms-edge-${id}`
+  // Check if this edge is part of the currently selected node's connected
+  // component. Non-connected edges fade out via CSS.
+  // When no selection (empty set), show all edges.
+  const api = useMediaCanvas()
+  const isConnected = !api.highlightedEdgeIds || api.highlightedEdgeIds.size === 0 || api.highlightedEdgeIds.has(id)
   return (
     <>
       <defs>
@@ -435,6 +441,7 @@ function FlowEdgeView(props: EdgeProps) {
       <BaseEdge
         id={id}
         path={path}
+        className={!isConnected ? 'is-dimmed' : undefined}
         style={{
           stroke: selected ? '#a5b4fc' : `url(#${gradId})`,
           strokeWidth: selected ? 2.5 : 2,
@@ -833,6 +840,35 @@ function CanvasView({ canvasId }: CanvasProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap])
 
+  // ── Highlighted nodes on selection ──────────────────────────────────────
+  // When a node is selected, highlight all nodes connected to it (upstream +
+  // downstream) so the user can see the dependency chain at a glance.
+  // Non-highlighted nodes and edges fade to 30% opacity for clear visual focus.
+  const [highlightedNodeIds, setHighlightedNodeIds] = useState<ReadonlySet<string>>(new Set())
+  const [highlightedEdgeIds, setHighlightedEdgeIds] = useState<ReadonlySet<string>>(new Set())
+
+  // Pre-computed adjacency lists — cached and only rebuilt when edges change.
+  // This avoids O(E) traversal on every selection event.
+  const adjacencyRef = useRef<{
+    out: Map<string, Array<{ id: string; target: string }>>
+    in: Map<string, Array<{ id: string; source: string }>>
+  }>({ out: new Map(), in: new Map() })
+
+  // Rebuild adjacency map only when edges change (not on every render).
+  useMemo(() => {
+    const outMap = new Map<string, Array<{ id: string; target: string }>>()
+    const inMap = new Map<string, Array<{ id: string; source: string }>>()
+    for (const e of edges) {
+      const outArr = outMap.get(e.source) ?? []
+      outArr.push({ id: e.id, target: e.target })
+      outMap.set(e.source, outArr)
+      const inArr = inMap.get(e.target) ?? []
+      inArr.push({ id: e.id, source: e.source })
+      inMap.set(e.target, inArr)
+    }
+    adjacencyRef.current = { out: outMap, in: inMap }
+  }, [edges])
+
   // ── Gestures ────────────────────────────────────────────────────────────
   // Only the resize-grip gesture may persist node heights. React Flow also
   // fires 'dimensions' events on every auto-measure/layout pass (and after
@@ -878,8 +914,48 @@ function CanvasView({ canvasId }: CanvasProps) {
       if (cur) queueHistory(cur)
       postLocal(dimCommits.map((c) => ({ op: 'updateNode', id: c.id, data: { height: Math.round(c.height) } })))
     }
+
+    // Compute highlighted nodes when selection changes.
+    const selChanges = changes.filter((ch) => ch.type === 'select')
+    for (const ch of selChanges) {
+      const nodeId = ch.id
+      const isSelected = !!ch.selected
+      if (!isSelected) {
+        setHighlightedNodeIds(new Set())
+        setHighlightedEdgeIds(new Set())
+        continue
+      }
+      // Fast lookup from pre-computed adjacency: direct neighbors only.
+      const connected = new Set<string>()
+      const connectedEdges = new Set<string>()
+      const { out, in: inMap } = adjacencyRef.current
+      const queue: string[] = [nodeId]
+      connected.add(nodeId)
+      while (queue.length > 0) {
+        const curr = queue.shift()!
+        // Outgoing edges
+        for (const edge of out.get(curr) ?? []) {
+          connectedEdges.add(edge.id)
+          if (!connected.has(edge.target)) {
+            connected.add(edge.target)
+            queue.push(edge.target)
+          }
+        }
+        // Incoming edges
+        for (const edge of inMap.get(curr) ?? []) {
+          connectedEdges.add(edge.id)
+          if (!connected.has(edge.source)) {
+            connected.add(edge.source)
+            queue.push(edge.source)
+          }
+        }
+      }
+      setHighlightedNodeIds(connected)
+      setHighlightedEdgeIds(connectedEdges)
+    }
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onNodesChangeBase, postLocal, queueHistory])
+  }, [onNodesChangeBase, postLocal, queueHistory, edges])
 
   const onEdgesChange = useCallback((changes: Parameters<typeof onEdgesChangeBase>[0]) => {
     onEdgesChangeBase(changes)
@@ -1002,6 +1078,12 @@ function CanvasView({ canvasId }: CanvasProps) {
   const onPaneDoubleClick = useCallback((event: React.MouseEvent | MouseEvent) => {
     openPaneMenuAt(event.clientX, event.clientY)
   }, [openPaneMenuAt])
+
+  // Click on empty pane clears selection and highlights.
+  const onPaneClick = useCallback(() => {
+    setHighlightedNodeIds(new Set())
+    setHighlightedEdgeIds(new Set())
+  }, [])
 
   const connectStartRef = useRef<string | null>(null)
   const onConnectStart: OnConnectStart = useCallback((_event, { nodeId }) => {
@@ -1248,6 +1330,8 @@ function CanvasView({ canvasId }: CanvasProps) {
     edgesRight: connMaps.right,
     edgesLeft: connMaps.left,
     hasUpstreamById: connMaps.left,
+    highlightedNodeIds,
+    highlightedEdgeIds,
     refreshNode: async (id: string) => {
       // Optimistically set status to 'running' immediately so the user sees
       // feedback before the (potentially long) generation completes. The SSE
@@ -1334,6 +1418,7 @@ function CanvasView({ canvasId }: CanvasProps) {
             onConnectEnd={onConnectEnd}
             onPaneContextMenu={onPaneContextMenu}
             onDoubleClick={onPaneDoubleClick}
+            onPaneClick={onPaneClick}
             onMove={onMoveViewport}
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
