@@ -474,7 +474,7 @@ const EDGE_TYPES = { flow: FlowEdgeView }
 // edges (2) / nodes (6). The layer itself is pointer-events: none; only the
 // title bar and resize handle opt back in (marked nopan/nodrag so xyflow's
 // pane never turns a region click into a canvas pan).
-function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, renamingRegionId, onRenameStart, onRenameCommit, onToggleConstraint }: {
+function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, renamingRegionId, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion }: {
   regions: SRegion[]
   onFit: (id: string) => void
   onDelete: (id: string) => void
@@ -495,6 +495,8 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
   onRenameCommit: (id: string, label: string) => void
   /** Toggle region constraint. */
   onToggleConstraint: (id: string) => void
+  /** Arrange nodes inside a single region. */
+  onArrangeRegion: (id: string) => void
 }) {
   const flowStoreApi = useFlowStoreApi()
   if (regions.length === 0) return null
@@ -516,6 +518,7 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
             onRenameStart={onRenameStart}
             onRenameCommit={onRenameCommit}
             onToggleConstraint={onToggleConstraint}
+            onArrangeRegion={onArrangeRegion}
           />
         ))}
       </div>
@@ -523,7 +526,7 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
   )
 }
 
-function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, isRenaming, onRenameStart, onRenameCommit, onToggleConstraint }: {
+function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, isRenaming, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion }: {
   region: SRegion
   flowStoreApi: ReturnType<typeof useFlowStoreApi>
   onFit: (id: string) => void
@@ -536,6 +539,7 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
   onRenameStart: (id: string) => void
   onRenameCommit: (id: string, label: string) => void
   onToggleConstraint: (id: string) => void
+  onArrangeRegion: (id: string) => void
 }) {
   const [renameDraft, setRenameDraft] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -636,6 +640,16 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
         )}
         {region.kind && <span className="ms-region-kind">{region.kind}</span>}
         <span className="ms-region-title-spacer" />
+        {/* Arrange nodes in this region — only visible when region is locked */}
+        <button
+          type="button"
+          className="ms-region-btn"
+          title="Arrange nodes in region"
+          aria-label="Arrange nodes in region"
+          onClick={(e) => { e.stopPropagation(); onArrangeRegion(region.id) }}
+        >
+          <IconWand size={11} strokeWidth={1.8} />
+        </button>
         {/* Constraint toggle */}
         <button
           type="button"
@@ -1389,6 +1403,79 @@ function CanvasView({ canvasId }: CanvasProps) {
     mutate([{ op: 'updateRegion', id, constrained: !r.constrained }])
   }, [mutate])
 
+  // ── Arrange nodes inside a single region ─────────────────────────────────
+  // Only active when the region has constrained=true (lock is on). Uses the
+  // same BFS-depth layout as the global adaptive arrange, but scoped to a
+  // single region and uses the region's actual width for column sizing.
+  const arrangeSingleRegion = useCallback((id: string) => {
+    previewingRef.current = false
+    const region = regionsRef.current.find((r) => r.id === id)
+    if (!region) return
+    const flowNodes = rf.getNodes()
+    const flowEdges = rf.getEdges()
+    const members = flowNodes.filter((n) => (n.data as Record<string, unknown>).region === id)
+    if (members.length === 0) return
+
+    // Build edge maps restricted to region members only.
+    const inMap = new Map<string, string[]>()
+    const outMap = new Map<string, string[]>()
+    const memberIds = new Set(members.map((n) => n.id))
+    for (const e of flowEdges) {
+      if (!memberIds.has(e.source) || !memberIds.has(e.target)) continue
+      const a = inMap.get(e.target) ?? []; a.push(e.source); inMap.set(e.target, a)
+      const b = outMap.get(e.source) ?? []; b.push(e.target); outMap.set(e.source, b)
+    }
+
+    // BFS from roots (no incoming edges within region).
+    const depth = new Map<string, number>()
+    const queue: Array<{ id: string; d: number }> = []
+    for (const n of members) {
+      if (!inMap.get(n.id)?.length) { depth.set(n.id, 0); queue.push({ id: n.id, d: 0 }) }
+    }
+    while (queue.length) {
+      const { id, d } = queue.shift()!
+      for (const t of outMap.get(id) ?? []) {
+        if ((depth.get(t) ?? -1) < d + 1) { depth.set(t, d + 1); queue.push({ id: t, d: d + 1 }) }
+      }
+    }
+    for (const n of members) if (!depth.has(n.id)) depth.set(n.id, 0)
+
+    // Group by depth for column assignment.
+    const byDepth = new Map<number, string[]>()
+    for (const n of members) {
+      const d = depth.get(n.id) ?? 0
+      const list = byDepth.get(d) ?? []
+      list.push(n.id)
+      byDepth.set(d, list)
+    }
+
+    // Dynamic column sizing: fit columns inside region width using actual node widths.
+    const pad = 24
+    const headerH = 64
+    const usableW = region.w - pad * 2
+    let maxNodeW = cardW
+    for (const n of members) {
+      const w = n.measured?.width ?? cardW
+      if (w > maxNodeW) maxNodeW = w
+    }
+    const cols = Math.max(1, Math.floor(usableW / (maxNodeW + 20)))
+    const colPitch = maxNodeW + 20
+    const rowPitch = 280
+    const ops: MsOp[] = []
+    let i = 0
+    for (const [d, ids] of [...byDepth.entries()].sort((a, b) => a[0] - b[0])) {
+      for (const nid of ids) {
+        const col = i % cols
+        const row = Math.floor(i / cols)
+        ops.push({ op: 'moveNode', id: nid, position: { x: region.x + pad + col * colPitch, y: region.y + headerH + row * rowPitch } })
+        i++
+      }
+    }
+    if (ops.length === 0) return
+    mutate([...ops, { op: 'fitRegion' as const, id }])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rf, cardW, mutate])
+
   // Drag end: commit the final geometry through mutate() — one host op, one
   // history entry (undo returns the box to its pre-drag size). SSE echo
   // reconciles with token-equal geometry, keeping the local object identity.
@@ -1555,8 +1642,15 @@ function CanvasView({ canvasId }: CanvasProps) {
       }
       const pad = 24
       const headerH = 64
-      const colPitch = 300
-      const rowPitch = 300
+      // Use actual node widths (or cardW fallback) to compute column sizing,
+      // ensuring nodes don't overflow the region boundary.
+      let maxNodeW = cardW
+      for (const n of regionNodes) {
+        const w = n.measured?.width ?? cardW
+        if (w > maxNodeW) maxNodeW = w
+      }
+      const colPitch = maxNodeW + 20
+      const rowPitch = 280
       const cols = Math.max(1, Math.floor((region.w - pad * 2) / colPitch))
       let i = 0
       for (const [d, ids] of [...byDepth.entries()].sort((a, b) => a[0] - b[0])) {
@@ -1770,6 +1864,27 @@ function CanvasView({ canvasId }: CanvasProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutate, queueHistory, cardW])
 
+  // ── Node drag — live constraint clamp during drag ───────────────────────
+  // onNodeDrag fires on every pointermove while dragging. Clamping here keeps
+  // the node visually inside the region bounds throughout the gesture instead
+  // of only correcting it at the very end (onNodeDragStop). This prevents the
+  // node from ever being rendered outside its constrained region.
+  const onNodeDrag = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
+    const rid = (node.data as Record<string, unknown>).region as string | undefined
+    if (!rid) return
+    const region = regionsRef.current.find((r) => r.id === rid)
+    if (!region || !region.constrained) return
+    const cw = cardW
+    const ch = 240
+    const maxX = region.x + region.w - cw - CONSTRAINT_PAD
+    const maxY = region.y + region.h - REGION_HEADER_H_CONST - ch - CONSTRAINT_PAD
+    const nx = Math.max(region.x + CONSTRAINT_PAD, Math.min(maxX, node.position.x))
+    const ny = Math.max(region.y + REGION_HEADER_H_CONST + CONSTRAINT_PAD, Math.min(maxY, node.position.y))
+    if (Math.abs(nx - node.position.x) < 0.5 && Math.abs(ny - node.position.y) < 0.5) return
+    rf.setNodes((nds) => nds.map((n) => n.id === node.id ? { ...n, position: { x: nx, y: ny } } : n))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rf, cardW])
+
   // ── API for node components ─────────────────────────────────────────────
   const api = useMemo(() => ({
     canvasId,
@@ -1867,6 +1982,7 @@ function CanvasView({ canvasId }: CanvasProps) {
             onConnect={onConnect}
             onConnectStart={onConnectStart}
             onConnectEnd={onConnectEnd}
+            onNodeDrag={onNodeDrag}
             onNodeDragStop={onNodeDragStop}
             onSelectionChange={onSelectionChange}
             onPaneContextMenu={onPaneContextMenu}
@@ -1918,6 +2034,7 @@ function CanvasView({ canvasId }: CanvasProps) {
               onRenameStart={setRenamingRegionId}
               onRenameCommit={commitRegionRename}
               onToggleConstraint={toggleRegionConstraint}
+              onArrangeRegion={arrangeSingleRegion}
             />
             <MiniMapWrap />
           </ReactFlow>
@@ -1960,7 +2077,6 @@ function CanvasView({ canvasId }: CanvasProps) {
 
           <ViewBar
             autoArrange={autoArrange}
-            adaptiveAutoArrange={adaptiveAutoArrange}
             minimapOn={prefs.minimap}
             onToggleMinimap={toggleMinimap}
             onClearCanvas={() => setClearConfirmOpen(true)}
@@ -2238,9 +2354,8 @@ function CreateMenu({ menu, onClose, onPick }: {
 
 // ── View bar (auto-arrange / minimap / fit / zoom / clear) ──────────────────
 
-function ViewBar({ autoArrange, adaptiveAutoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
+function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
   autoArrange: () => void
-  adaptiveAutoArrange: () => void
   minimapOn: boolean
   onToggleMinimap: () => void
   onClearCanvas: () => void
@@ -2260,20 +2375,6 @@ function ViewBar({ autoArrange, adaptiveAutoArrange, minimapOn, onToggleMinimap,
         aria-label={t('view.autoArrange')}
       >
         <IconWand size={15} strokeWidth={1.8} />
-      </button>
-      <button
-        type="button"
-        className="ms-view-bar-btn"
-        onClick={adaptiveAutoArrange}
-        title={t('view.adaptiveAutoArrange')}
-        aria-label={t('view.adaptiveAutoArrange')}
-      >
-        <svg width="15" height="15" viewBox="0 0 15 15" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden>
-          <rect x="0.5" y="0.5" width="6" height="6" rx="1.5" />
-          <rect x="8.5" y="0.5" width="6" height="6" rx="1.5" />
-          <rect x="0.5" y="8.5" width="6" height="6" rx="1.5" />
-          <rect x="8.5" y="8.5" width="6" height="6" rx="1.5" />
-        </svg>
       </button>
       <button
         type="button"
