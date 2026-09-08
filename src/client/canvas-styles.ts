@@ -602,6 +602,17 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .media-studio-canvas .ms-region[data-constrained="true"]:hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 20%, transparent);
 }
+/* Transparent body overlay — absorbs pointer events on empty region space
+   so they don't fall through to the ReactFlow pane and trigger canvas pan. */
+.media-studio-canvas .ms-region-body {
+  position: absolute;
+  inset: 0;
+  top: 64px;       /* below the title bar */
+  bottom: 0;
+  right: 0;
+  pointer-events: auto;
+  z-index: 0;
+}
 /* Resize grip — bottom-right corner, visible on hover. */
 .media-studio-canvas .ms-region-resize {
   position: absolute;

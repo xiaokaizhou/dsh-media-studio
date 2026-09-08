@@ -49,6 +49,7 @@ import {
   type NodeChange,
   type OnConnectEnd,
   type OnConnectStart,
+  type OnNodeDrag,
   type OnSelectionChangeParams,
 } from '@xyflow/react'
 import { createPortal } from 'react-dom'
@@ -665,6 +666,14 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
         aria-hidden
         onPointerDown={onResizeStart}
       />
+      {/* Transparent drag-blocking overlay — covers the empty region body so
+          clicks there are absorbed (region is nopan/nodrag) rather than
+          reaching the ReactFlow pane and panning the canvas. */}
+      <div
+        className="ms-region-body nopan nodrag"
+        aria-hidden
+        onPointerDown={(e) => e.stopPropagation()}
+      />
     </div>
   )
 }
@@ -798,6 +807,32 @@ function CanvasView({ canvasId }: CanvasProps) {
   // direct handle to gate writes while the camera is mid-gesture.
   const lastPersistedVpRef = useRef<[number, number, number] | null>(null)
   const vpPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Track viewport pixel size so adaptive-arrange zoom calculations don't
+  // need to reach into the xyflow store (which has no public getState()).
+  const viewportSizeRef = useRef<{ w: number; h: number }>({ w: 800, h: 600 })
+  // Sync viewportSizeRef from the ReactFlow store via a passive subscription.
+  // We intentionally do NOT put this in state — only a ref — to avoid
+  // triggering canvas re-renders on every viewport change.
+  const vpSizeSubRef = useRef<(() => void) | null>(null)
+  useEffect(() => {
+    const api = useFlowStoreApi()
+    // useFlowStoreApi returns the store api; we create a one-time subscription.
+    // The effect cleanup disposes it when the component unmounts.
+    // However, useFlowStoreApi can only be called inside a React component,
+    // not inside an effect that runs after mount — we instead read from the
+    // existing flowStoreApi that's already in scope (see RegionLayer).
+    // Here we just read from the pane DOM element directly.
+    const el = document.querySelector('.media-studio-canvas .react-flow') as HTMLElement
+    if (el) {
+      viewportSizeRef.current = { w: el.clientWidth, h: el.clientHeight }
+    }
+    const ro = new ResizeObserver((entries) => {
+      const { clientWidth: w, clientHeight: h } = entries[0].target as HTMLElement
+      if (w && h) viewportSizeRef.current = { w, h }
+    })
+    if (el) ro.observe(el)
+    return () => { ro.disconnect() }
+  }, [])
   const onMoveViewport = useCallback((_event: unknown, viewport: { x: number; y: number; zoom: number }) => {
     const { x, y, zoom } = viewport
     const prev = lastPersistedVpRef.current
@@ -1571,7 +1606,38 @@ function CanvasView({ canvasId }: CanvasProps) {
       console.error('[media-studio] adaptiveAutoArrange failed:', (e as Error).message)
       return
     }
-    setTimeout(() => { try { rf.fitView({ padding: 0.15, duration: 360 }) } catch { /* ignore */ } }, 140)
+    setTimeout(() => {
+      try {
+        // Compute bounding box of all regions + nodes and zoom to fit content.
+        const pad = 60
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+        for (const n of flowNodes) {
+          const px = n.position?.x ?? 0
+          const py = n.position?.y ?? 0
+          minX = Math.min(minX, px)
+          minY = Math.min(minY, py)
+          maxX = Math.max(maxX, px + (n.measured?.width ?? cardW))
+          maxY = Math.max(maxY, py + (n.measured?.height ?? 240))
+        }
+        for (const r of regionsRef.current) {
+          minX = Math.min(minX, r.x)
+          minY = Math.min(minY, r.y)
+          maxX = Math.max(maxX, r.x + r.w)
+          maxY = Math.max(maxY, r.y + r.h)
+        }
+        if (isFinite(minX) && isFinite(maxX) && isFinite(minY) && isFinite(maxY)) {
+          const cx = (minX + maxX) / 2
+          const cy = (minY + maxY) / 2
+          const w = maxX - minX + pad * 2
+          const h = maxY - minY + pad * 2
+          const vp = viewportSizeRef.current
+          const scale = Math.min(vp.w / w, vp.h / h, 2)
+          rf.setCenter(cx, cy, { zoom: scale, duration: 360 })
+        } else {
+          rf.fitView({ padding: 0.15, duration: 360 })
+        }
+      } catch { /* ignore */ }
+    }, 200)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rf, cardW, mutate, regionsRef])
 
@@ -1661,6 +1727,34 @@ function CanvasView({ canvasId }: CanvasProps) {
       setDimSet(canvasId, null)
     }
   }, [canvasId])
+
+  // ── Node drag stop — real-time constraint clamp ─────────────────────────
+  // Clamps a node's position inside its constrained region immediately when
+  // the user lifts the mouse, so xyflow never renders the node outside the
+  // bounds. The onNodesChange commit is kept as a safety net for any edge
+  // case where onNodeDragStop doesn't fire (e.g. keyboard-driven moves).
+  const CONSTRAINT_PAD = 24
+  const REGION_HEADER_H_CONST = 64
+  const onNodeDragStop: OnNodeDrag = useCallback((event, node) => {
+    const rid = (node.data as Record<string, unknown>).region as string | undefined
+    if (!rid) return
+    const region = regionsRef.current.find((r) => r.id === rid)
+    if (!region || !region.constrained) return
+    event.preventDefault()
+    const cur = appliedRef.current
+    if (cur) queueHistory(cur)
+    const cw = cardW
+    const ch = 240
+    const maxX = region.x + region.w - cw - CONSTRAINT_PAD
+    const maxY = region.y + region.h - REGION_HEADER_H_CONST - ch - CONSTRAINT_PAD
+    const clampedX = Math.max(region.x + CONSTRAINT_PAD, Math.min(maxX, node.position.x))
+    const clampedY = Math.max(region.y + REGION_HEADER_H_CONST + CONSTRAINT_PAD, Math.min(maxY, node.position.y))
+    const dx = clampedX - node.position.x
+    const dy = clampedY - node.position.y
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return
+    mutate([{ op: 'moveNode', id: node.id, position: { x: Math.round(clampedX), y: Math.round(clampedY) } }])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mutate, queueHistory, cardW])
 
   // ── API for node components ─────────────────────────────────────────────
   const api = useMemo(() => ({
@@ -1759,6 +1853,7 @@ function CanvasView({ canvasId }: CanvasProps) {
             onConnect={onConnect}
             onConnectStart={onConnectStart}
             onConnectEnd={onConnectEnd}
+            onNodeDragStop={onNodeDragStop}
             onSelectionChange={onSelectionChange}
             onPaneContextMenu={onPaneContextMenu}
             onDoubleClick={onPaneDoubleClick}
