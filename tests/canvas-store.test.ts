@@ -397,4 +397,251 @@ describe('CanvasStore — regions (partition containers)', () => {
     expect(snap.graph.regions[0]).toMatchObject({ id: 'r-sb', label: '分镜区', kind: 'storyboard' })
     expect(snap.graph.nodes[0].data.region).toBe('r-sb')
   })
+
+  it('moveNode into a constrained region clamps the position inside the region bounds', () => {
+    store.apply('main', [
+      { op: 'addRegion', label: 'lockbox', id: 'r-lock', x: 100, y: 100, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-a', regionId: 'r-lock', position: { x: 120, y: 180 } },
+    ])
+    // Try to drag the node outside the region (far to the right).
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-a', position: { x: 5000, y: 5000 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-a')!
+    // Must be clamped inside the region — range is the FULL box (no
+    // PAD/HEADER reservation): x in [100, 580], y in [100, 260]
+    // (region 720×400 minus card 240×240).
+    expect(node.position!.x).toBeLessThanOrEqual(580)
+    expect(node.position!.y).toBeLessThanOrEqual(260)
+    expect(node.position!.x).toBeGreaterThanOrEqual(100)
+    expect(node.position!.y).toBeGreaterThanOrEqual(100)
+  })
+
+  it('moveNode into a constrained region can still move freely when the request lands inside', () => {
+    store.apply('main', [
+      { op: 'addRegion', label: 'lockbox', id: 'r-lock', x: 100, y: 100, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-a', regionId: 'r-lock', position: { x: 120, y: 180 } },
+    ])
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-a', position: { x: 200, y: 220 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-a')!
+    expect(node.position).toEqual({ x: 200, y: 220 })
+  })
+
+  it('moveNode without constrained region allows positions anywhere', () => {
+    store.apply('main', [
+      { op: 'addRegion', label: 'freebox', id: 'r-free', x: 100, y: 100, w: 720, h: 400 },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-a', regionId: 'r-free', position: { x: 120, y: 180 } },
+    ])
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-a', position: { x: 5000, y: 5000 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-a')!
+    expect(node.position).toEqual({ x: 5000, y: 5000 })
+  })
+
+  it('re-locking a region leaves previously-outside members in place (drops membership)', () => {
+    // Regression for "unlock → drag node out → re-lock". The node is a
+    // member (regionId) but its center sits far outside the box. Flipping the
+    // lock ON must NOT yank it back in: it drops membership and stays put, so
+    // it also stops following region drags.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-x', x: 100, y: 100, w: 720, h: 400 },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-a', regionId: 'r-x', position: { x: 5000, y: 5000 } },
+    ])
+    const r = store.apply('main', [{ op: 'updateRegion', id: 'r-x', constrained: true }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-a')!
+    expect('region' in node.data).toBe(false)
+    expect(node.position).toEqual({ x: 5000, y: 5000 }) // left where it was
+  })
+
+  it('locking a region still claps members that are inside the box back in', () => {
+    // Counterpart: a member whose center is INSIDE the box is clamped to fit
+    // fully within the (no PAD/HEADER) bounds on lock — the normal locked
+    // invariant for nodes that genuinely belong.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-in', x: 100, y: 100, w: 720, h: 400 },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-in', regionId: 'r-in', position: { x: 50, y: 50 } },
+    ])
+    // center (170,170) is inside the 100..820 × 100..500 box.
+    const r = store.apply('main', [{ op: 'updateRegion', id: 'r-in', constrained: true }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-in')!
+    expect(node.data.region).toBe('r-in') // still a member
+    // Full-region clamp: x in [100, 580], y in [100, 260] → card snaps to (100,100).
+    expect(node.position).toEqual({ x: 100, y: 100 })
+  })
+
+  it('shrinking a constrained region pulls members back inside the new bounds', () => {
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-shrink', x: 0, y: 0, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-shrink', regionId: 'r-shrink', position: { x: 400, y: 100 } },
+    ])
+    // Shrink the region so the existing child would spill out (the card
+    // extends from x=400 to x=640, well inside the 720-wide box).
+    const r = store.apply('main', [{ op: 'updateRegion', id: 'r-shrink', w: 360, h: 400 }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-shrink')!
+    // Full-region clamp — card right edge may reach `region.x + region.w`,
+    // card top-left may be at `region.y` (no PAD / HEADER reservation).
+    expect(node.position!.x + 240).toBeLessThanOrEqual(360)
+    expect(node.position!.y).toBeGreaterThanOrEqual(0)
+  })
+
+  it('type-aware clamp uses a text card\'s stored data.height (regression: content-fit text overflowing locked region)', () => {
+    // A content-fit text card whose actual rendered height is 300 px must
+    // have regionNodeHeight return 300, so the constrained-region clamp
+    // reserves `region.h - 300` of vertical space — NOT 160 (the unset
+    // default) and NOT 240 (the media default). This is the contract the
+    // client relies on when it auto-persists measured height on first render.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-tall', x: 0, y: 0, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'text', label: 'long script', nodeId: 'n-tall', regionId: 'r-tall', position: { x: 100, y: 500 }, data: { height: 300 } },
+    ])
+    // moveNode to a y that would exceed the 160-default clamp but fit the
+    // 300-aware clamp (y_max = 0 + 400 - 300 = 100, so 150 is clamped to 100).
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-tall', position: { x: 100, y: 150 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-tall')!
+    expect(node.position!.y).toBe(100) // clamped by data.height=300, not 240 (would give 160) nor 160 (would give 240)
+  })
+
+  it('image card with persisted data.height (cardW-dependent) clamps correctly (regression: cardW ≠ 240 overflow)', () => {
+    // When the canvas pane is wide, `cardW` is up to 280 px and an image
+    // card's true rendered height is 280 — NOT the historical 240 default.
+    // The client now auto-persists the measured height to `data.height` on
+    // every measurement, and the server's `regionNodeHeight` reads it. This
+    // test pins the server contract the client relies on: a persisted
+    // data.height of 280 must drive the clamp (y_max = region.h - 280),
+    // even for an image card.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-wide', x: 0, y: 0, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'wide card', nodeId: 'n-wide', regionId: 'r-wide', position: { x: 100, y: 200 }, data: { height: 280 } },
+    ])
+    // y_max with h=280 is 0 + 400 - 280 = 120. Send y=200 → clamp to 120.
+    // The old 240-default would have given y=160, which leaves the card
+    // bottom at 160+280=440 — 40 px past the region's 400 bottom.
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-wide', position: { x: 100, y: 200 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-wide')!
+    expect(node.position!.y).toBe(120)
+  })
+
+  it('music card with persisted data.height (cardW×9/16) clamps correctly (regression: cardW ≠ 240 overflow)', () => {
+    // Music cards are 16:9 — at cardW=240 the height is 135, but at
+    // cardW=280 the height is 157.5. Persisting the measured height
+    // ensures the clamp follows the pane width.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-mu', x: 0, y: 0, w: 720, h: 300, constrained: true },
+      { op: 'addNode', type: 'music', label: 'wide music', nodeId: 'n-mu', regionId: 'r-mu', position: { x: 100, y: 200 }, data: { height: 158 } },
+    ])
+    // y_max with h=158 is 0 + 300 - 158 = 142. Send y=200 → clamp to 142.
+    const r = store.apply('main', [{ op: 'moveNode', id: 'n-mu', position: { x: 100, y: 200 } }])
+    const node = r.graph.nodes.find((n) => n.id === 'n-mu')!
+    expect(node.position!.y).toBe(142)
+  })
+
+  it('region drag commit (updateRegion + per-child moveNode batch) moves every child by exactly the region delta', () => {
+    // The region-drag UI commits a single batch on pointer-up:
+    //   [ { op: 'updateRegion', id, x, y }, ...moveNode for each child... ]
+    // Each moveNode carries the child's NEW position (orig + delta), not
+    // a relative delta — verify the server applies them exactly so the
+    // optimistic local frame matches the persisted state with zero
+    // post-commit "jump" caused by an SSE echo mismatch.
+    store.apply('main', [
+      { op: 'addRegion', label: 'flow', id: 'r-flow', x: 100, y: 100, w: 720, h: 400 },
+      { op: 'addNode', type: 'image', label: 'a', nodeId: 'n-a', regionId: 'r-flow', position: { x: 120, y: 180 } },
+      { op: 'addNode', type: 'image', label: 'b', nodeId: 'n-b', regionId: 'r-flow', position: { x: 380, y: 180 } },
+      { op: 'addNode', type: 'image', label: 'c', nodeId: 'n-c', regionId: 'r-flow', position: { x: 640, y: 180 } },
+      // c lives outside the region — a member pin (constrained=true) would
+      // clamp it; we don't constrain here so the dragged moveNode value
+      // must be respected verbatim.
+    ])
+    const dx = 50
+    const dy = 30
+    const r = store.apply('main', [
+      { op: 'updateRegion', id: 'r-flow', x: 100 + dx, y: 100 + dy },
+      { op: 'moveNode', id: 'n-a', position: { x: 120 + dx, y: 180 + dy } },
+      { op: 'moveNode', id: 'n-b', position: { x: 380 + dx, y: 180 + dy } },
+      { op: 'moveNode', id: 'n-c', position: { x: 640 + dx, y: 180 + dy } },
+    ])
+    expect(r.graph.regions[0]).toMatchObject({ x: 150, y: 130 })
+    expect(r.graph.nodes.find((n) => n.id === 'n-a')!.position).toEqual({ x: 170, y: 210 })
+    expect(r.graph.nodes.find((n) => n.id === 'n-b')!.position).toEqual({ x: 430, y: 210 })
+    expect(r.graph.nodes.find((n) => n.id === 'n-c')!.position).toEqual({ x: 690, y: 210 })
+    // Membership survives the batch.
+    for (const n of r.graph.nodes) {
+      expect(n.data.region).toBe('r-flow')
+    }
+  })
+
+  it('region drag commit on a constrained region clamps children that would spill', () => {
+    // Counterpart to the free-drag case: when the region is locked, the
+    // client must clamp the child moveNode coordinates to the new box so
+    // the SSE echo doesn't snap them. Verify the server applies the same
+    // clamp authoritatively.
+    store.apply('main', [
+      { op: 'addRegion', label: 'lockbox', id: 'r-lk', x: 0, y: 0, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'left', nodeId: 'n-l', regionId: 'r-lk', position: { x: 50, y: 100 } },
+      { op: 'addNode', type: 'image', label: 'right', nodeId: 'n-r', regionId: 'r-lk', position: { x: 400, y: 100 } },
+    ])
+    // Drag the box 200px right — left child would land at x=250 (still
+    // inside the new 200..920 box) but right child would land at x=600
+    // (still inside). To force a clamp we'd need an even larger drag;
+    // use dx=1000 to put both far outside, then verify they're pulled back.
+    const r = store.apply('main', [
+      { op: 'updateRegion', id: 'r-lk', x: 1000, y: 0 },
+      { op: 'moveNode', id: 'n-l', position: { x: 1050, y: 100 } },
+      { op: 'moveNode', id: 'n-r', position: { x: 1400, y: 100 } },
+    ])
+    const box = r.graph.regions[0]
+    const cardW = 240
+    const cardH = 240
+    // Full-region clamp — no PAD/HEADER reservation. The card top-left
+    // can land at the box's left/top edges and the card's right/bottom
+    // edges can land at the box's right/bottom edges.
+    for (const n of r.graph.nodes) {
+      expect(n.position!.x).toBeGreaterThanOrEqual(box.x)
+      expect(n.position!.x + cardW).toBeLessThanOrEqual(box.x + box.w)
+      expect(n.position!.y).toBeGreaterThanOrEqual(box.y)
+      expect(n.position!.y + cardH).toBeLessThanOrEqual(box.y + box.h)
+    }
+  })
+
+  it('updateNode with region: null clears membership (auto-detect "dragged out")', () => {
+    // The onNodeDragStop auto-detect flow clears membership with an explicit
+    // `region: null` (NOT `undefined` — JSON.stringify drops undefined, so an
+    // undefined payload would reach the server as `{}` and leave the region
+    // key intact). Verify the server actually deletes the key so the node
+    // detaches and no longer follows the region / gets pulled back on lock.
+    store.apply('main', [
+      { op: 'addRegion', label: 'box', id: 'r-out', x: 0, y: 0, w: 720, h: 400, constrained: true },
+      { op: 'addNode', type: 'image', label: 'inside', nodeId: 'n-out', regionId: 'r-out', position: { x: 100, y: 100 } },
+    ])
+    const before = store.snapshot('main')
+    expect(before.graph.nodes[0].data.region).toBe('r-out')
+
+    const after = store.apply('main', [
+      { op: 'updateNode', id: 'n-out', data: { region: null } },
+    ])
+    // Membership cleared AND the key removed (not just set to undefined) so
+    // the persisted graph stays clean.
+    expect('region' in after.graph.nodes[0].data).toBe(false)
+    expect(after.graph.nodes[0].data.region).toBeUndefined()
+
+    // Now the node can move anywhere — even into a constrained region's box
+    // it is not clamped because it is no longer a member.
+    const free = store.apply('main', [
+      { op: 'moveNode', id: 'n-out', position: { x: 9999, y: 9999 } },
+    ])
+    expect(free.graph.nodes[0].position).toEqual({ x: 9999, y: 9999 })
+  })
+
+  it('updateNode preserves other data fields when only region changes (the auto-detect edit)', () => {
+    // The auto-detect flow writes only `{ region: <id> }` — the shallow
+    // merge in updateNode must not drop the node's prompt, label, status,
+    // or any other field the user has touched.
+    store.apply('main', [
+      { op: 'addRegion', label: 'flow', id: 'r-flow2' },
+      { op: 'addNode', type: 'image', label: 'image', nodeId: 'n-img', data: { prompt: 'a cat', status: 'done' }, position: { x: 200, y: 200 } },
+    ])
+    const after = store.apply('main', [
+      { op: 'updateNode', id: 'n-img', data: { region: 'r-flow2' } },
+    ])
+    const n = after.graph.nodes.find((x) => x.id === 'n-img')!
+    expect(n.data.region).toBe('r-flow2')
+    expect(n.data.prompt).toBe('a cat')
+    expect(n.data.status).toBe('done')
+  })
 })

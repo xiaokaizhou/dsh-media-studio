@@ -129,8 +129,8 @@
 - 边可带语义 `label`（如「角色清单来源」「一致性锚点」）。**画布 UI 不渲染边标签**（产品决定：视觉上只保留连线本体）；`label` 仍随 `connect` 写入图数据并参与版本令牌，供刷新协议 / 语义字典使用。
 - 持久化：`canvases/<id>.json` 顶层新增 `regions` 数组，旧文件缺省视为空；`restore` / 级联迁移均带 regions。
 - **自动扩容**：`addNode` / `batchAddMedia` 带 `regionId` 落宫格时，若新节点超出分区右/下沿，分区 `w/h` 就地扩大（宫格 240px 卡片 + 300px 列/行距，60px 间距），保证「节点永远在盒内」——agent 无需手工维护几何；节点被手动拖出后可用 `canvas_region_fit` 收拢。
-- **autoArrange 自动收拢**：`canvas_auto_arrange`（含 `regionId` 单分区版）整理完节点位置后，会自动对受影响的分区执行 `fitRegion`，盒子紧贴内容，不会留下大片空白。
-- **客户端交互**（`ms-region-layer` 经 `ViewportPortal` 渲染进 viewport，随缩放平移）：标题栏提供「贴合内容」「删除分区」按钮；右下角手柄可拖拽调整大小（落盘一次 `updateRegion`，可撤销）。
+- **autoArrange 自动收拢**：`canvas_auto_arrange`（含 `regionId` 单分区版）整理完节点位置后，会自动对受影响的分区执行 `fitRegion`，盒子紧贴内容（底部仅留 `REGION_PAD` 内边距，不设 HEADER 预留），不会留下大片空白。`fitRegion` 保证区域底部始终不低于内容最低点 + 内边距，因此即便节点被移到区域顶部附近，盒子也不会短到导致节点溢出。
+- **客户端交互**（`ms-region-layer` 经 `ViewportPortal` 渲染进 viewport，随缩放平移）：标题栏提供「贴合内容」「删除分区」按钮；右下角手柄可拖拽调整大小（落盘一次 `updateRegion`，可撤销）。**整张分区可拖动**：分区盒的 `.ms-region` 容器本身是 `pointer-events:auto` + `nopan nodrag` 的拖拽面，从标题栏、标题带空白、或盒内任意空白处按下并拖动即可移动分区，分区内子节点跟随一起平移（点击按钮 / 重命名输入框 / 右下角调把手柄不会触发拖动，落点交给各自的事件流；因此盒顶那条标题带不会再「透传给画布平移」）。拖动期间 `data-region-dragging` 切换为 `true`，CSS 提供 grabbing 光标 + 加亮边框的 active 视觉反馈。**锁定图标**：`constrained=true` 时锁按钮带 `is-locked` 类，蓝色图标 + 浅蓝底片，一眼可辨已锁。**节点自动归属**：用户把节点视觉上拖进某个分区后，`onNodeDragStop` 会按节点中心点所在分区自动写入 `data.region`；拖出分区时用显式 `region: null` 清掉归属（`undefined` 会被 `JSON.stringify` 丢弃、到服务端不生效，故用 `null`，服务端 `updateNode` 见 `region===null` 即删除该键）。**重新加锁不回收外部节点**：`updateRegion` 刚把 `constrained` 从 false 翻成 true（`justLocked`）时，中心点已在盒外的成员**直接脱落归属**（留在原地、不再跟随分区拖拽），盒内成员照常夹回盒内；而已经是锁定态的分区做 resize/move 时仍按旧行为把溢出成员夹回盒内（`justLocked=false`）。分区锁定后，锁定的活动范围是**整个分区**（`[region.x, region.x + region.w - cardW] × [region.y, region.y + region.h - cardH]`），不再有 PAD 或 HEADER 预留内缩。
 
 ## 画布 Tab
 

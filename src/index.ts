@@ -46,6 +46,7 @@ import {
 import { CanvasStore } from './canvas-store'
 import { registerCanvasRoutes } from './routes'
 import { ProjectStore, type ProjectEvent } from './project-store'
+import { createMediaStudioService, MEDIA_STUDIO_SERVICE_NAME } from './media-studio-service'
 import { registerProjectRoutes } from './project-routes'
 import { registerAssetRoutes } from './asset-routes'
 import { registerSearchRoutes } from './search-routes'
@@ -196,6 +197,25 @@ export function apply(ctx: Context, config: ConfigShape): void {
     logger: ctx.logger,
   }
   setMediaStudioHandles(handles)
+
+  // ── Cross-plugin service surface ────────────────────────────────────────
+  // Publish `mediaStudio` on the root context so sibling plugins can read
+  // it with `ctx.get('mediaStudio')` at call time. dsh-llm-multimodal uses
+  // it to write generated media into the ACTIVE project's asset tree
+  // (<sourcePath>/assets/<kind>/) instead of a shared web-jobs directory.
+  //
+  // The registration is wrapped so a failure (name collision, unusual host)
+  // degrades to a warning — consumers fall back to their legacy outputDir
+  // behaviour, the plugin itself keeps working. `provide` auto-unregisters
+  // when this plugin's fiber unloads; we intentionally do NOT add it to
+  // `inject` (that would hard-depend every sibling on this service).
+  try {
+    ;(ctx as unknown as { reflect: { provide(name: string, value: unknown): unknown } }).reflect
+      .provide(MEDIA_STUDIO_SERVICE_NAME, createMediaStudioService(wsRoot, projectStore))
+    ctx.logger?.info?.(`[media-studio] provided "${MEDIA_STUDIO_SERVICE_NAME}" service for sibling plugins (active-project asset routing)`)
+  } catch (e) {
+    ctx.logger?.warn?.(`[media-studio] failed to provide "${MEDIA_STUDIO_SERVICE_NAME}" service: ${(e as Error).message} — sibling plugins will fall back to their outputDir default`)
+  }
 
   // Surface the default workspace at boot so the canvas store can read it
   // before any user interaction.

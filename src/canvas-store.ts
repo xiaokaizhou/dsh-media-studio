@@ -139,6 +139,10 @@ export type CanvasOp =
     y?: number
     w?: number
     h?: number
+    /** Create the region already locked (constrained). Mirrors the
+     *  updateRegion flag so a single addRegion call can land in a
+     *  fully-configured, ready-to-use partition. */
+    constrained?: boolean
   }
   | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number; constrained?: boolean }
   | { op: 'deleteRegion'; id: string }
@@ -606,6 +610,11 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
       const n = graph.nodes.find((x) => x.id === op.id)
       if (!n) return `node "${op.id}" not found`
       n.data = { ...n.data, ...op.data }
+      // Explicit `region: null` is the "clear membership" sentinel. JSON
+      // drops `undefined`, so the client sends `null` to survive the
+      // round-trip; removing the key keeps the persisted graph clean and
+      // actually detaches the node from the region.
+      if (op.data.region === null) delete n.data.region
       return null
     }
     case 'renameNode': {
@@ -624,6 +633,28 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
     case 'moveNode': {
       const n = graph.nodes.find((x) => x.id === op.id)
       if (!n) return `node "${op.id}" not found`
+      // Constrained-region lock: if this node belongs to a region with
+      // constrained=true, clamp the requested position inside the region
+      // bounds so the node can never escape — even via direct REST/agent
+      // patches that bypass the client's drag clamp. The client does the
+      // same clamp optimistically on drag; this server-side check is the
+      // authoritative enforcement.
+      //
+      // The clamp spans the FULL region box (no PAD / HEADER reservation)
+      // to match the client. `clampInside` handles the "card bigger than
+      // region" degenerate case by collapsing `min > max` to a no-op so we
+      // never write NaN.
+      const regionId = (n.data as Record<string, unknown>).region as string | undefined
+      if (regionId) {
+        const region = graph.regions.find((r) => r.id === regionId)
+        if (region?.constrained) {
+          const cardW = REGION_CARD_W
+          const cardH = regionNodeHeight(n)
+          const clamped = clampInside(op.position, region, cardW, cardH)
+          n.position = { x: Math.round(clamped.x), y: Math.round(clamped.y) }
+          return null
+        }
+      }
       n.position = op.position
       return null
     }
@@ -659,12 +690,14 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
         y: op.y ?? (bottom === 0 ? SLOT_MARGIN : bottom + 60),
         w: op.w ?? REGION_W,
         h: op.h ?? REGION_H,
+        ...(op.constrained ? { constrained: true } : {}),
       })
       return null
     }
     case 'updateRegion': {
       const r = graph.regions.find((x) => x.id === op.id)
       if (!r) return `region "${op.id}" not found`
+      const wasConstrained = r.constrained === true
       if (op.label !== undefined) r.label = op.label
       if (op.kind !== undefined) r.kind = op.kind
       if (op.x !== undefined) r.x = op.x
@@ -672,6 +705,34 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
       if (op.w !== undefined) r.w = op.w
       if (op.h !== undefined) r.h = op.h
       if (op.constrained !== undefined) r.constrained = op.constrained
+      // Constrained-region maintenance. Two distinct cases:
+      //  • justLocked — the user flipped the switch on in THIS op. A member
+      //    whose center has already left the box (dragged out while unlocked)
+      //    should NOT be yanked back; we drop its membership so it neither
+      //    follows region drags nor gets pulled in.
+      //  • geometry change on an already-locked region (shrink/move) — the
+      //    "locked nodes stay inside" invariant must hold, so members that
+      //    spill out of the new box are clamped back inside.
+      if (r.constrained) {
+        const justLocked = op.constrained === true && !wasConstrained
+        const cardW = REGION_CARD_W
+        for (const n of graph.nodes) {
+          if ((n.data as Record<string, unknown>).region !== op.id) continue
+          const cardH = regionNodeHeight(n)
+          const cur = n.position ?? { x: r.x, y: r.y }
+          const cx = cur.x + cardW / 2
+          const cy = cur.y + cardH / 2
+          const centerOutside = cx < r.x || cx > r.x + r.w || cy < r.y || cy > r.y + r.h
+          if (centerOutside && justLocked) {
+            delete (n.data as Record<string, unknown>).region
+            continue
+          }
+          const clamped = clampInside(cur, r, cardW, cardH)
+          if (clamped.x !== n.position?.x || clamped.y !== n.position?.y) {
+            n.position = { x: Math.round(clamped.x), y: Math.round(clamped.y) }
+          }
+        }
+      }
       return null
     }
     case 'deleteRegion': {
@@ -696,11 +757,17 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
         maxX = Math.max(maxX, p.x + REGION_CARD_W)
         maxY = Math.max(maxY, p.y + regionNodeHeight(n))
       }
-      // Tight wrap: header band on top, small padding elsewhere.
+      // Tight wrap: header band on top (`REGION_HEADER_H`), small padding
+      // below content. The bottom of the region must extend at least
+      // `REGION_HEADER_H` below the content top (so nodes that happen to
+      // sit above the header band still leave room below). Otherwise the
+      // region would be too short and cards would overflow the bottom edge.
+      const bodyTop = minY + REGION_HEADER_H
+      const bottom = Math.max(maxY + REGION_PAD, bodyTop + REGION_PAD)
       region.x = Math.round(minX - REGION_PAD)
       region.y = Math.round(minY - REGION_HEADER_H)
       region.w = Math.round(maxX - minX + REGION_PAD * 2)
-      region.h = Math.round(maxY - minY + REGION_HEADER_H + REGION_PAD)
+      region.h = Math.round(bottom - region.y)
       return null
     }
     case 'batchAddMedia': {
@@ -839,14 +906,47 @@ const REGION_CARD_H_MEDIA = 240
 const REGION_CARD_H_MUSIC = 135
 const REGION_CARD_H_TEXT = 160
 
-/** Estimated rendered height of a node card (used by fitRegion bounding box). */
+/** Estimated rendered height of a node card (used by fitRegion bounding box
+ *  and the constrained-region clamp). For every type we first read the
+ *  measured/persisted `data.height` so the clamp reflects the card's true
+ *  rendered size — critical for media cards whose height tracks the
+ *  pane-derived cardW (200–280 px) and would otherwise be stuck at the
+ *  historical 240/135 defaults and overflow a locked region. Type-specific
+ *  values are only fallbacks for the first render before measurement. */
 function regionNodeHeight(n: CanvasNode): number {
+  const stored = (n.data as { height?: unknown } | undefined)?.height
+  const hasStored = typeof stored === 'number' && stored > 0
+  if (hasStored) return stored as number
   if (n.type === 'music') return REGION_CARD_H_MUSIC
-  if (n.type === 'text' || n.type === 'note') {
-    const h = (n.data as { height?: unknown }).height
-    return typeof h === 'number' && h > 0 ? h : REGION_CARD_H_TEXT
-  }
+  if (n.type === 'text' || n.type === 'note') return REGION_CARD_H_TEXT
   return REGION_CARD_H_MEDIA
+}
+
+/** Clamp a node's top-left so its card (cardW × cardH) stays fully inside
+ *  the region box. Uses the FULL region — no PAD / HEADER reservation — so
+ *  users can park a card anywhere from the region's left edge to
+ *  `region.x + region.w - cardW` (and similarly for y). The min/max swap
+ *  guards against the degenerate "card bigger than region" case where
+ *  `min > max`; the clamp then collapses to a no-op rather than writing
+ *  NaN positions. */
+function clampInside(
+  pos: { x: number; y: number },
+  region: { x: number; y: number; w: number; h: number },
+  cardW: number,
+  cardH: number,
+): { x: number; y: number } {
+  const minX = region.x
+  const minY = region.y
+  const maxX = region.x + region.w - cardW
+  const maxY = region.y + region.h - cardH
+  const loX = Math.min(minX, maxX)
+  const hiX = Math.max(minX, maxX)
+  const loY = Math.min(minY, maxY)
+  const hiY = Math.max(minY, maxY)
+  return {
+    x: Math.max(loX, Math.min(hiX, pos.x)),
+    y: Math.max(loY, Math.min(hiY, pos.y)),
+  }
 }
 
 function regionSlot(graph: CanvasGraph, regionId: string): { x: number; y: number } {

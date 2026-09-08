@@ -177,6 +177,14 @@ function projectNodeOne(n: SNode): FlowNode {
       // including the echo of the very patch that stored it — doesn't drop
       // it and collapse the card back to its default size.
       height: n.data.height,
+      // Region membership: server records it as `data.region = <regionId>`
+      // when the node is created via addNode/batchAddMedia with a regionId.
+      // Without copying it onto the React Flow node's data every region-aware
+      // client behavior fails silently — region-drag won't move children,
+      // the constrained-region clamp never fires, region-scoped auto-arrange
+      // finds no members. Carry it here so all those code paths share the
+      // same source of truth.
+      region: n.data.region,
     },
   }
 }
@@ -197,14 +205,25 @@ function projectedNodeToken(n: SNode): string {
  * node objects whose content is unchanged. Per-version SSE updates then only
  * re-render the cards that actually changed instead of remounting the whole
  * canvas — the main source of UI-wide jank on large canvases.
+ *
+ * `frozenIds` (optional) lets the caller preserve the local position of
+ * specific nodes across the merge. This is how a region drag keeps child
+ * nodes pinned to the live drag delta even when an SSE echo arrives mid
+ * gesture with the pre-drag coordinates: those positions would otherwise
+ * win the token comparison and snap the children back to where they started.
  */
 function mergeNodes(
   prev: FlowNode[],
   graph: SGraph,
   tokenCache: Map<string, string>,
+  frozenIds?: ReadonlySet<string>,
 ): FlowNode[] {
   if (prev.length === 0 || graph.nodes.length === 0) {
     tokenCache.clear()
+    if (!frozenIds || frozenIds.size === 0) return projectNodes(graph)
+    // Even on the cold-start path, project the graph normally — there is no
+    // prior position to "freeze" yet. Caller is expected to seed `prev`
+    // before the first SSE lands.
     return projectNodes(graph)
   }
   const prevById = new Map(prev.map((n) => [n.id, n]))
@@ -218,6 +237,13 @@ function mergeNodes(
       continue
     }
     const projected = projectNodeOne(n)
+    // Position lock for nodes the caller is locally driving (e.g. children
+    // riding along a region drag): carry over the previous position so the
+    // SSE echo — which carries the pre-drag coordinates — can't snap them
+    // back. Everything else (label, data, status, …) follows the snapshot.
+    if (frozenIds && frozenIds.has(n.id) && existing?.position) {
+      projected.position = existing.position
+    }
     tokenCache.set(n.id, token)
     out.push(projected)
   }
@@ -288,6 +314,63 @@ function projectRegions(graph: SGraph): SRegion[] {
   return (graph.regions ?? []).map((r) => ({ ...r }))
 }
 
+/** Returns the node's top-left clamped to the region box, sized so the
+ *  card (cardW × cardH) stays fully inside. Range is the FULL region —
+ *  no PAD reservation and no HEADER reservation — so users can park a
+ *  card anywhere from the region's left edge to `region.x + region.w -
+ *  cardW`, and from `region.y` to `region.y + region.h - cardH`. If the
+ *  card is bigger than the region (impossible in practice but possible
+ *  via extreme resize), `min > max` and the clamp degenerates to a
+ *  no-op; the node is left where it is rather than pushed to NaN. */
+function clampInsideRegion(
+  pos: { x: number; y: number },
+  region: SRegion,
+  cardW: number,
+  cardH: number,
+): { x: number; y: number } {
+  const minX = region.x
+  const minY = region.y
+  const maxX = region.x + region.w - cardW
+  const maxY = region.y + region.h - cardH
+  const loX = Math.min(minX, maxX)
+  const hiX = Math.max(minX, maxX)
+  const loY = Math.min(minY, maxY)
+  const hiY = Math.max(minY, maxY)
+  return {
+    x: Math.max(loX, Math.min(hiX, pos.x)),
+    y: Math.max(loY, Math.min(hiY, pos.y)),
+  }
+}
+
+// Mirror of the host `regionNodeHeight` (src/canvas-store.ts). The host is the
+// source of truth for constrained-region clamping, so the client's live clamps
+// and auto-detect must use the SAME per-type height or the SSE echo will land
+// at a different coordinate and the card will visibly snap back. The old fixed
+// 240 made text/note (160) and music (135) cards judge/ clamp at the wrong
+// size — the "imprecise region" symptom. For all types we first read the
+// measured/persisted `data.height` (set by the auto-persist below) so the
+// clamp reflects the card's TRUE rendered height, which for image/video/music
+// tracks `cardW` (the pane-derived width, 200–280 px) and for text/note
+// tracks content or user-resize. Type-specific defaults are only used as
+// fallbacks when no measurement has been recorded yet.
+const REGION_CARD_H_MUSIC = 135
+const REGION_CARD_H_TEXT = 160
+const REGION_CARD_H_MEDIA = 240
+function regionCardH(n: { type?: string; data?: unknown }): number {
+  const t = n.type
+  if (t === 'music') {
+    const h = ((n.data ?? {}) as { height?: unknown }).height
+    return typeof h === 'number' && h > 0 ? h : REGION_CARD_H_MUSIC
+  }
+  if (t === 'text' || t === 'note') {
+    const h = ((n.data ?? {}) as { height?: unknown }).height
+    return typeof h === 'number' && h > 0 ? h : REGION_CARD_H_TEXT
+  }
+  // image / video: prefer measured height, fall back to the historical 240
+  const h = ((n.data ?? {}) as { height?: unknown }).height
+  return typeof h === 'number' && h > 0 ? h : REGION_CARD_H_MEDIA
+}
+
 /** Deterministic local mirror of the host apply() for UI-fired ops, so the
  *  optimistic state matches the SSE echo. Edge ids are client placeholders —
  *  content comparison ignores them. Region ops mirror the host rules
@@ -311,7 +394,18 @@ function applyLocalOps(
           id,
           type: op.type,
           position: op.position ?? { x: 0, y: 0 },
-          data: { kind: op.type, label: op.label, ...(op.data ?? {}) },
+          // Mirror server apply(): when regionId is set, record membership as
+          // `data.region = regionId`. Without this, the optimistic local
+          // mirror says "no region" and region-aware client code (drag
+          // children-along, constrained clamp, region-scoped arrange) misbehaves
+          // for the brief window before the SSE echo lands — and also never
+          // recovers if the SSE is delayed.
+          data: {
+            kind: op.type,
+            label: op.label,
+            ...(op.data ?? {}),
+            ...(op.regionId ? { region: op.regionId } : {}),
+          },
         }]
         break
       }
@@ -329,7 +423,14 @@ function applyLocalOps(
         break
       }
       case 'updateNode': {
-        ns = ns.map((n) => (n.id === op.id ? { ...n, data: { ...(n.data as object), ...op.data } } : n))
+        ns = ns.map((n) => {
+          if (n.id !== op.id) return n
+          const merged = { ...(n.data as object), ...op.data } as Record<string, unknown>
+          // `region: null` = "clear membership" — mirror the server by
+          // deleting the key so the optimistic node matches the SSE echo.
+          if (op.data.region === null) delete merged.region
+          return { ...n, data: merged }
+        })
         break
       }
       case 'connect': {
@@ -474,7 +575,7 @@ const EDGE_TYPES = { flow: FlowEdgeView }
 // edges (2) / nodes (6). The layer itself is pointer-events: none; only the
 // title bar and resize handle opt back in (marked nopan/nodrag so xyflow's
 // pane never turns a region click into a canvas pan).
-function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, renamingRegionId, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion }: {
+function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, renamingRegionId, draggingRegionId, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion, membersCountMap }: {
   regions: SRegion[]
   onFit: (id: string) => void
   onDelete: (id: string) => void
@@ -489,6 +590,10 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
   onDragStart: (regionId: string, clientX: number, clientY: number, e: React.PointerEvent) => void
   /** Currently-renamed region id (null = none). */
   renamingRegionId: string | null
+  /** Currently-being-dragged region id (null = none). Surfaces on the
+   *  RegionBox as `data-region-dragging` so CSS can paint an active state
+   *  (cursor change + dim siblings). */
+  draggingRegionId: string | null
   /** Start inline rename for a region. */
   onRenameStart: (id: string) => void
   /** Commit a region rename. */
@@ -497,6 +602,9 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
   onToggleConstraint: (id: string) => void
   /** Arrange nodes inside a single region. */
   onArrangeRegion: (id: string) => void
+  /** Counts of members per region, keyed by id — used by the arrange
+   *  button to show a disabled state when there's nothing to arrange. */
+  membersCountMap: ReadonlyMap<string, number>
 }) {
   const flowStoreApi = useFlowStoreApi()
   if (regions.length === 0) return null
@@ -515,6 +623,8 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
             onDragStateChange={onDragStateChange}
             onDragStart={onDragStart}
             isRenaming={r.id === renamingRegionId}
+            draggingRegionId={draggingRegionId}
+            membersCount={membersCountMap.get(r.id) ?? 0}
             onRenameStart={onRenameStart}
             onRenameCommit={onRenameCommit}
             onToggleConstraint={onToggleConstraint}
@@ -526,7 +636,7 @@ function RegionLayer({ regions, onFit, onDelete, onResizeLocal, onResizeCommit, 
   )
 }
 
-function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, isRenaming, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion }: {
+function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onResizeCommit, onDragStateChange, onDragStart, isRenaming, draggingRegionId, membersCount, onRenameStart, onRenameCommit, onToggleConstraint, onArrangeRegion }: {
   region: SRegion
   flowStoreApi: ReturnType<typeof useFlowStoreApi>
   onFit: (id: string) => void
@@ -536,6 +646,12 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
   onDragStateChange: (dragging: boolean) => void
   onDragStart: (regionId: string, clientX: number, clientY: number, e: React.PointerEvent) => void
   isRenaming: boolean
+  /** Id of the region currently being dragged (or null). When it matches
+   *  `region.id` we paint the active state via `data-region-dragging`. */
+  draggingRegionId: string | null
+  /** Number of nodes whose `data.region` equals this region's id. Used
+   *  to disable the arrange button when there are no children. */
+  membersCount: number
   onRenameStart: (id: string) => void
   onRenameCommit: (id: string, label: string) => void
   onToggleConstraint: (id: string) => void
@@ -572,6 +688,15 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
   }
 
   const handleDragStart = (e: React.PointerEvent) => {
+    // Skip drag if the pointerdown originated on an interactive child
+    // (button, rename input, resize grip). Buttons own their own click
+    // flow (delete / lock toggle / arrange) — starting a drag there would
+    // swallow the click before the onClick handler can fire. Same for the
+    // resize grip and the inline rename input.
+    const target = e.target as HTMLElement | null
+    if (target && target.closest('.ms-region-btn, .ms-region-rename-input, .ms-region-resize')) {
+      return
+    }
     e.preventDefault()
     e.stopPropagation()
     onDragStart(region.id, e.clientX, e.clientY, e)
@@ -597,18 +722,22 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
 
   return (
     <div
-      className="ms-region"
+      className="ms-region nopan nodrag"
       data-kind={region.kind ?? 'generic'}
       data-constrained={region.constrained ? 'true' : 'false'}
+      data-region-dragging={draggingRegionId === region.id ? 'true' : 'false'}
       style={{ left: region.x, top: region.y, width: region.w, height: region.h }}
+      onPointerDown={handleDragStart}
     >
-      <div className="ms-region-title nopan nodrag">
-        {/* Drag handle — left side of title bar */}
+      <div className="ms-region-title nopan nodrag" onPointerDown={handleDragStart}>
+        {/* Drag handle — left side of title bar. Visual affordance only;
+            the whole title bar (and the body overlay below) also start
+            the same drag, so users can grab the partition from anywhere
+            except the rename input, the buttons, or the resize grip. */}
         <div
-          className="ms-region-drag-handle nopan nodrag"
+          className="ms-region-drag-handle"
           title="拖动移动分区及子节点"
           aria-label="Drag to move region"
-          onPointerDown={handleDragStart}
         >
           <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor" aria-hidden>
             <circle cx="2.5" cy="2.5" r="1.5" />
@@ -626,13 +755,14 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
             onChange={(e) => setRenameDraft(e.target.value)}
             onBlur={handleRenameInputBlur}
             onKeyDown={handleRenameInputKeydown}
+            onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             autoFocus
           />
         ) : (
           <span
             className="ms-region-label ms-region-label-clickable"
-            title="点击重命名"
+            title="点击重命名 · 拖动以移动分区"
             onClick={handleLabelClick}
           >
             {region.label}
@@ -640,12 +770,18 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
         )}
         {region.kind && <span className="ms-region-kind">{region.kind}</span>}
         <span className="ms-region-title-spacer" />
-        {/* Arrange nodes in this region — only visible when region is locked */}
+        {/* Arrange nodes in this region — always visible so users can
+            trigger layout even on unconstrained regions. Disabled (grayed
+            out, no pointer events) when the region has no members.
+            Buttons stop the pointerdown from bubbling so a click on the
+            button doesn't also start a region drag. */}
         <button
           type="button"
-          className="ms-region-btn"
-          title="Arrange nodes in region"
+          className={`ms-region-btn${membersCount === 0 ? ' is-disabled' : ''}`}
+          title={membersCount === 0 ? '分区内暂无节点' : '整理分区内节点布局'}
           aria-label="Arrange nodes in region"
+          disabled={membersCount === 0}
+          onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => { e.stopPropagation(); onArrangeRegion(region.id) }}
         >
           <IconWand size={11} strokeWidth={1.8} />
@@ -653,10 +789,11 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
         {/* Constraint toggle */}
         <button
           type="button"
-          className="ms-region-btn"
-          title={region.constrained ? '解锁：允许节点移出分区' : '约束：限制节点在分区内移动'}
+          className={`ms-region-btn${region.constrained ? ' is-locked' : ''}`}
+          title={region.constrained ? '已锁定：节点被约束在分区内' : '未锁定：点击锁定，限制节点在分区内移动'}
           aria-label={region.constrained ? 'Unlock region constraint' : 'Constrain region'}
           aria-pressed={region.constrained}
+          onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => { e.stopPropagation(); onToggleConstraint(region.id) }}
         >
           {region.constrained
@@ -669,6 +806,7 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
           className="ms-region-btn ms-region-btn-danger"
           title="删除分区（不删除内部节点）"
           aria-label={`Delete region ${region.label}`}
+          onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => { e.stopPropagation(); onDelete(region.id) }}
         >
           <IconX size={11} strokeWidth={2.2} />
@@ -680,13 +818,16 @@ function RegionBox({ region, flowStoreApi, onFit, onDelete, onResizeLocal, onRes
         aria-hidden
         onPointerDown={onResizeStart}
       />
-      {/* Transparent drag-blocking overlay — covers the empty region body so
-          clicks there are absorbed (region is nopan/nodrag) rather than
-          reaching the ReactFlow pane and panning the canvas. */}
+      {/* Transparent body overlay — now the primary drag surface for the
+          empty region area. Mirrors the title-bar drag start so users can
+          grab the partition from anywhere except interactive children
+          (buttons / rename input / resize grip). The handler also stops
+          propagation so the pointerdown never reaches ReactFlow's pane
+          and starts a canvas pan. */}
       <div
         className="ms-region-body nopan nodrag"
         aria-hidden
-        onPointerDown={(e) => e.stopPropagation()}
+        onPointerDown={handleDragStart}
       />
     </div>
   )
@@ -935,7 +1076,15 @@ function CanvasView({ canvasId }: CanvasProps) {
     // Reference-preserving merge: only cards whose content actually changed
     // are replaced, so memoized node components skip re-renders and the
     // whole canvas no longer remounts on every version tick.
-    setNodes((cur) => mergeNodes(cur, snap.graph, nodeTokenCacheRef.current))
+    //
+    // During a region drag the children ride along at a position the host
+    // doesn't know yet — pass their ids as `frozenIds` so the SSE echo of
+    // pre-drag coordinates can't snap them back to where the gesture
+    // started.
+    const frozenIds = draggingRegionId
+      ? frozenChildIdsRef.current ?? undefined
+      : undefined
+    setNodes((cur) => mergeNodes(cur, snap.graph, nodeTokenCacheRef.current, frozenIds))
     setEdges((cur) => mergeEdges(cur, snap.graph.edges))
     if (!draggingRegionRef.current) {
       setRegions((cur) => mergeRegions(cur, snap.graph.regions ?? []))
@@ -991,15 +1140,12 @@ function CanvasView({ canvasId }: CanvasProps) {
     previewingRef.current = false
     let draggingNow = false
     const commits: Array<{ id: string; position: { x: number; y: number } }> = []
-    const dimCommits: Array<{ id: string; height: number }> = []
+    const dimCommits: Array<{ id: string; width?: number; height: number }> = []
     // Constrained-region clamp: when a node belongs to a region with
     // constrained=true, its flow-position must stay inside the region bounds
     // (padding + card size). We clamp during the commit phase so the SSE
     // echo also carries the clamped value.
     const CARD_W = cardW
-    const CARD_H = 240
-    const CONstrain_PAD = 24
-    const REGION_HEADER_H_LOCAL = 64
     for (const ch of changes) {
       if (ch.type === 'position' && ch.dragging) {
         interactingRef.current = true
@@ -1007,16 +1153,18 @@ function CanvasView({ canvasId }: CanvasProps) {
       }
       if (ch.type === 'position' && !ch.dragging && ch.position) {
         // Find the region this node belongs to and check if it's constrained.
-        const nodeData = nodesRef.current.find((n) => n.id === ch.id)?.data as Record<string, unknown> | undefined
-        const regionId = nodeData?.region as string | undefined
-        if (regionId) {
+        const node = nodesRef.current.find((n) => n.id === ch.id)
+        const regionId = (node?.data as Record<string, unknown> | undefined)?.region as string | undefined
+        if (regionId && node) {
           const region = regionsRef.current.find((r) => r.id === regionId)
           if (region?.constrained) {
-            const maxX = region.x + region.w - CARD_W - CONstrain_PAD
-            const maxY = region.y + region.h - REGION_HEADER_H_LOCAL - CARD_H - CONstrain_PAD
-            const clampedX = Math.max(region.x + CONstrain_PAD, Math.min(maxX, ch.position.x))
-            const clampedY = Math.max(region.y + REGION_HEADER_H_LOCAL + CONstrain_PAD, Math.min(maxY, ch.position.y))
-            commits.push({ id: ch.id, position: { x: Math.round(clampedX), y: Math.round(clampedY) } })
+            // Full-region clamp (no PAD/HEADER reservation) at the card's real
+            // height — see `clampInsideRegion` / `regionCardH` (mirrors the host
+            // clamp exactly so the committed value matches the SSE echo). This
+            // is the safety-net path for keyboard nudges and any move that
+            // bypassed onNodeDragStop.
+            const clamped = clampInsideRegion(ch.position, region, CARD_W, regionCardH(node))
+            commits.push({ id: ch.id, position: { x: Math.round(clamped.x), y: Math.round(clamped.y) } })
           } else {
             commits.push({ id: ch.id, position: ch.position })
           }
@@ -1032,7 +1180,47 @@ function CanvasView({ canvasId }: CanvasProps) {
           resizingIdsRef.current.add(ch.id)
         } else if (ch.dimensions && resizingIdsRef.current.has(ch.id)) {
           resizingIdsRef.current.delete(ch.id)
-          dimCommits.push({ id: ch.id, height: ch.dimensions.height })
+          dimCommits.push({ id: ch.id, height: ch.dimensions.height, width: ch.dimensions.width })
+        } else if (ch.dimensions) {
+          // Auto-persist the measured card size so the constrained-region
+          // clamp uses the card's TRUE rendered size instead of the
+          // historical fixed defaults (image 240 / music 135 / text 160).
+          // Rules:
+          //   - text/note: persist height ONLY when undefined (preserves any
+          //     prior user resize). Width is fixed (240), no need to persist.
+          //   - image/video/music: persist both width and height on every
+          //     measurement. These cards have no user-resize, and their
+          //     height tracks `cardW` (the pane-derived card width, which
+          //     varies 200–280 px), so the measurement IS the truth. When
+          //     the pane resizes and cardW changes, the next measurement
+          //     overwrites the stored value and the clamp stays accurate.
+          const node = nodesRef.current.find((n) => n.id === ch.id)
+          const t = node?.type
+          if (!node || !t) break
+          const data = (node.data ?? {}) as Record<string, unknown>
+          const measuredH = Math.round(ch.dimensions.height)
+          const measuredW = Math.round(ch.dimensions.width)
+          if (t === 'text' || t === 'note') {
+            const hasStored = typeof data.height === 'number' && (data.height as number) > 0
+            if (!hasStored && measuredH > 0) {
+              dimCommits.push({ id: ch.id, height: measuredH })
+            }
+          } else {
+            // image / video / music
+            const storedW = data.width
+            const storedH = data.height
+            const wChanged = measuredW > 0 && (typeof storedW !== 'number' || storedW !== measuredW)
+            const hChanged = measuredH > 0 && (typeof storedH !== 'number' || storedH !== measuredH)
+            if (wChanged || hChanged) {
+              const update: { id: string; width?: number; height: number } = {
+                id: ch.id,
+                height: storedH && typeof storedH === 'number' ? storedH : measuredH,
+              }
+              if (wChanged) update.width = measuredW
+              if (hChanged) update.height = measuredH
+              dimCommits.push(update)
+            }
+          }
         }
       }
     }
@@ -1046,7 +1234,11 @@ function CanvasView({ canvasId }: CanvasProps) {
     if (dimCommits.length > 0) {
       const cur = appliedRef.current
       if (cur) queueHistory(cur)
-      postLocal(dimCommits.map((c) => ({ op: 'updateNode', id: c.id, data: { height: Math.round(c.height) } })))
+      postLocal(dimCommits.map((c) => {
+        const data: Record<string, number> = { height: Math.round(c.height) }
+        if (typeof c.width === 'number') data.width = c.width
+        return { op: 'updateNode', id: c.id, data }
+      }))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onNodesChangeBase, postLocal, queueHistory, cardW, regionsRef])
@@ -1299,7 +1491,12 @@ function CanvasView({ canvasId }: CanvasProps) {
     nodePositions: Map<string, { x: number; y: number }>
     startX: number
     startY: number
+    childIds: Set<string>
   } | null>(null)
+  // Frozen child-node ids during a region drag — the SSE handler reads this
+  // ref so an echo of pre-drag coordinates can never snap the children back
+  // to where the gesture started. Cleared at drag end.
+  const frozenChildIdsRef = useRef<Set<string> | null>(null)
 
   const onRegionDragStart = useCallback((regionId: string, clientX: number, clientY: number, e: React.PointerEvent) => {
     e.preventDefault()
@@ -1308,11 +1505,25 @@ function CanvasView({ canvasId }: CanvasProps) {
     if (!r) return
     setDraggingRegionId(regionId)
     const nodePositions = new Map<string, { x: number; y: number }>()
+    const childIds = new Set<string>()
     for (const n of nodesRef.current) {
       if ((n.data as Record<string, unknown>).region !== regionId) continue
       nodePositions.set(n.id, n.position ?? { x: 0, y: 0 })
+      childIds.add(n.id)
     }
-    dragStartRef.current = { regionId, regionX: r.x, regionY: r.y, nodePositions, startX: clientX, startY: clientY }
+    // Seed the freeze list so an SSE echo that lands before the effect's
+    // first pointermove can't revert the children to their pre-drag
+    // positions.
+    frozenChildIdsRef.current = childIds
+    dragStartRef.current = {
+      regionId,
+      regionX: r.x,
+      regionY: r.y,
+      nodePositions,
+      startX: clientX,
+      startY: clientY,
+      childIds,
+    }
   }, [])
 
   useEffect(() => {
@@ -1331,6 +1542,12 @@ function CanvasView({ canvasId }: CanvasProps) {
     // setNodes) into a single paint per frame. Without this, pointermove
     // fires two independent React state updates per frame → 120 renders/s at
     // 60 Hz. With RAF, we coalesce to one render per frame (60 renders/s).
+    // The local clamp MUST mirror the host's authoritative `updateRegion` /
+    // `moveNode` re-clamp (full box, no PAD/HEADER reservation, per-child
+    // type-aware height) or the SSE echo lands at a different coordinate and
+    // the children visibly jump. See clampInsideRegion + regionCardH.
+    const REGION_DRAG_CARD_W = 240
+    const REGION_DRAG_CARD_H_FALLBACK = 240
     let rafId: number | null = null
     let pendingDx = 0
     let pendingDy = 0
@@ -1343,6 +1560,20 @@ function CanvasView({ canvasId }: CanvasProps) {
         dirty = false
         const dx = pendingDx
         const dy = pendingDy
+        // Constrained-region drag: when the region is locked, the children's
+        // (orig.x + dx, orig.y + dy) target can fall outside the box the
+        // region will have at the new position (e.g. dragging a tall
+        // region's bottom edge up against a child sitting near the bottom).
+        // Clamp here so the child rides along visually AND the SSE echo
+        // returns the same coordinates — otherwise the server's authoritative
+        // clamp would silently re-place the child a few px away and the user
+        // would see "the node didn't follow the region".
+        const draggingRegion = regionsRef.current.find((r) => r.id === draggingRegionId)
+        const isConstrained = draggingRegion?.constrained === true
+        const newRegionX = start.regionX + dx
+        const newRegionY = start.regionY + dy
+        const boxW = draggingRegion?.w ?? 720
+        const boxH = draggingRegion?.h ?? 400
         setRegions((cur) => cur.map((r) =>
           r.id === draggingRegionId ? { ...r, x: Math.round(start.regionX + dx), y: Math.round(start.regionY + dy) } : r,
         ))
@@ -1350,7 +1581,16 @@ function CanvasView({ canvasId }: CanvasProps) {
           if ((n.data as Record<string, unknown>).region !== draggingRegionId) return n
           const orig = start.nodePositions.get(n.id)
           if (!orig) return n
-          return { ...n, position: { x: Math.round(orig.x + dx), y: Math.round(orig.y + dy) } }
+          if (!isConstrained) {
+            return { ...n, position: { x: Math.round(orig.x + dx), y: Math.round(orig.y + dy) } }
+          }
+          const targetX = Math.round(orig.x + dx)
+          const targetY = Math.round(orig.y + dy)
+          // Full-box, per-child type-aware height — mirrors the host clamp so
+          // the coordinates the user sees == the coordinates the echo carries.
+          const clampedX = Math.max(newRegionX, Math.min(newRegionX + boxW - REGION_DRAG_CARD_W, targetX))
+          const clampedY = Math.max(newRegionY, Math.min(newRegionY + boxH - regionCardH(n), targetY))
+          return { ...n, position: { x: clampedX, y: clampedY } }
         }))
       })
     }
@@ -1365,12 +1605,38 @@ function CanvasView({ canvasId }: CanvasProps) {
       window.removeEventListener('pointerup', up)
       if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null }
       setDraggingRegionId(null)
+      // Drag is ending — release the SSE freeze. Clearing here (rather than
+      // after mutate) means the echo of the very patch we are about to send
+      // already runs without the freeze; local positions match the snap
+      // anyway, so freezing or not freezing is visually identical, but
+      // letting the freeze linger risks gating a concurrent unrelated
+      // SSE patch from updating other nodes while we hold it.
+      frozenChildIdsRef.current = null
       // Commit the move as a batch op.
       const dx = (ev.clientX - start.startX) / zoom
       const dy = (ev.clientY - start.startY) / zoom
+      const draggingRegion = regionsRef.current.find((r) => r.id === draggingRegionId)
+      const isConstrained = draggingRegion?.constrained === true
+      const newRegionX = start.regionX + dx
+      const newRegionY = start.regionY + dy
+      const boxW = draggingRegion?.w ?? 720
+      const boxH = draggingRegion?.h ?? 400
       const ops: MsOp[] = [{ op: 'updateRegion', id: draggingRegionId, x: Math.round(start.regionX + dx), y: Math.round(start.regionY + dy) }]
       for (const [nid, orig] of start.nodePositions) {
-        ops.push({ op: 'moveNode', id: nid, position: { x: Math.round(orig.x + dx), y: Math.round(orig.y + dy) } })
+        const targetX = Math.round(orig.x + dx)
+        const targetY = Math.round(orig.y + dy)
+        // Apply the same clamp the live drag loop used, so the committed
+        // moveNode coordinates are identical to what the user already sees
+        // on the canvas — no SSE echo "jump". Full box + per-child height.
+        let finalX = targetX
+        let finalY = targetY
+        if (isConstrained) {
+          const member = nodesRef.current.find((n) => n.id === nid)
+          const cardH = member ? regionCardH(member) : REGION_DRAG_CARD_H_FALLBACK
+          finalX = Math.max(newRegionX, Math.min(newRegionX + boxW - REGION_DRAG_CARD_W, targetX))
+          finalY = Math.max(newRegionY, Math.min(newRegionY + boxH - cardH, targetY))
+        }
+        ops.push({ op: 'moveNode', id: nid, position: { x: finalX, y: finalY } })
       }
       mutate(ops)
       dragStartRef.current = null
@@ -1404,9 +1670,12 @@ function CanvasView({ canvasId }: CanvasProps) {
   }, [mutate])
 
   // ── Arrange nodes inside a single region ─────────────────────────────────
-  // Only active when the region has constrained=true (lock is on). Uses the
-  // same BFS-depth layout as the global adaptive arrange, but scoped to a
-  // single region and uses the region's actual width for column sizing.
+  // Works whether the region is locked (constrained) or not — as long as it
+  // has members. Uses the same BFS-depth layout as the global adaptive
+  // arrange, but scoped to a single region and uses the region's actual width
+  // for column sizing. On a constrained region the arranged grid already sits
+  // inside the box, so the constrained clamp is a no-op; fitRegion then
+  // re-fits the box to the new content.
   const arrangeSingleRegion = useCallback((id: string) => {
     previewingRef.current = false
     const region = regionsRef.current.find((r) => r.id === id)
@@ -1836,31 +2105,58 @@ function CanvasView({ canvasId }: CanvasProps) {
     }
   }, [canvasId])
 
-  // ── Node drag stop — real-time constraint clamp ─────────────────────────
-  // Clamps a node's position inside its constrained region immediately when
-  // the user lifts the mouse, so xyflow never renders the node outside the
-  // bounds. The onNodesChange commit is kept as a safety net for any edge
-  // case where onNodeDragStop doesn't fire (e.g. keyboard-driven moves).
-  const CONSTRAINT_PAD = 24
-  const REGION_HEADER_H_CONST = 64
+  // ── Node drag stop — auto-detect region membership + constraint clamp ───
+  // On drag end we figure out which region the node's center is inside and
+  // write that as `data.region` — without this, dragging an existing node
+  // *visually* into a region would leave it orphaned and the region's
+  // "drag-children-along" gesture would silently skip it. Then, if the
+  // containing region is constrained, we clamp the position so the card
+  // stays inside the whole region (no PAD/HEADER reservation — the user
+  // wants the full box as the move range, not a tight strip near the
+  // middle). The onNodesChange position-commit is kept as a safety net for
+  // moves that don't fire onNodeDragStop (e.g. keyboard nudges).
   const onNodeDragStop: OnNodeDrag = useCallback((event, node) => {
-    const rid = (node.data as Record<string, unknown>).region as string | undefined
-    if (!rid) return
-    const region = regionsRef.current.find((r) => r.id === rid)
-    if (!region || !region.constrained) return
-    event.preventDefault()
     const cur = appliedRef.current
     if (cur) queueHistory(cur)
     const cw = cardW
-    const ch = 240
-    const maxX = region.x + region.w - cw - CONSTRAINT_PAD
-    const maxY = region.y + region.h - REGION_HEADER_H_CONST - ch - CONSTRAINT_PAD
-    const clampedX = Math.max(region.x + CONSTRAINT_PAD, Math.min(maxX, node.position.x))
-    const clampedY = Math.max(region.y + REGION_HEADER_H_CONST + CONSTRAINT_PAD, Math.min(maxY, node.position.y))
-    const dx = clampedX - node.position.x
-    const dy = clampedY - node.position.y
-    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return
-    mutate([{ op: 'moveNode', id: node.id, position: { x: Math.round(clampedX), y: Math.round(clampedY) } }])
+    // Center + clamp at the card's REAL height (media 240, text/note stored or
+    // measured, music 135) — not a fixed 240, which misjudges everything that
+    // isn't a media card. regionCardH mirrors the host clamp exactly, so the
+    // committed position matches the SSE echo (no snap-back).
+    const ch = regionCardH(node)
+    // Pick the region whose box contains the node's CENTER. Top-left
+    // anchoring is unstable (a partly-overlapping drag would flip-flop
+    // membership on every pixel of motion); the center is stable across
+    // gestures and matches the user's mental model of "the card is in
+    // the box".
+    const cx = node.position.x + cw / 2
+    const cy = node.position.y + ch / 2
+    const containing = regionsRef.current.find(
+      (r) => cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h,
+    )
+    const curRid = (node.data as Record<string, unknown>).region as string | undefined
+    const ops: MsOp[] = []
+    if ((containing?.id ?? null) !== (curRid ?? null)) {
+      // Clear membership with an explicit `region: null`. `undefined` is
+      // dropped by JSON.stringify, so it would never reach the server and
+      // the drop would silently not persist (the next SSE echo would restore
+      // the region and the node would keep following the region). `null`
+      // survives the round-trip and the server deletes the key.
+      ops.push({
+        op: 'updateNode',
+        id: node.id,
+        data: containing ? { region: containing.id } : { region: null },
+      })
+    }
+    if (containing?.constrained) {
+      const clamped = clampInsideRegion(node.position, containing, cw, ch)
+      if (Math.abs(clamped.x - node.position.x) > 0.5 || Math.abs(clamped.y - node.position.y) > 0.5) {
+        ops.push({ op: 'moveNode', id: node.id, position: { x: Math.round(clamped.x), y: Math.round(clamped.y) } })
+      }
+    }
+    if (ops.length === 0) return
+    event.preventDefault()
+    mutate(ops)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mutate, queueHistory, cardW])
 
@@ -1868,20 +2164,18 @@ function CanvasView({ canvasId }: CanvasProps) {
   // onNodeDrag fires on every pointermove while dragging. Clamping here keeps
   // the node visually inside the region bounds throughout the gesture instead
   // of only correcting it at the very end (onNodeDragStop). This prevents the
-  // node from ever being rendered outside its constrained region.
+  // node from ever being rendered outside its constrained region. Range is the
+  // full region (no PAD / HEADER reservation) — see onNodeDragStop comment.
   const onNodeDrag = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
     const rid = (node.data as Record<string, unknown>).region as string | undefined
     if (!rid) return
     const region = regionsRef.current.find((r) => r.id === rid)
     if (!region || !region.constrained) return
     const cw = cardW
-    const ch = 240
-    const maxX = region.x + region.w - cw - CONSTRAINT_PAD
-    const maxY = region.y + region.h - REGION_HEADER_H_CONST - ch - CONSTRAINT_PAD
-    const nx = Math.max(region.x + CONSTRAINT_PAD, Math.min(maxX, node.position.x))
-    const ny = Math.max(region.y + REGION_HEADER_H_CONST + CONSTRAINT_PAD, Math.min(maxY, node.position.y))
-    if (Math.abs(nx - node.position.x) < 0.5 && Math.abs(ny - node.position.y) < 0.5) return
-    rf.setNodes((nds) => nds.map((n) => n.id === node.id ? { ...n, position: { x: nx, y: ny } } : n))
+    const ch = regionCardH(node)
+    const clamped = clampInsideRegion(node.position, region, cw, ch)
+    if (Math.abs(clamped.x - node.position.x) < 0.5 && Math.abs(clamped.y - node.position.y) < 0.5) return
+    rf.setNodes((nds) => nds.map((n) => n.id === node.id ? { ...n, position: { x: clamped.x, y: clamped.y } } : n))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rf, cardW])
 
@@ -2031,10 +2325,25 @@ function CanvasView({ canvasId }: CanvasProps) {
               onDragStateChange={setRegionDragging}
               onDragStart={onRegionDragStart}
               renamingRegionId={renamingRegionId}
+              draggingRegionId={draggingRegionId}
               onRenameStart={setRenamingRegionId}
               onRenameCommit={commitRegionRename}
               onToggleConstraint={toggleRegionConstraint}
               onArrangeRegion={arrangeSingleRegion}
+              // Member counts must track the LIVE node set, not the initial
+              // one. Memoizing on `nodesRef` (a stable ref object) froze the
+              // count at first-render values, so a region that later gained
+              // members — including after being locked — still read as 0 and
+              // the arrange button stayed grayed out. Depend on `nodes`.
+              membersCountMap={useMemo(() => {
+                const counts = new Map<string, number>()
+                for (const n of nodes) {
+                  const rid = (n.data as Record<string, unknown>).region as string | undefined
+                  if (!rid) continue
+                  counts.set(rid, (counts.get(rid) ?? 0) + 1)
+                }
+                return counts
+              }, [nodes])}
             />
             <MiniMapWrap />
           </ReactFlow>

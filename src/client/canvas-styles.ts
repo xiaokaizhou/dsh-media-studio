@@ -495,6 +495,12 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
     linear-gradient(180deg, color-mix(in srgb, var(--ms-accent, #7c83ff) 7%, transparent), transparent 36%),
     color-mix(in srgb, var(--ms-bg2, #14171d) 55%, transparent);
   transition: box-shadow 0.14s ease, border-color 0.14s ease;
+  /* The region layer is pointer-events:none; opt back in so the whole box
+     (including the title-band strip above the body overlay) is a drag
+     surface and never falls through to a canvas pan. Nodes sit in a higher
+     z-index layer, so they still capture their own events. */
+  pointer-events: auto;
+  cursor: move;
 }
 .media-studio-canvas .ms-region:hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 22%, transparent);
@@ -525,6 +531,7 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   font: 600 12px/1 system-ui, -apple-system, sans-serif;
   pointer-events: auto;
   user-select: none;
+  cursor: grab;
 }
 .media-studio-canvas .ms-region-label {
   white-space: nowrap;
@@ -559,7 +566,23 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 .media-studio-canvas .ms-region-btn:hover { background: var(--ms-panel-soft); color: var(--ms-fg); transform: scale(1.1); }
 .media-studio-canvas .ms-region-btn.ms-region-btn-danger:hover { background: rgba(220, 38, 38, 0.22); color: #fca5a5; }
-/* Drag handle — four-dot grip on the left side of the title bar. */
+.media-studio-canvas .ms-region-btn.is-disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
+.media-studio-canvas .ms-region-btn.is-disabled:hover { transform: none; background: transparent; }
+/* Locked state — make it unmistakable: blue icon on a soft blue chip so the
+   user can tell at a glance that nodes are pinned inside the region. */
+.media-studio-canvas .ms-region-btn.is-locked {
+  color: #6db0ff;
+  background: color-mix(in srgb, #3b82f6 24%, transparent);
+}
+.media-studio-canvas .ms-region-btn.is-locked:hover {
+  color: #a9d0ff;
+  background: color-mix(in srgb, #3b82f6 38%, transparent);
+  transform: scale(1.1);
+}
+/* Drag handle — four-dot grip on the left side of the title bar. Purely
+   visual affordance: the entire title bar (and the body overlay below) also
+   start the same drag, so users can grab the partition from anywhere except
+   the rename input, the buttons, or the resize grip. */
 .media-studio-canvas .ms-region-drag-handle {
   flex: none;
   width: 18px;
@@ -567,13 +590,11 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  cursor: grab;
   border-radius: 4px;
   color: var(--ms-fg-faint);
   transition: background 0.12s ease, color 0.12s ease;
 }
 .media-studio-canvas .ms-region-drag-handle:hover { background: var(--ms-panel-soft); color: var(--ms-fg); }
-.media-studio-canvas .ms-region-drag-handle:active { cursor: grabbing; }
 /* Clickable label — shows a subtle hint that it can be renamed. */
 .media-studio-canvas .ms-region-label-clickable {
   cursor: text;
@@ -602,8 +623,30 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 .media-studio-canvas .ms-region[data-constrained="true"]:hover {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 20%, transparent);
 }
+/* Active drag state — partition is currently being moved. Brighten the
+   border, swap cursor to "grabbing" everywhere inside the box, and freeze
+   text selection so the live geometry doesn't flicker under the cursor. */
+.media-studio-canvas .ms-region[data-region-dragging="true"] {
+  border-color: var(--ms-accent, #7c83ff);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 45%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 22%, transparent),
+    0 8px 24px -10px color-mix(in srgb, var(--ms-accent, #7c83ff) 45%, transparent);
+}
+.media-studio-canvas .ms-region[data-region-dragging="true"],
+.media-studio-canvas .ms-region[data-region-dragging="true"] .ms-region-title,
+.media-studio-canvas .ms-region[data-region-dragging="true"] .ms-region-body,
+.media-studio-canvas .ms-region[data-region-dragging="true"] .ms-region-drag-handle {
+  cursor: grabbing;
+}
+.media-studio-canvas .ms-region[data-region-dragging="true"] * {
+  user-select: none;
+  -webkit-user-select: none;
+}
 /* Transparent body overlay — absorbs pointer events on empty region space
-   so they don't fall through to the ReactFlow pane and trigger canvas pan. */
+   so they don't fall through to the ReactFlow pane and trigger canvas pan.
+   Now also acts as a primary drag surface: users can grab the partition
+   from anywhere inside the box (except over interactive children). */
 .media-studio-canvas .ms-region-body {
   position: absolute;
   inset: 0;
@@ -612,8 +655,12 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   right: 0;
   pointer-events: auto;
   z-index: 0;
+  cursor: move;
 }
-/* Resize grip — bottom-right corner, visible on hover. */
+/* Resize grip — bottom-right corner, visible on hover. Must sit ABOVE
+   .ms-region-body (z-index 0) so the grip can actually receive pointer
+   events — the body overlay would otherwise swallow every pointerdown in
+   the bottom-right 22×22 area and the region would become un-resizable. */
 .media-studio-canvas .ms-region-resize {
   position: absolute;
   right: 0;
@@ -622,6 +669,7 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   height: 22px;
   cursor: nwse-resize;
   pointer-events: auto;
+  z-index: 1;
   opacity: 0;
   border-radius: 0 0 18px 0;
   background:
