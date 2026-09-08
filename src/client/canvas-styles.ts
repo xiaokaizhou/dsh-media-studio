@@ -559,6 +559,49 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 .media-studio-canvas .ms-region-btn:hover { background: var(--ms-panel-soft); color: var(--ms-fg); transform: scale(1.1); }
 .media-studio-canvas .ms-region-btn.ms-region-btn-danger:hover { background: rgba(220, 38, 38, 0.22); color: #fca5a5; }
+/* Drag handle — four-dot grip on the left side of the title bar. */
+.media-studio-canvas .ms-region-drag-handle {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  border-radius: 4px;
+  color: var(--ms-fg-faint);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.media-studio-canvas .ms-region-drag-handle:hover { background: var(--ms-panel-soft); color: var(--ms-fg); }
+.media-studio-canvas .ms-region-drag-handle:active { cursor: grabbing; }
+/* Clickable label — shows a subtle hint that it can be renamed. */
+.media-studio-canvas .ms-region-label-clickable {
+  cursor: text;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.12s ease;
+}
+.media-studio-canvas .ms-region-label-clickable:hover { border-bottom-color: var(--ms-fg-faint); }
+/* Inline rename input */
+.media-studio-canvas .ms-region-rename-input {
+  flex: 1;
+  min-width: 0;
+  max-width: 160px;
+  padding: 1px 6px;
+  border: 1px solid var(--ms-accent);
+  border-radius: 4px;
+  background: var(--ms-bg);
+  color: var(--ms-fg);
+  font: 600 12px/1 system-ui, sans-serif;
+  outline: none;
+}
+/* Constrained region visual hint — subtle solid border. */
+.media-studio-canvas .ms-region[data-constrained="true"] {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--ms-accent, #7c83ff) 55%, transparent);
+}
+.media-studio-canvas .ms-region[data-constrained="true"]:hover {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--ms-accent, #7c83ff) 20%, transparent);
+}
 /* Resize grip — bottom-right corner, visible on hover. */
 .media-studio-canvas .ms-region-resize {
   position: absolute;

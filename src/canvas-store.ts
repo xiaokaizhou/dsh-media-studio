@@ -53,6 +53,9 @@ export interface CanvasRegion {
   y: number
   w: number
   h: number
+  /** When true, child nodes are clamped inside this region's bounds during
+   *  drag. Toggled via the region title bar (lock icon). */
+  constrained?: boolean
 }
 
 export interface CanvasGraph {
@@ -137,7 +140,7 @@ export type CanvasOp =
     w?: number
     h?: number
   }
-  | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number }
+  | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number; constrained?: boolean }
   | { op: 'deleteRegion'; id: string }
   | {
     op: 'fitRegion'
@@ -668,6 +671,7 @@ function applyOp(graph: CanvasGraph, op: CanvasOp): string | null {
       if (op.y !== undefined) r.y = op.y
       if (op.w !== undefined) r.w = op.w
       if (op.h !== undefined) r.h = op.h
+      if (op.constrained !== undefined) r.constrained = op.constrained
       return null
     }
     case 'deleteRegion': {

@@ -59,7 +59,7 @@ export type MsOp =
     w?: number
     h?: number
   }
-  | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number }
+  | { op: 'updateRegion'; id: string; label?: string; kind?: string; x?: number; y?: number; w?: number; h?: number; constrained?: boolean }
   | { op: 'deleteRegion'; id: string }
   | { op: 'fitRegion'; id: string }
 
@@ -82,6 +82,7 @@ export interface MsSnapshot {
       y: number
       w: number
       h: number
+      constrained?: boolean
     }>
   }
   version: number
