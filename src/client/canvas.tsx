@@ -813,15 +813,7 @@ function CanvasView({ canvasId }: CanvasProps) {
   // Sync viewportSizeRef from the ReactFlow store via a passive subscription.
   // We intentionally do NOT put this in state — only a ref — to avoid
   // triggering canvas re-renders on every viewport change.
-  const vpSizeSubRef = useRef<(() => void) | null>(null)
   useEffect(() => {
-    const api = useFlowStoreApi()
-    // useFlowStoreApi returns the store api; we create a one-time subscription.
-    // The effect cleanup disposes it when the component unmounts.
-    // However, useFlowStoreApi can only be called inside a React component,
-    // not inside an effect that runs after mount — we instead read from the
-    // existing flowStoreApi that's already in scope (see RegionLayer).
-    // Here we just read from the pane DOM element directly.
     const el = document.querySelector('.media-studio-canvas .react-flow') as HTMLElement
     if (el) {
       viewportSizeRef.current = { w: el.clientWidth, h: el.clientHeight }
