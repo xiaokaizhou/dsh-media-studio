@@ -20,6 +20,7 @@ import {
   syncAssetFromCanvas,
   projectAssetRoot,
   sharedAssetRoot,
+  projectAssetRootAt,
   ASSET_CATEGORY_DIR,
   AssetDeleteBlockedError,
 } from '../src/asset-store'
@@ -28,11 +29,14 @@ let ws: string
 let canvasStore: CanvasStore
 let ps: ProjectStore
 const roots = (): string[] => [ws]
+function sourcePathFor(projectId: string): string | undefined {
+  return ps.snapshot().projects.find((x) => x.id === projectId)?.sourcePath
+}
 
 async function setup(): Promise<void> {
   ws = await mkdtemp(join(tmpdir(), 'media-studio-assets-'))
   canvasStore = new CanvasStore(ws, {})
-  ps = new ProjectStore(ws, canvasStore, { recentLimit: 10, trashEnabled: true })
+  ps = new ProjectStore(ws, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(ws, 'Movies') })
   await ps.ready()
 }
 
@@ -65,14 +69,14 @@ describe('registration', () => {
     const p = await newProject('P')
     const src = await writeMedia('web-jobs/hero.png', 'png-bytes-123')
     putNode(p.id, 'n-1', 'image', src)
-    const r = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character', name: '林晚' })
+    const r = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character', name: '林晚', sourcePath: sourcePathFor(p.id) })
     expect(r.created).toBe(true)
     expect(r.asset.kind).toBe('character')
     expect(r.asset.name).toBe('林晚')
-    const file = join(projectAssetRoot(ws, p.id), ASSET_CATEGORY_DIR.character, r.asset.file)
+    const file = join(projectAssetRootAt(sourcePathFor(p.id), ws, p.id), ASSET_CATEGORY_DIR.character, r.asset.file)
     expect(await readFile(file, 'utf8')).toBe('png-bytes-123')
-    // index.json persisted
-    const assets = await listAssets(ws, p.id)
+    // .index.json persisted (sourcePath project)
+    const assets = await listAssets(ws, p.id, sourcePathFor(p.id))
     expect(assets).toHaveLength(1)
     expect(assets[0].origin).toEqual({ type: 'canvas', canvasNodeId: 'n-1' })
   })
@@ -81,30 +85,30 @@ describe('registration', () => {
     const p = await newProject('P')
     const src = await writeMedia('web-jobs/a.png', 'aaa')
     putNode(p.id, 'n-1', 'image', src)
-    const first = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene' })
-    const second = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene' })
+    const first = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene', sourcePath: sourcePathFor(p.id) })
+    const second = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene', sourcePath: sourcePathFor(p.id) })
     expect(first.asset.id).toBe(second.asset.id)
     expect(second.created).toBe(false)
-    expect(await listAssets(ws, p.id)).toHaveLength(1)
+    expect(await listAssets(ws, p.id, sourcePathFor(p.id))).toHaveLength(1)
   })
 
   it('decodes data: URLs', async () => {
     const p = await newProject('P')
     const b64 = Buffer.from('png-bytes').toString('base64')
     putNode(p.id, 'n-1', 'image', `data:image/png;base64,${b64}`)
-    const r = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character' })
+    const r = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character', sourcePath: sourcePathFor(p.id) })
     expect(r.asset.file.endsWith('.png')).toBe(true)
-    expect(await readFile(join(projectAssetRoot(ws, p.id), ASSET_CATEGORY_DIR.character, r.asset.file), 'utf8')).toBe('png-bytes')
+    expect(await readFile(join(projectAssetRootAt(sourcePathFor(p.id), ws, p.id), ASSET_CATEGORY_DIR.character, r.asset.file), 'utf8')).toBe('png-bytes')
   })
 
   it('rejects nodes without resultUrl or missing nodes', async () => {
     const p = await newProject('P')
     await expect(
-      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'ghost', kind: 'scene' }),
+      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'ghost', kind: 'scene', sourcePath: sourcePathFor(p.id) }),
     ).rejects.toThrow('not found')
     putNode(p.id, 'n-2', 'video', '')
     await expect(
-      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-2', kind: 'clip' }),
+      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-2', kind: 'clip', sourcePath: sourcePathFor(p.id) }),
     ).rejects.toThrow('no resultUrl')
   })
 
@@ -112,7 +116,7 @@ describe('registration', () => {
     const p = await newProject('P')
     putNode(p.id, 'n-1', 'image', '/etc/hostname')
     await expect(
-      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene' }),
+      registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'scene', sourcePath: sourcePathFor(p.id) }),
     ).rejects.toThrow('could not be read')
   })
 })
@@ -122,12 +126,12 @@ describe('metadata + deletion', () => {
     const p = await newProject('P')
     const src = await writeMedia('web-jobs/b.png', 'bbb')
     putNode(p.id, 'n-1', 'image', src)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character', name: '旧名' })
-    const updated = await updateAssetMeta(ws, p.id, asset.id, { name: '林晚·立绘', tags: ['女主'] })
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'character', name: '旧名', sourcePath: sourcePathFor(p.id) })
+    const updated = await updateAssetMeta(ws, p.id, asset.id, { name: '林晚·立绘', tags: ['女主'] }, sourcePathFor(p.id))
     expect(updated.name).toBe('林晚·立绘')
     expect(updated.tags).toEqual(['女主'])
     expect(updated.file).toBe(asset.file)
-    await expect(updateAssetMeta(ws, p.id, asset.id, { name: '   ' })).rejects.toThrow('required')
+    await expect(updateAssetMeta(ws, p.id, asset.id, { name: '   ' }, sourcePathFor(p.id))).rejects.toThrow('required')
   })
 
   it('blocks deletion by default when another project soft-references it', async () => {
@@ -135,13 +139,13 @@ describe('metadata + deletion', () => {
     const refP = await newProject('引用者')
     const src = await writeMedia('web-jobs/c.png', 'ccc')
     putNode(owner.id, 'n-1', 'image', src)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene', name: '客厅' })
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene', name: '客厅', sourcePath: sourcePathFor(owner.id) })
     // referrer canvas
     canvasStore.apply(refP.id, [
       { op: 'addNode', nodeId: 'r-1', type: 'image', label: 'ref', data: { assetRef: { projectId: owner.id, assetId: asset.id }, status: 'done', resultUrl: '/x.png' } },
     ])
-    await expect(deleteAsset(ws, canvasStore, owner.id, asset.id, 'cancel', [owner.id, refP.id])).rejects.toBeInstanceOf(AssetDeleteBlockedError)
-    expect(await listAssets(ws, owner.id)).toHaveLength(1)
+    await expect(deleteAsset(ws, canvasStore, owner.id, asset.id, 'cancel', [owner.id, refP.id], sourcePathFor(owner.id))).rejects.toBeInstanceOf(AssetDeleteBlockedError)
+    expect(await listAssets(ws, owner.id, sourcePathFor(owner.id))).toHaveLength(1)
   })
 
   it('break-refs cascade removes the file and marks referencing nodes broken', async () => {
@@ -149,16 +153,16 @@ describe('metadata + deletion', () => {
     const refP = await newProject('引用者')
     const src = await writeMedia('web-jobs/d.png', 'ddd')
     putNode(owner.id, 'n-1', 'image', src)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene' })
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene', sourcePath: sourcePathFor(owner.id) })
     canvasStore.apply(refP.id, [
       { op: 'addNode', nodeId: 'r-1', type: 'image', label: 'ref', data: { assetRef: { projectId: owner.id, assetId: asset.id }, status: 'done', resultUrl: '/x.png' } },
     ])
-    const res = await deleteAsset(ws, canvasStore, owner.id, asset.id, 'break-refs', [owner.id, refP.id])
+    const res = await deleteAsset(ws, canvasStore, owner.id, asset.id, 'break-refs', [owner.id, refP.id], sourcePathFor(owner.id))
     expect(res.brokenNodes).toBe(1)
-    expect(await listAssets(ws, owner.id)).toHaveLength(0)
+    expect(await listAssets(ws, owner.id, sourcePathFor(owner.id))).toHaveLength(0)
     const node = canvasStore.peek(refP.id)!.graph.nodes.find((n) => n.id === 'r-1')!
     expect(node.data.brokenAsset).toBe(true)
-    await expect(access(join(projectAssetRoot(ws, owner.id), ASSET_CATEGORY_DIR.scene, asset.file))).rejects.toThrow()
+    await expect(access(join(projectAssetRootAt(sourcePathFor(owner.id), ws, owner.id), ASSET_CATEGORY_DIR.scene, asset.file))).rejects.toThrow()
   })
 
   it('migrate-shared moves the asset into __shared and rewrites refs', async () => {
@@ -166,11 +170,11 @@ describe('metadata + deletion', () => {
     const refP = await newProject('引用者')
     const src = await writeMedia('web-jobs/e.png', 'eee')
     putNode(owner.id, 'n-1', 'image', src)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene', name: '共享素材' })
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: owner.id, canvasNodeId: 'n-1', kind: 'scene', name: '共享素材', sourcePath: sourcePathFor(owner.id) })
     canvasStore.apply(refP.id, [
       { op: 'addNode', nodeId: 'r-1', type: 'image', label: 'ref', data: { assetRef: { projectId: owner.id, assetId: asset.id }, status: 'done', resultUrl: '/x.png' } },
     ])
-    const res = await deleteAsset(ws, canvasStore, owner.id, asset.id, 'migrate-shared', [owner.id, refP.id])
+    const res = await deleteAsset(ws, canvasStore, owner.id, asset.id, 'migrate-shared', [owner.id, refP.id], sourcePathFor(owner.id))
     expect(res.migrated).toBe(true)
     // lives on in the shared root
     const sharedFiles = await readdir(join(sharedAssetRoot(ws), ASSET_CATEGORY_DIR.scene))
@@ -180,7 +184,7 @@ describe('metadata + deletion', () => {
     const node = canvasStore.peek(refP.id)!.graph.nodes.find((n) => n.id === 'r-1')!
     expect((node.data.assetRef as { projectId: string }).projectId).toBe('__shared')
     // gone from the owner index
-    expect(await listAssets(ws, owner.id)).toHaveLength(0)
+    expect(await listAssets(ws, owner.id, sourcePathFor(owner.id))).toHaveLength(0)
   })
 })
 
@@ -190,16 +194,16 @@ describe('hard copy + sync', () => {
     const b = await newProject('目标')
     const src = await writeMedia('web-jobs/f.png', 'fff')
     putNode(a.id, 'n-1', 'image', src)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: a.id, canvasNodeId: 'n-1', kind: 'character', name: '林晚' })
-    const r1 = await copyAssetToProject(ws, a.id, asset.id, b.id)
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: a.id, canvasNodeId: 'n-1', kind: 'character', name: '林晚', sourcePath: sourcePathFor(a.id) })
+    const r1 = await copyAssetToProject(ws, a.id, asset.id, b.id, sourcePathFor(a.id), sourcePathFor(b.id))
     expect(r1.created).toBe(true)
     expect(r1.asset.id).not.toBe(asset.id)
     expect(r1.asset.copyOf).toEqual({ projectId: a.id, assetId: asset.id })
-    expect(await readFile(join(projectAssetRoot(ws, b.id), ASSET_CATEGORY_DIR.character, r1.asset.file), 'utf8')).toBe('fff')
-    const r2 = await copyAssetToProject(ws, a.id, asset.id, b.id)
+    expect(await readFile(join(projectAssetRootAt(sourcePathFor(b.id), ws, b.id), ASSET_CATEGORY_DIR.character, r1.asset.file), 'utf8')).toBe('fff')
+    const r2 = await copyAssetToProject(ws, a.id, asset.id, b.id, sourcePathFor(a.id), sourcePathFor(b.id))
     expect(r2.created).toBe(false)
     expect(r2.asset.id).toBe(r1.asset.id)
-    expect(await listAssets(ws, b.id)).toHaveLength(1)
+    expect(await listAssets(ws, b.id, sourcePathFor(b.id))).toHaveLength(1)
     // owner's delete preflight now reports the copy consumer
     const deps = await ps.dependentsOf(a.id)
     expect(deps.copyConsumers.some((c) => c.projectId === b.id && c.count >= 1)).toBe(true)
@@ -209,23 +213,23 @@ describe('hard copy + sync', () => {
     const p = await newProject('P')
     const v1 = await writeMedia('web-jobs/v1.mp4', 'small')
     putNode(p.id, 'n-1', 'video', v1)
-    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'clip', name: '片段' })
-    const filePath = join(projectAssetRoot(ws, p.id), ASSET_CATEGORY_DIR.clip, asset.file)
+    const { asset } = await registerCanvasAsset({ wsRoot: ws, roots: roots(), canvasStore, projectId: p.id, canvasNodeId: 'n-1', kind: 'clip', name: '片段', sourcePath: sourcePathFor(p.id) })
+    const filePath = join(projectAssetRootAt(sourcePathFor(p.id), ws, p.id), ASSET_CATEGORY_DIR.clip, asset.file)
     // agent regenerates the node → new, bigger file
     const v2 = await writeMedia('web-jobs/v2.mp4', 'much-bigger-content')
     canvasStore.apply(p.id, [{ op: 'updateNode', id: 'n-1', data: { resultUrl: v2, status: 'done' } }])
-    const res = await syncAssetFromCanvas(ws, roots(), canvasStore, p.id, asset.id)
+    const res = await syncAssetFromCanvas(ws, roots(), canvasStore, p.id, asset.id, sourcePathFor(p.id))
     expect(res.changed).toBe(true)
     expect(await readFile(filePath, 'utf8')).toBe('much-bigger-content')
-    const listed = await listAssets(ws, p.id)
+    const listed = await listAssets(ws, p.id, sourcePathFor(p.id))
     expect(listed[0].bytes).toBe(Buffer.byteLength('much-bigger-content'))
   })
 })
 
 describe('migrateBrokenCanvasUrls', () => {
   it('rewrites file:///tmp/ URLs to project-relative paths for sourcePath projects', async () => {
-    const ws = await mkdtemp(join(tmpdir(), 'media-studio-migrate-'))
-    const srcPath = join(ws, 'my-project')
+    const ws2 = await mkdtemp(join(tmpdir(), 'media-studio-migrate-'))
+    const srcPath = join(ws2, 'my-project')
     await mkdir(srcPath, { recursive: true })
 
     // Write a real PNG-like file to OS temp dir so it is OUTSIDE the allowed roots
@@ -259,10 +263,10 @@ describe('migrateBrokenCanvasUrls', () => {
         },
       },
     }
-    await writeFile(join(ws, 'projects.json'), JSON.stringify(registry))
+    await writeFile(join(ws2, 'projects.json'), JSON.stringify(registry))
 
     const { migrateBrokenCanvasUrls } = await import('../src/asset-store')
-    const r = await migrateBrokenCanvasUrls(ws, [ws], ['p-test'], { 'p-test': srcPath })
+    const r = await migrateBrokenCanvasUrls(ws2, [ws2], ['p-test'], { 'p-test': srcPath })
 
     expect(r.migrated).toBe(1)
     expect(r.errors).toHaveLength(0)
@@ -278,6 +282,6 @@ describe('migrateBrokenCanvasUrls', () => {
     expect(await readdir(assetDir)).toHaveLength(1)
     expect(await readFile(join(assetDir, (await readdir(assetDir))[0]), 'utf8')).toBe('fake-png-bytes')
 
-    await rm(ws, { recursive: true, force: true })
+    await rm(ws2, { recursive: true, force: true })
   })
 })

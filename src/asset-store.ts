@@ -327,7 +327,7 @@ export async function updateAssetMeta(
   }
   if (patch.tags !== undefined) a.tags = patch.tags
   a.updatedAt = new Date().toISOString()
-  await writeAssetIndex(root, index)
+  await writeAssetIndex(root, index, indexFile)
   return { ...a }
 }
 
@@ -550,7 +550,7 @@ export async function syncAssetFromCanvas(
   }
   a.bytes = read.bytes.length
   a.updatedAt = new Date().toISOString()
-  await writeAssetIndex(root, index)
+  await writeAssetIndex(root, index, indexFile)
   return { asset: { ...a }, changed: true }
 }
 

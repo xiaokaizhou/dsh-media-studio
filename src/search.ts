@@ -168,7 +168,8 @@ export async function runSearch(input: RunSearchInput): Promise<SearchResult> {
   const nodeScores: Array<{ item: SearchItem; score: number; ownerId: string }> = []
 
   for (const p of input.projects) {
-    const index = await loadAssetIndex(projectAssetRootAt(p.sourcePath, input.wsRoot, p.id))
+    const indexFile = p.sourcePath ? '.index.json' : 'index.json'
+    const index = await loadAssetIndex(projectAssetRootAt(p.sourcePath, input.wsRoot, p.id), indexFile)
     for (const a of index.assets) {
       const score = scoreAsset(q, a)
       if (score <= 0) continue
@@ -314,7 +315,9 @@ export async function resolveAsset(
   assetId: string,
   sourcePath?: string,
 ): Promise<Asset> {
-  const index = await loadAssetIndex(projectAssetRootAt(sourcePath, wsRoot, ownerProjectId))
+  const assetRoot = projectAssetRootAt(sourcePath, wsRoot, ownerProjectId)
+  const indexFile = sourcePath ? '.index.json' : 'index.json'
+  const index = await loadAssetIndex(assetRoot, indexFile)
   const a = index.assets.find((x) => x.id === assetId)
   if (!a) throw new Error(`asset "${assetId}" not found in project "${ownerProjectId}"`)
   return a

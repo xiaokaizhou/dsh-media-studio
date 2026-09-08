@@ -154,7 +154,7 @@ describe('agent tools: 12 new media_studio_* tools', () => {
     const { CanvasStore } = await import('../src/canvas-store')
     const { ProjectStore } = await import('../src/project-store')
     const canvasStore = new CanvasStore(wsRoot)
-    const projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true })
+    const projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(wsRoot, "Movies") })
     setMediaStudioHandles({
       workspaceRoot: wsRoot,
       mediaRoots: [],
@@ -187,7 +187,7 @@ describe('agent tools: 12 new media_studio_* tools', () => {
     const { CanvasStore } = await import('../src/canvas-store')
     const { ProjectStore } = await import('../src/project-store')
     const canvasStore = new CanvasStore(wsRoot)
-    const projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true })
+    const projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(wsRoot, "Movies") })
     setMediaStudioHandles({
       workspaceRoot: wsRoot,
       mediaRoots: [],
@@ -201,11 +201,11 @@ describe('agent tools: 12 new media_studio_* tools', () => {
     const proj = await projectStore.createProject('search-target')
     // Seed a small PNG asset under the project asset root so the search
     // index has something to find.
-    const assetDir = join(wsRoot, 'projects', proj.id, 'assets', 'characters')
+    const assetDir = join(proj.sourcePath!, 'assets', 'characters')
     await mkdir(assetDir, { recursive: true })
     const seedBuf = Buffer.from('89504E470D0A1A0A0000000D49484452000000010000000108020000009077533DE', 'hex')
     await writeFile(join(assetDir, 'seed.png'), seedBuf)
-    const indexPath = join(wsRoot, 'projects', proj.id, 'assets', 'index.json')
+    const indexPath = join(proj.sourcePath!, 'assets', '.index.json')
     await writeFile(indexPath, JSON.stringify({
       version: 1,
       assets: [{

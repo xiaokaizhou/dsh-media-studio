@@ -19,6 +19,7 @@ import { Canvas } from './client/canvas'
 import ProjectApp from './client/project-bar'
 import { registerLocaleDictionaries, translate, resolveLang, LOCALE_NS, type LocaleSource } from './client/i18n'
 import { IconCanvas } from './client/icons'
+import { subscribeProjectFocused } from './client/canvas-bus'
 
 /**
  * Runtime services we need. Both are soft dependencies — without them we
@@ -95,9 +96,11 @@ export function apply(ctx: unknown): void {
   const locale = c.locale ?? null
   const disposeLocale = registerLocaleDictionaries(locale)
 
+  const TAB_ID = 'media-studio:canvas'
+
   if (c.betterSidebar) {
     c.betterSidebar.registerTab({
-      id: 'media-studio:canvas',
+      id: TAB_ID,
       title: () => resolveTabTitle(locale),
       icon: renderTabIcon,
       single: true,
@@ -109,6 +112,50 @@ export function apply(ctx: unknown): void {
           renderCanvas: (canvasId: string) => createElement(Canvas, { canvasId, key: canvasId }),
         }),
     })
+
+    // Auto-open the Media Studio sidebar tab when a project is focused by the
+    // agent (media_studio_create_project / media_studio_open_project).
+    //
+    // This mirrors the browser-skill pattern: subscribe directly to
+    // betterSidebar.state changes so we can call openTab() BEFORE the
+    // SidebarFocusListener React component ever mounts (it only exists once
+    // the tab is already open — a chicken-and-egg problem).
+    //
+    // Also subscribe to project-focused SSE events as a belt-and-suspenders
+    // fallback: even if subscribeState fires on unrelated changes, the
+    // project-focused guard ensures we only open when an agent creates/opens
+    // a project.
+    const SB = c.betterSidebar as {
+      subscribeState?: (fn: () => void) => () => void
+      openTab?: (seed: { type: string; id?: string }) => void
+      getSnapshot?: () => { state?: { sessionId?: string } }
+    }
+
+    let pendingFocus = false
+
+    // Mark that a project-focused SSE event arrived. This flag is consumed
+    // by openIfNeeded() on the next betterSidebar state change (or immediately
+    // on the initial call below).
+    const markPending = () => { pendingFocus = true }
+    subscribeProjectFocused(markPending)
+
+    // Open the Media Studio tab when a project-focused event fires.
+    // openTab is idempotent — safe to call even if the tab is already open.
+    // We gate on pendingFocus so we only open when the agent explicitly
+    // focused a project (create/open), not on every unrelated sidebar change.
+    const openIfNeeded = () => {
+      if (!pendingFocus) return
+      try {
+        SB.openTab?.({ type: TAB_ID, id: TAB_ID })
+        pendingFocus = false
+      } catch { /* best-effort */ }
+    }
+
+    // Subscribe to sidebar state changes so we open when the panel is ready.
+    SB.subscribeState?.(openIfNeeded)
+
+    // Try immediately — the sidebar may already be initialized.
+    openIfNeeded()
   }
 
   // Tie dictionary unregistration to the plugin fiber so a future reload

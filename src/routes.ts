@@ -8,7 +8,7 @@ import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles, log, type MediaStudioHandles } from './service-state'
-import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch } from './tools'
+import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch, backfillVideoPosters } from './tools'
 
 const MEDIA_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -456,6 +456,52 @@ export function registerCanvasRoutes(ctx: Context): () => void {
             res.end(JSON.stringify({ ok: false, error: (e as Error).message }))
           }
         }
+      })
+    },
+  })
+
+  // Backfill missing video posters. Iterates every video node in the canvas
+  // and, for any node whose data.poster is empty, runs prepareVideoForCanvas
+  // to attach (or extract) a cover image and patch the node's data. The
+  // intended caller is either the agent (after discovering a session of
+  // legacy video nodes with no cover) or the GUI (a one-click "修复视频封面"
+  // action when a scan finds blank video cards).
+  wserver.register({
+    kind: 'exact',
+    path: '/api/media-studio/canvas/backfill-video-posters',
+    handler: (req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c: Buffer) => chunks.push(c))
+      req.on('end', () => {
+        void (async () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { canvasId?: string }
+            const reqUrl = new URL(req.url || '/', 'http://localhost')
+            const canvasId = body.canvasId || reqUrl.searchParams.get('canvasId') || 'main'
+            const handles = getMediaStudioHandles()
+            const projectStore = handles.projectStore
+            const projectId = (() => {
+              if (!projectStore) return canvasId
+              const snap = projectStore.snapshot?.()
+              if (snap && snap.projects.some((p) => p.id === canvasId)) return canvasId
+              return projectStore.activeCanvasId?.() ?? canvasId
+            })()
+            const sourcePath = projectStore?.resolveSourcePath?.(projectId)
+            const result = await backfillVideoPosters(
+              projectId,
+              handles.workspaceRoot,
+              sourcePath,
+              handles.canvasStore,
+            )
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ok: true, ...result }))
+          } catch (e) {
+            if (!res.headersSent) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ok: false, error: (e as Error).message }))
+            }
+          }
+        })()
       })
     },
   })

@@ -28,7 +28,7 @@ let projectStore: ProjectStore
 async function setup(): Promise<void> {
   wsRoot = mkdtempSync(join(tmpdir(), 'ms-pipe-reg-'))
   canvasStore = new CanvasStore(wsRoot)
-  projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true })
+  projectStore = new ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(wsRoot, "Movies") })
   await projectStore.ready()
   setMediaStudioHandles({
     workspaceRoot: wsRoot,
@@ -74,9 +74,9 @@ describe('P3: postProcess resolves the TARGET canvas project, not the active one
     expect(issues.filter((s) => s.startsWith('warn:'))).toHaveLength(0)
 
     // The pinned file must land in the TARGET project's assets.
-    expect(filesIn(join(wsRoot, 'projects', targetProj.id, 'assets', 'characters'), '.png')).toHaveLength(1)
+    expect(filesIn(join(targetProj.sourcePath!, 'assets', 'characters'), '.png')).toHaveLength(1)
     // …and NOT in the active project's assets.
-    expect(filesIn(join(wsRoot, 'projects', activeProj.id, 'assets', 'characters'), '.png')).toHaveLength(0)
+    expect(filesIn(join(activeProj.sourcePath!, 'assets', 'characters'), '.png')).toHaveLength(0)
 
     // The node URL must be rewritten to the target project's convention.
     const snap = canvasStore.snapshot(targetProj.id)
@@ -95,9 +95,9 @@ describe('P4a: pinned media is not double-copied by auto-register', () => {
     const issues = await postProcessCanvasPatch(canvasStore, a.id, ops, res.issues)
     expect(issues.filter((s) => s.startsWith('warn:'))).toHaveLength(0)
 
-    const idx = await loadAssetIndex(join(wsRoot, 'projects', a.id, 'assets'))
+    const idx = await loadAssetIndex(join(a.sourcePath!, 'assets'), '.index.json')
     expect(idx.assets).toHaveLength(1)
-    expect(filesIn(join(wsRoot, 'projects', a.id, 'assets', 'characters'), '.png')).toHaveLength(1)
+    expect(filesIn(join(a.sourcePath!, 'assets', 'characters'), '.png')).toHaveLength(1)
   })
 })
 
@@ -179,6 +179,6 @@ describe('P1: executeNodeRefresh persists music/TTS output to a stable local fil
     // Must be a stable local copy, not the provider temp path.
     expect(url).not.toBe(tmpAudio)
     expect(url.startsWith('file://') || url.startsWith('projects/')).toBe(true)
-    expect(filesIn(join(wsRoot, 'web-jobs'), '.mp3')).toHaveLength(1)
+    expect(filesIn(join(a.sourcePath!, 'assets', 'audio'), '.mp3')).toHaveLength(1)
   })
 })

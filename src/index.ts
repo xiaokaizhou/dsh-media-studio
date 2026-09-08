@@ -181,6 +181,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     trashEnabled: config.trashEnabled,
     onEvent: broadcastProject,
     logger: ctx.logger,
+    defaultSourcePath: expandRoot(config.defaultSourcePath),
   })
 
   // Stash plugin-scoped handles. Tools + routes read via getMediaStudioHandles().

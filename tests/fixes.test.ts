@@ -166,7 +166,7 @@ describe('Fix 3 + 4: project rename / delete round-trip', () => {
     const cs = await import('../src/canvas-store')
     const ps = await import('../src/project-store')
     canvasStore = new cs.CanvasStore(wsRoot)
-    projectStore = new ps.ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true })
+    projectStore = new ps.ProjectStore(wsRoot, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(wsRoot, 'Movies') })
     await projectStore.ready()
   })
 
@@ -192,15 +192,16 @@ describe('Fix 3 + 4: project rename / delete round-trip', () => {
 
   it('deleteProject moves the project to trash by default', async () => {
     const created = await projectStore.createProject('Doomed')
+    // Write a canvas node so there's something to trash
+    canvasStore.apply(created.id, [{ op: 'addNode', type: 'note', label: 'hi', data: { content: 'x' } }])
     const result = await projectStore.deleteProject(created.id, 'trash', 'cancel')
     expect(result.deletedId).toBe(created.id)
     expect(result.mode).toBe('trash')
     // Registry no longer contains it.
     const snap = projectStore.snapshot()
     expect(snap.projects.find((p) => p.id === created.id)).toBeUndefined()
-    // The project dir moved to trash (legacy layout: <wsRoot>/projects/<id> →
-    // <wsRoot>/trash/projects_<id>_<ts>; new layout with sourcePath: assets/,
-    // .canvas.json → <wsRoot>/trash/assets_<ts> / <wsRoot>/trash/.canvas.json_<ts>).
+    // With sourcePath the disposed items are assets/ and .canvas.json moved
+    // to <wsRoot>/trash/ as assets_<ts> / .canvas.json_<ts>.
     const trashDir = join(wsRoot, 'trash')
     const entries = await import('node:fs/promises').then((m) => m.readdir(trashDir).catch(() => []))
     expect(entries.length).toBeGreaterThan(0)

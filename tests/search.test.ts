@@ -18,19 +18,22 @@ import {
   type Asset,
 } from '../src/asset-store'
 import { runSearch, addSoftRefToCanvas, resolveAsset } from '../src/search'
+import { projectAssetRootAt } from '../src/asset-store'
 
 let ws: string
 let canvasStore: CanvasStore
 let ps: ProjectStore
 
 async function addLibraryAsset(projectId: string, a: Asset): Promise<void> {
-  const root = projectAssetRoot(ws, projectId)
+  const meta = ps.snapshot().projects.find((p) => p.id === projectId)
+  const root = projectAssetRootAt(meta?.sourcePath, ws, projectId)
   const cat = join(root, ASSET_CATEGORY_DIR[a.kind])
   await mkdir(cat, { recursive: true })
   await writeFile(join(cat, a.file), 'x')
-  const idx = await loadAssetIndex(root)
+  const indexFile = meta?.sourcePath ? '.index.json' : 'index.json'
+  const idx = await loadAssetIndex(root, indexFile)
   idx.assets.push(a)
-  await writeAssetIndex(root, idx)
+  await writeAssetIndex(root, idx, indexFile)
 }
 
 async function registerCanvasNode(projectId: string, nodeId: string, type: 'image' | 'video' | 'music', url: string, label: string): Promise<void> {
@@ -42,7 +45,7 @@ async function registerCanvasNode(projectId: string, nodeId: string, type: 'imag
 beforeEach(async () => {
   ws = await mkdtemp(join(tmpdir(), 'media-studio-search-'))
   canvasStore = new CanvasStore(ws, {})
-  ps = new ProjectStore(ws, canvasStore, { recentLimit: 10, trashEnabled: true })
+  ps = new ProjectStore(ws, canvasStore, { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(ws, "Movies") })
   await ps.ready()
 })
 
@@ -151,8 +154,9 @@ describe('addSoftRefToCanvas & alreadyRefCount', () => {
     const owner = await ps.createProject('素材源')
     const asset: Asset = { id: 's3', kind: 'audio', name: '旁白-林晚', file: 's3.mp3', createdAt: 'n', updatedAt: 'n' }
     await addLibraryAsset(owner.id, asset)
-    const resolved = await resolveAsset(ws, owner.id, 's3')
+    const meta = ps.snapshot().projects.find((p) => p.id === owner.id)
+    const resolved = await resolveAsset(ws, owner.id, 's3', meta?.sourcePath)
     expect(resolved.name).toBe('旁白-林晚')
-    await expect(resolveAsset(ws, owner.id, 'ghost')).rejects.toThrow('not found')
+    await expect(resolveAsset(ws, owner.id, 'ghost', meta?.sourcePath)).rejects.toThrow('not found')
   })
 })

@@ -32,6 +32,13 @@ export interface Config {
   /** Deleting a project moves it under <workspaceRoot>/trash instead of
    *  hard-deleting it, unless the dialog explicitly opts into permanent. */
   trashEnabled: boolean
+  /**
+   * Base directory used as the default sourcePath for newly created projects
+   * that don't receive an explicit sourcePath. Projects land under
+   * <defaultSourcePath>/<projectName>/ instead of <wsRoot>/projects/<id>/.
+   * Defaults to ~/Movies.
+   */
+  defaultSourcePath: string
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -41,4 +48,5 @@ export const Config: Schema<Config> = Schema.object({
   logToolCalls: Schema.boolean().default(true).description('Append every canvas/media tool result to the session log for replay.'),
   recentLimit: Schema.number().default(10).min(1).max(50).description('Max entries kept in the project "recently opened" list.'),
   trashEnabled: Schema.boolean().default(true).description('Deleted projects/assets move to <workspaceRoot>/trash (recoverable) unless permanent delete is explicitly requested.'),
+  defaultSourcePath: Schema.string().default('~/Movies').description('Base directory for new projects without an explicit sourcePath. Projects land under <defaultSourcePath>/<name>/ instead of <wsRoot>/projects/<id>/.'),
 })

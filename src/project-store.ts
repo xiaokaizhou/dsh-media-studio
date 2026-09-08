@@ -25,7 +25,8 @@
  */
 
 import { readFile, writeFile, mkdir, readdir, rename, rm, copyFile } from 'node:fs/promises'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename } from 'node:path'
+import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import type { CanvasStore, CanvasOp } from './canvas-store'
 import {
@@ -129,6 +130,13 @@ export interface ProjectStoreOpts {
   onEvent?: (event: ProjectEvent) => void
   /** Plugin logger. Absent in unit-test environments. */
   logger?: { info?: (m: string) => void; warn?: (m: string) => void; error?: (m: string) => void; debug?: (m: string) => void }
+  /**
+   * Base directory used as the default sourcePath for newly created projects
+   * that don't receive an explicit sourcePath from the user. When set, every
+   * new project lands under <defaultSourcePath>/<projectName>/ instead of
+   * <wsRoot>/projects/<id>/. Defaults to ~/Movies when absent.
+   */
+  defaultSourcePath?: string
 }
 
 const REGISTRY_VERSION = 1
@@ -176,12 +184,15 @@ export class ProjectStore {
   private canvasStore: CanvasStore
   private opts: ProjectStoreOpts
   private logger?: ProjectStoreOpts['logger']
+  /** Base directory for new projects without an explicit sourcePath (e.g. ~/Movies). */
+  private defaultSourcePath: string
 
   constructor(wsRoot: string, canvasStore: CanvasStore, opts: ProjectStoreOpts) {
     this.wsRoot = wsRoot
     this.canvasStore = canvasStore
     this.opts = opts
     this.logger = opts.logger
+    this.defaultSourcePath = opts.defaultSourcePath ?? join(homedir(), 'Movies')
     this.readyPromise = this.serial(() => this.boot())
   }
 
@@ -293,11 +304,62 @@ export class ProjectStore {
     for (const meta of Object.values(this.registry.projects)) {
       this.canvasStore.setCanvasSourcePath(meta.id, meta.sourcePath)
     }
+    // Migrate legacy projects that have no sourcePath into the default source
+    // directory (<defaultSourcePath>/<name>/). This moves asset data from the
+    // old <wsRoot>/projects/<id>/ layout and canvas data from
+    // <wsRoot>/canvases/<id>.json into the user-owned directory, then updates
+    // the registry so future boots resolve everything from the new location.
+    await this.migrateLegacyProjects()
     // Make sure every persisted canvas is in memory before any dependents
     // scan runs. Pass the full sourcePath map so sourcePath projects'
     // .canvas.json files are picked up — without this, DSH restart loses
     // every sourcePath project's canvas state.
     await this.canvasStore.restore(this.allSourcePaths())
+  }
+
+  /** Move projects without sourcePath from <wsRoot>/projects/<id>/ and
+   *  <wsRoot>/canvases/<id>.json into <defaultSourcePath>/<name>/, then
+   *  update the registry. Non-destructive: skipped if target already exists.
+   *  The old <wsRoot>/projects/ directory is removed only after all projects
+   *  are migrated (called separately by the caller). */
+  private async migrateLegacyProjects(): Promise<void> {
+    const legacyDir = join(this.wsRoot, 'projects')
+    const canvasesDir = join(this.wsRoot, 'canvases')
+    let changed = false
+    for (const meta of Object.values(this.registry.projects)) {
+      if (meta.sourcePath) continue
+      const target = join(this.defaultSourcePath, meta.name)
+      try {
+        // If target already exists (e.g. user manually created the dir), skip.
+        const targetStat = await readdir(target).catch(() => null)
+        if (targetStat !== null) {
+          this.logger?.debug?.(`[media-studio] migrate: target ${target} already exists, skipping`)
+          meta.sourcePath = target
+          this.canvasStore.setCanvasSourcePath(meta.id, target)
+          continue
+        }
+        // Move assets from legacy layout.
+        const legacyAssets = join(legacyDir, meta.id, 'assets')
+        if (await readdir(legacyAssets).catch(() => null)) {
+          await mkdir(dirname(target), { recursive: true })
+          await rename(legacyAssets, join(target, 'assets'))
+        }
+        // Move canvas file.
+        const legacyCanvas = join(canvasesDir, `${meta.id}.json`)
+        try {
+          await readFile(legacyCanvas, 'utf8')
+          await mkdir(dirname(target), { recursive: true })
+          await rename(legacyCanvas, join(target, '.canvas.json'))
+        } catch { /* no canvas file */ }
+        meta.sourcePath = target
+        this.canvasStore.setCanvasSourcePath(meta.id, target)
+        changed = true
+        this.logger?.info?.(`[media-studio] migrated ${meta.id} → ${target}`)
+      } catch (e) {
+        this.logger?.warn?.(`[media-studio] migrate ${meta.id} failed: ${(e as Error).message}`)
+      }
+    }
+    if (changed) await this.persistRegistry()
   }
 
   private registryPath(): string {
@@ -314,13 +376,17 @@ export class ProjectStore {
       const err = validateProjectName(finalName)
       if (err) throw new Error(`createProject rejected: ${err}`)
 
+      const resolvedSourcePath =
+        typeof sourcePath === 'string' && sourcePath.trim()
+          ? sourcePath.trim()
+          : join(this.defaultSourcePath, finalName)
       const meta: ProjectMeta = {
         id: newProjectId(),
         name: finalName,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         lastOpenedAt: new Date().toISOString(),
-        ...(typeof sourcePath === 'string' && sourcePath.trim() ? { sourcePath: sourcePath.trim() } : {}),
+        sourcePath: resolvedSourcePath,
       }
       await this.ensureProjectTemplate(meta.id)
       await this.ensureProjectAgentsMd(meta)
@@ -495,7 +561,9 @@ export class ProjectStore {
         }
       }
       // Hard copies stored in the other project's asset index (copyOf).
-      const idx = await loadAssetIndex(this.projectAssetRoot(meta.id))
+      const src = this.registry.projects[meta.id]?.sourcePath
+      const idxFile = src ? '.index.json' : 'index.json'
+      const idx = await loadAssetIndex(this.projectAssetRoot(meta.id), idxFile)
       for (const a of idx.assets) {
         if (a.copyOf && a.copyOf.projectId === ownerId) {
           copyCounts.set(meta.id, (copyCounts.get(meta.id) ?? 0) + 1)

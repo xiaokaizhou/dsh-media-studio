@@ -23,13 +23,14 @@ let canvasStore: CanvasStore
 let store: ProjectStore
 const events: string[] = []
 
-async function makeStore(opts: { recentLimit?: number; trashEnabled?: boolean } = {}): Promise<ProjectStore> {
+async function makeStore(opts: { recentLimit?: number; trashEnabled?: boolean; defaultSourcePath?: string } = {}): Promise<ProjectStore> {
   events.length = 0
   canvasStore = new CanvasStore(wsRoot, {})
   store = new ProjectStore(wsRoot, canvasStore, {
     recentLimit: opts.recentLimit ?? 10,
     trashEnabled: opts.trashEnabled ?? true,
     onEvent: (e) => events.push(e.type),
+    defaultSourcePath: opts.defaultSourcePath ?? join(wsRoot, 'Movies'),
   })
   await store.ready()
   return store
@@ -57,10 +58,11 @@ function applySoftRef(projectId: string, nodeId: string, ref: { projectId: strin
 }
 
 async function makeOwnerAsset(projectId: string, asset: Asset): Promise<void> {
-  const catDir = join(wsRoot, 'projects', projectId, 'assets', ASSET_CATEGORY_DIR[asset.kind])
+  const meta = store.snapshot().projects.find((p) => p.id === projectId)
+  const catDir = join(meta?.sourcePath ?? join(wsRoot, 'projects', projectId), 'assets', ASSET_CATEGORY_DIR[asset.kind])
   await mkdir(catDir, { recursive: true })
   await writeFile(join(catDir, asset.file), 'png-bytes')
-  const root = join(wsRoot, 'projects', projectId, 'assets')
+  const root = join(meta?.sourcePath ?? join(wsRoot, 'projects', projectId), 'assets')
   const existing = await readAssetIndex(root)
   await writeAssetIndex(root, { version: 1, assets: [...existing, asset] })
 }
@@ -148,14 +150,13 @@ describe('create / rename / recent', () => {
     expect(store.snapshot().recent[0]).toBe(a.id)
   })
 
-  it('rename only touches the name when the project has no user sourcePath', async () => {
-    // Pure-registry rename: a project created without a `sourcePath` (the
-    // default for `createProject(name)` — no folder picked) only changes
-    // its display name. id stays stable, the on-disk layout under
-    // `<wsRoot>/projects/<id>` is not touched.
+  it('rename renames the user-owned sourcePath folder', async () => {
+    // With defaultSourcePath set, createProject always assigns a sourcePath.
+    // Renaming updates both the display name and the directory on disk.
     await makeStore()
     const p = await store.createProject('旧名')
-    expect(p.sourcePath).toBeUndefined()
+    expect(p.sourcePath).toBeDefined()
+    expect(p.sourcePath).toContain('Movies')
     const renamed = await store.renameProject(p.id, '新名·重制版')
     expect(renamed.id).toBe(p.id)
     expect(renamed.name).toBe('新名·重制版')
@@ -259,7 +260,7 @@ describe('deletion dependency analysis & cascades', () => {
     // asset dir moved to trash
     const trashDirs = await readdir(join(wsRoot, 'trash'))
     expect(trashDirs.length).toBeGreaterThan(0)
-    const trashed = trashDirs.find((d) => d.startsWith(p.id))
+    const trashed = trashDirs.some((d) => d.startsWith('assets_') || d.startsWith('.canvas.json_'))
     expect(trashed).toBeTruthy()
   })
 
@@ -321,7 +322,8 @@ describe('deletion dependency analysis & cascades', () => {
     const p = await store.createProject('永删')
     await store.deleteProject(p.id, 'permanent')
     await expect(readdir(join(wsRoot, 'trash'))).rejects.toThrow()
-    await expect(readdir(join(wsRoot, 'projects'))).resolves.toEqual([])
+    // Project must be gone from registry
+    expect(store.snapshot().projects.some((x) => x.id === p.id)).toBe(false)
   })
 })
 
@@ -335,7 +337,7 @@ describe('registry file durability', () => {
     expect(raw.activeId).toBe(p.id)
     expect(raw.version).toBe(1)
     // A brand new store instance over the same root sees the same data.
-    const s2 = new ProjectStore(wsRoot, new CanvasStore(wsRoot, {}), { recentLimit: 10, trashEnabled: true })
+    const s2 = new ProjectStore(wsRoot, new CanvasStore(wsRoot, {}), { recentLimit: 10, trashEnabled: true, defaultSourcePath: join(wsRoot, "Movies") })
     await s2.ready()
     expect(s2.snapshot().projects.find((x) => x.id === p.id)?.name).toBe('持久2')
     expect(s2.activeCanvasId()).toBe(p.id)
@@ -351,17 +353,18 @@ describe('registry file durability', () => {
 })
 
 describe('lossless JSON round-trip (Issue B regression)', () => {
-  it('createProject without sourcePath produces snapshot without undefined sourcePath key', async () => {
+  it('createProject always includes sourcePath in snapshot', async () => {
     await makeStore()
-    const p = await store.createProject('无源路径项目')
-    expect(p.sourcePath).toBeUndefined()
+    const p = await store.createProject('有源路径项目')
+    expect(p.sourcePath).toBeDefined()
+    expect(p.sourcePath).toContain('Movies')
     // The snapshot must not contain any undefined-valued keys
     const snap = store.snapshot()
     const snapJson = JSON.stringify(snap)
     // Re-parse to confirm no undefined leaked
     const parsed = JSON.parse(snapJson) as ReturnType<ProjectStore['snapshot']>
     for (const proj of parsed.projects) {
-      expect(proj).not.toHaveProperty('sourcePath')
+      expect(proj).toHaveProperty('sourcePath')
     }
     // The tool-like return value must also be clean
     const returnVal = { ok: true, ...snap }
@@ -370,15 +373,15 @@ describe('lossless JSON round-trip (Issue B regression)', () => {
     expect(JSON.parse(returnJson)).toEqual(returnVal)
   })
 
-  it('openProject without sourcePath preserves clean snapshot', async () => {
+  it('openProject preserves sourcePath in snapshot', async () => {
     await makeStore()
     const p = await store.createProject('开放测试')
-    expect(p.sourcePath).toBeUndefined()
+    expect(p.sourcePath).toBeDefined()
     const opened = await store.openProject(p.id)
-    expect(opened.sourcePath).toBeUndefined()
+    expect(opened.sourcePath).toBeDefined()
     const snap = store.snapshot()
     for (const proj of snap.projects) {
-      expect(proj).not.toHaveProperty('sourcePath')
+      expect(proj).toHaveProperty('sourcePath')
     }
   })
 })
