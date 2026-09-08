@@ -1313,22 +1313,43 @@ function CanvasView({ canvasId }: CanvasProps) {
       const match = style?.match(/scale\(([\d.]+)\)/)
       if (match) zoom = parseFloat(match[1]) || 1
     }
+    // Use requestAnimationFrame to batch the two state updates (setRegions +
+    // setNodes) into a single paint per frame. Without this, pointermove
+    // fires two independent React state updates per frame → 120 renders/s at
+    // 60 Hz. With RAF, we coalesce to one render per frame (60 renders/s).
+    let rafId: number | null = null
+    let pendingDx = 0
+    let pendingDy = 0
+    let dirty = false
+    const schedule = () => {
+      if (rafId !== null) return
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        if (!dirty) return
+        dirty = false
+        const dx = pendingDx
+        const dy = pendingDy
+        setRegions((cur) => cur.map((r) =>
+          r.id === draggingRegionId ? { ...r, x: Math.round(start.regionX + dx), y: Math.round(start.regionY + dy) } : r,
+        ))
+        setNodes((cur) => cur.map((n) => {
+          if ((n.data as Record<string, unknown>).region !== draggingRegionId) return n
+          const orig = start.nodePositions.get(n.id)
+          if (!orig) return n
+          return { ...n, position: { x: Math.round(orig.x + dx), y: Math.round(orig.y + dy) } }
+        }))
+      })
+    }
     const move = (ev: PointerEvent) => {
-      const dx = (ev.clientX - start.startX) / zoom
-      const dy = (ev.clientY - start.startY) / zoom
-      const nx = start.regionX + dx
-      const ny = start.regionY + dy
-      setRegions((cur) => cur.map((r) => (r.id === draggingRegionId ? { ...r, x: Math.round(nx), y: Math.round(ny) } : r)))
-      setNodes((cur) => cur.map((n) => {
-        if ((n.data as Record<string, unknown>).region !== draggingRegionId) return n
-        const orig = start.nodePositions.get(n.id)
-        if (!orig) return n
-        return { ...n, position: { x: Math.round(orig.x + dx), y: Math.round(orig.y + dy) } }
-      }))
+      pendingDx = (ev.clientX - start.startX) / zoom
+      pendingDy = (ev.clientY - start.startY) / zoom
+      dirty = true
+      schedule()
     }
     const up = (ev: PointerEvent) => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
+      if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null }
       setDraggingRegionId(null)
       // Commit the move as a batch op.
       const dx = (ev.clientX - start.startX) / zoom
@@ -1346,6 +1367,7 @@ function CanvasView({ canvasId }: CanvasProps) {
     return () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
+      if (rafId !== null) cancelAnimationFrame(rafId)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draggingRegionId])
