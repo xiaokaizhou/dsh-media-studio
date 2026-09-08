@@ -45,6 +45,7 @@ import {
   type MsStatus,
   type NodeKind,
 } from './canvas-api'
+import { useNodeDimmed } from './dim-store'
 import Lightbox from './lightbox'
 import { resolveLang, translate } from './i18n'
 
@@ -289,6 +290,11 @@ interface ShellProps {
   /** Mirrors `NodeProps.selected` so NodeShell can skip an xyflow store
    *  selector subscription per node (see the comment inside NodeShell). */
   selected?: boolean
+  /** Chain-highlight: true when the canvas has an active node selection and
+   *  this node is OUTSIDE the related (upstream/downstream) set. The card
+   *  renders dimmed via CSS; the value arrives from a boolean
+   *  useSyncExternalStore subscription, so only flipped cards re-render. */
+  dimmed?: boolean
 }
 
 /**
@@ -297,7 +303,7 @@ interface ShellProps {
  * source handles (left/right), corner-delete affordance slot and the "+"
  * branch buttons on both sides.
  */
-function NodeShell({ id, kind, status, title, toolbar, children, selected = false }: ShellProps) {
+function NodeShell({ id, kind, status, title, toolbar, children, selected = false, dimmed = false }: ShellProps) {
   const api = useMediaCanvas()
   const { cardW } = api
   const meta = KIND_META[kind]
@@ -322,7 +328,7 @@ function NodeShell({ id, kind, status, title, toolbar, children, selected = fals
   const showPill = visible && !!toolbar && toolbar.length > 0
 
   return (
-    <div className="canvas-card-wrap" style={cardWidthVar(cardW)} data-ms-id={id}>
+    <div className={`canvas-card-wrap${dimmed ? ' ms-dimmed' : ''}`} style={cardWidthVar(cardW)} data-ms-id={id}>
       <Handle type="target" position={Position.Left} id={`${id}-in`} className="ms-handle" />
       <div
         className="node-frame-wrap"
@@ -923,6 +929,7 @@ function makeMediaNode(kind: MediaKind) {
     const { id, data } = props
     useRefreshHandles(id)
     const api = useMediaCanvas()
+    const dimmed = useNodeDimmed(api.canvasId, id)
     const d = data as unknown as MsData
     const status = d.status ?? 'idle'
     const title = d.label ?? KIND_META[kind].placeholder
@@ -980,7 +987,7 @@ function makeMediaNode(kind: MediaKind) {
     }, [raw, id, api.saveToLibraryNode])
 
     return (
-      <NodeShell id={id} kind={kind} status={status} title={title} toolbar={toolbar} selected={props.selected}>
+      <NodeShell id={id} kind={kind} status={status} title={title} toolbar={toolbar} selected={props.selected} dimmed={dimmed}>
         <MediaCardBody kind={kind} nodeId={id} d={d} />
         {lightboxSrc && (
           <Lightbox
@@ -1012,12 +1019,17 @@ function makeDocNode(kind: 'text' | 'note') {
     const { id, data } = props
     useRefreshHandles(id)
     const api = useMediaCanvas()
+    const dimmed = useNodeDimmed(api.canvasId, id)
     const d = data as unknown as MsData
     const meta = KIND_META[kind]
     const status = d.status ?? 'idle'
     const title = d.label ?? meta.placeholder
     const field: 'text' | 'content' = kind === 'text' ? 'text' : 'content'
-    const value = (d[field] as string | undefined) ?? ''
+    // Guard against non-string values (e.g. agent wrote an object via
+    // canvas_node_update). The type cast above is only a compile-time hint;
+    // the runtime value could be anything since MsData extends Record<string, unknown>.
+    const rawValue = d[field]
+    const value = typeof rawValue === 'string' ? rawValue : String(rawValue ?? '')
     const storedH = typeof d.height === 'number' ? d.height : undefined
 
     const [draft, setDraft] = useState(value)
@@ -1043,7 +1055,7 @@ function makeDocNode(kind: 'text' | 'note') {
     const shownH = previewH ?? storedH
 
     return (
-      <NodeShell id={id} kind={kind} status={status} title={title} selected={props.selected}>
+      <NodeShell id={id} kind={kind} status={status} title={title} selected={props.selected} dimmed={dimmed}>
         <div
           className={`canvas-node node-${kind} ms-drag-area${shownH ? ' is-fixed' : ''}`}
           style={shownH ? { height: shownH } : undefined}

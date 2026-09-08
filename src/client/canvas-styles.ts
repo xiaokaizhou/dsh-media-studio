@@ -122,7 +122,12 @@ export const MEDIA_STUDIO_CSS = String.raw`
 }
 .media-studio-canvas .react-flow__connection { pointer-events: none; }
 .media-studio-canvas .react-flow__edge { pointer-events: all; cursor: pointer; }
-.media-studio-canvas .react-flow__edge-path { stroke-linecap: round; }
+.media-studio-canvas .react-flow__edge-path {
+  stroke-linecap: round;
+  /* Chain-highlight dim fade (FlowEdgeView toggles stroke-opacity inline;
+   * the transition here makes the state switch smooth). */
+  transition: stroke-opacity 0.15s ease;
+}
 .media-studio-canvas .react-flow__edge-textpointer { cursor: text; }
 .media-studio-canvas .react-flow__connection-path {
   stroke: var(--ms-edge-stroke, #7c83ff);
@@ -587,7 +592,15 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
   flex-direction: column;
   align-items: stretch;
   border-radius: var(--ms-radius-lg);
+  /* Chain-highlight dim fade — opacity-only so the transition runs on the
+   * compositor (no layout, no repainted children). */
+  transition: opacity 0.15s ease;
 }
+/* Upstream/downstream chain highlight (see dim-store.ts): while a node is
+ * selected, cards outside the related set render dimmed. Hovering a dimmed
+ * card restores it to full opacity so unrelated nodes stay reachable. */
+.canvas-card-wrap.ms-dimmed { opacity: 0.28; }
+.canvas-card-wrap.ms-dimmed:hover { opacity: 1; }
 .node-frame-wrap {
   display: flex;
   flex-direction: column;

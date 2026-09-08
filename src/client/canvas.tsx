@@ -49,12 +49,20 @@ import {
   type NodeChange,
   type OnConnectEnd,
   type OnConnectStart,
+  type OnSelectionChangeParams,
 } from '@xyflow/react'
 import { createPortal } from 'react-dom'
 import { NODE_CATALOG, NODE_TYPES, defaultLabel } from './nodes'
 import {
+  getDimSet,
+  setDimSet,
+  computeRelated,
+  useEdgeDimmed,
+} from './dim-store'
+import {
   MediaCanvasContext,
   postOps,
+  useMediaCanvas,
   type MsOp,
   type MsSnapshot,
   type NodeKind,
@@ -420,7 +428,14 @@ function estimateDocHeight(id: string, cardW: number): number | null {
 // refresh / skill sync) but is intentionally NOT rendered — per product
 // decision, edge labels are removed from the canvas UI.
 function FlowEdgeView(props: EdgeProps) {
-  const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, selected, style } = props
+  const { id, source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, selected, style } = props
+  // Chain-highlight: dim this edge when the canvas has an active node
+  // selection and at least one endpoint is outside the related set. The
+  // boolean subscription re-renders only flipped edges (see dim-store.ts).
+  // EdgeProps id/source/target are `string | number` in xyflow; our node
+  // ids are strings, so coerce defensively for the store lookup.
+  const { canvasId } = useMediaCanvas()
+  const dimmed = useEdgeDimmed(canvasId, String(source), String(target))
   const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
   const gradId = `ms-edge-${id}`
   return (
@@ -438,7 +453,9 @@ function FlowEdgeView(props: EdgeProps) {
         style={{
           stroke: selected ? '#a5b4fc' : `url(#${gradId})`,
           strokeWidth: selected ? 2.5 : 2,
-          strokeOpacity: selected ? 1 : 0.6,
+          // `stroke-opacity` animates via CSS transition (canvas-styles.ts);
+          // a selected edge always wins at full opacity.
+          strokeOpacity: selected ? 1 : dimmed ? 0.12 : 0.6,
           ...style,
         }}
       />
@@ -1225,15 +1242,75 @@ function CanvasView({ canvasId }: CanvasProps) {
   // AddSideButton / RefreshSideButton through the canvas context so they
   // skip the per-gesture `useStore(s => s.edges.some(...))` selector that
   // was the dominant source of UI jank when the canvas tab was on screen.
+  // The out/in adjacency arrays feed the chain-highlight BFS (dim-store.ts).
   const connMaps = useMemo(() => {
     const right = new Set<string>()
     const left = new Set<string>()
+    const out = new Map<string, string[]>()
+    const inn = new Map<string, string[]>()
     for (const e of edges) {
       right.add(e.source)
       left.add(e.target)
+      const a = out.get(e.source) ?? []
+      a.push(e.target)
+      out.set(e.source, a)
+      const b = inn.get(e.target) ?? []
+      b.push(e.source)
+      inn.set(e.target, b)
     }
-    return { right, left }
+    return { right, left, out, in: inn }
   }, [edges])
+
+  // ── Chain highlight (dim unrelated nodes/edges while a node is selected) ─
+  // `onSelectionChange` is xyflow's selection funnel: node click, Shift+click,
+  // Cmd/Ctrl marquee and empty-pane deselect all flow through it. We publish
+  // the related set (selected ∪ upstream ∪ downstream) to the module-level
+  // dim store; each card/edge subscribes a boolean snapshot, so a selection
+  // toggle only re-renders the elements that flipped. The adjacency lookup
+  // goes through a ref so the callback stays stable across edges churn
+  // (a fresh callback per SSE version would re-render the ReactFlow tree).
+  const connMapsRef = useRef(connMaps)
+  connMapsRef.current = connMaps
+  const selectedIdsRef = useRef<string[]>([])
+  const dimStructRef = useRef('')
+
+  const onSelectionChange = useCallback(({ nodes }: OnSelectionChangeParams) => {
+    // Node ids are strings in this app; String() guards the xyflow
+    // `string | number` id type so the dim store stays id-keyed.
+    const ids = nodes.map((n) => String(n.id))
+    selectedIdsRef.current = ids
+    dimStructRef.current = ''
+    if (ids.length === 0) {
+      setDimSet(canvasId, null)
+      return
+    }
+    setDimSet(canvasId, computeRelated(connMapsRef.current, ids))
+  }, [canvasId])
+
+  // Topology changed under an active selection (e.g. the agent added a node
+  // while the user had one selected) → recompute so the new nodes get the
+  // correct dim treatment. connMaps ref changes on every SSE version; the
+  // token guard makes content-equal echoes no-ops.
+  useEffect(() => {
+    const ids = selectedIdsRef.current
+    if (ids.length === 0 || getDimSet(canvasId) === null) return
+    const token =
+      ids.join('|') + '=>' + edges.map((e) => `${e.source}->${e.target}`).join('|')
+    if (token === dimStructRef.current) return
+    dimStructRef.current = token
+    setDimSet(canvasId, computeRelated(connMaps, ids))
+  }, [canvasId, connMaps, edges])
+
+  // A canvas (re)mount starts with an empty selection — clear any dim state
+  // left over from a previously active canvas tab on mount/change/unmount.
+  useEffect(() => {
+    selectedIdsRef.current = []
+    dimStructRef.current = ''
+    setDimSet(canvasId, null)
+    return () => {
+      setDimSet(canvasId, null)
+    }
+  }, [canvasId])
 
   // ── API for node components ─────────────────────────────────────────────
   const api = useMemo(() => ({
@@ -1332,6 +1409,7 @@ function CanvasView({ canvasId }: CanvasProps) {
             onConnect={onConnect}
             onConnectStart={onConnectStart}
             onConnectEnd={onConnectEnd}
+            onSelectionChange={onSelectionChange}
             onPaneContextMenu={onPaneContextMenu}
             onDoubleClick={onPaneDoubleClick}
             onMove={onMoveViewport}
