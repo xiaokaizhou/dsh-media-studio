@@ -3,9 +3,10 @@ import type { Context } from '@deepseek-ai/cordis'
 // the cordis Context type so TypeScript knows ctx.webServer exists.
 import '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createReadStream } from 'node:fs'
+import { createReadStream, readFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles, log, type MediaStudioHandles } from './service-state'
 import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch, backfillVideoPosters } from './tools'
@@ -505,6 +506,34 @@ export function registerCanvasRoutes(ctx: Context): () => void {
       })
     },
   })
+
+  // ── Service Worker: /api/media-studio/service-worker.js ──────────────────
+  // Serves the preheat SW so the browser can register it with
+  // `navigator.serviceWorker.register('/api/media-studio/service-worker.js')`.
+  // The SW intercepts media-file requests and serves cached headers on range
+  // hits, turning "click → stream" into "click → instant playback".
+  try {
+    const swPath = resolve(fileURLToPath(import.meta.url), '../lib/service-worker.js')
+    const swBody = readFileSync(swPath, 'utf8')
+    if (swBody) {
+      wserver.register({
+        kind: 'exact',
+        path: '/api/media-studio/service-worker.js',
+        handler: (_req, res) => {
+          res.writeHead(200, {
+            'Content-Type': 'application/javascript; charset=utf-8',
+            'Service-Worker-Allowed': '/',
+            'Cache-Control': 'public, max-age=86400',
+          })
+          res.end(swBody)
+        },
+      })
+    } else {
+      log.warn('[media-studio] service-worker.js is empty — SW preheat disabled')
+    }
+  } catch (e) {
+    log.warn('[media-studio] sw route setup failed: ' + (e as Error).message)
+  }
 
   // Return a noop disposer — the webServer.unregister handles cleanup
   // when the plugin fiber is disposed; we don't need custom teardown.

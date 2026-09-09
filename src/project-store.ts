@@ -762,16 +762,13 @@ export class ProjectStore {
   private async disposeProjectAssets(projectId: string, mode: DeleteMode): Promise<void> {
     const meta = this.registry.projects[projectId]
     const root = this.projectAssetRoot(projectId)
-    // With sourcePath the project root is the USER's directory; we must
-    // never delete the directory itself, only the media-studio-owned bits
-    // under it (assets/ + .canvas.json + AGENTS.md). Without sourcePath
-    // we fall back to the legacy whole-dir delete so existing trash
-    // behaviour is preserved.
+    // With sourcePath the project root is the user's own directory. We
+    // delete the entire directory (trashed or permanent) because the user
+    // expects the project folder to disappear on deletion — only deleting
+    // the assets/ subdirectory would leave an empty shell behind.
+    // Without sourcePath we fall back to the legacy whole-dir delete.
     if (meta?.sourcePath) {
-      await this.disposeFile(root, mode) // assets/
-      await this.disposeFile(join(meta.sourcePath, '.canvas.json'), mode)
-      // AGENTS.md is user-editable and may be the only marker they kept
-      // about the deletion, so leave it in place for reference.
+      await this.disposeFile(meta.sourcePath, mode)
     } else {
       const dir = dirname(root) // <wsRoot>/projects/<id>
       await this.disposeFile(dir, mode)

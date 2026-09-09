@@ -200,8 +200,8 @@ describe('Fix 3 + 4: project rename / delete round-trip', () => {
     // Registry no longer contains it.
     const snap = projectStore.snapshot()
     expect(snap.projects.find((p) => p.id === created.id)).toBeUndefined()
-    // With sourcePath the disposed items are assets/ and .canvas.json moved
-    // to <wsRoot>/trash/ as assets_<ts> / .canvas.json_<ts>.
+    // With sourcePath the entire project directory is moved to <wsRoot>/trash/
+    // as <projectName>_<ts> (not just assets/).
     const trashDir = join(wsRoot, 'trash')
     const entries = await import('node:fs/promises').then((m) => m.readdir(trashDir).catch(() => []))
     expect(entries.length).toBeGreaterThan(0)

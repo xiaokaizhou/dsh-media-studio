@@ -257,10 +257,11 @@ describe('deletion dependency analysis & cascades', () => {
     expect(result.deletedId).toBe(p.id)
     expect(store.snapshot().projects.some((x) => x.id === p.id)).toBe(false)
     expect(canvasStore.peek(p.id)).toBeNull()
-    // asset dir moved to trash
+    // sourcePath dir moved to trash (the whole project directory, not just assets/)
     const trashDirs = await readdir(join(wsRoot, 'trash'))
     expect(trashDirs.length).toBeGreaterThan(0)
-    const trashed = trashDirs.some((d) => d.startsWith('assets_') || d.startsWith('.canvas.json_'))
+    // The trashed entry is the project directory name (e.g. "要删的_<ts>")
+    const trashed = trashDirs.some((d) => d.startsWith('要删的_'))
     expect(trashed).toBeTruthy()
   })
 

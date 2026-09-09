@@ -148,15 +148,23 @@
 
 ## 持久化布局（workspaceRoot）
 
+带 `sourcePath` 的项目（当前所有注册项目均有；`createProject` 默认给 `~/Movies/<名称>`）画布与素材都在用户自己的 sourcePath 下，workspaceRoot 只保留注册表：
+
 ```
 <ws>/projects.json                  # 项目注册表（activeId / recent≤recentLimit / 项目元数据）
-<ws>/projects/<id>/assets/{characters,scenes,audio,clips}/ + index.json   # 素材
 <ws>/shared-assets/                 # __shared 共享库（被引用资产迁居地）
-<ws>/canvases/<id>.json             # 画布（id = 项目 id；旧画布原样保留）
 <ws>/trash/                         # 回收站（默认软删除）
-<ws>/web-jobs/                      # 生成媒体落点（dsh-llm-multimodal 写入）
+
+<sourcePath>/.canvas.json           # 画布（id = 项目 id）
+<sourcePath>/assets/{characters,scenes,audio,clips}/ + .index.json   # 素材
+
+<ws>/canvases/<id>.json             # 旧版画布（无 sourcePath 的 legacy 项目回退；首次启动自动提升为项目）
+<ws>/projects/<id>/assets/… + index.json   # 旧版素材（legacy 回退）
+<ws>/web-jobs/                      # 遗留：dsh-llm-multimodal 回退落点（服务缺失 / 无活跃项目 /
+                                     #  outputStrategy=outputDir 时才写入；默认策略下通常不出现）
 ```
 > 运行 profile 会以 cordis.patch.yml 覆盖 `workspaceRoot`（web profile 为 `/tmp/canvas-smoke`）——查持久化/媒体代理以运行 profile 为准。首次升级启动会把旧 `canvases/*.json` 自动提升为项目（legacy 标记）。
+> 插件在 apply() 发布跨插件服务 `mediaStudio`（`ctx.reflect.provide`，`src/media-studio-service.ts`）：`getActiveProjectId()` / `getActiveProject()` / `resolveAssetDir(projectId?, kind?)` / `workspaceRoot()`。dsh-llm-multimodal 以 `ctx.get('mediaStudio')` 软引用，把生成媒体直写活跃项目的 `<sourcePath>/assets/<kind>/`（图片默认 character、视频 clip、音频 audio，generate_image 可用 `asset_kind` 指定 scene 等）；服务缺失或无活跃项目时回退 `outputDir`（空 → `/tmp`），无硬依赖。
 
 ## 错误处理
 

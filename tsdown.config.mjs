@@ -120,4 +120,23 @@ export default [
       footer: 'return module.exports; } });',
     },
   },
+
+  // ── 3. Service Worker — plain ES module, no wrapper, no framework deps ─
+  //     Served at /api/media-studio/service-worker.js by the host route.
+  {
+    entry: { 'service-worker': 'src/client/service-worker.ts' },
+    outDir: 'lib',
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2022',
+    dts: false,
+    clean: false,
+    sourcemap: false,
+    minify: false,
+    treeshake: false,
+    splitting: false,
+    chunking: false,
+    // No framework bundle — SW runs at top-level; `self` globals are native.
+    banner: { js: '// media-studio service-worker\n' },
+  },
 ]

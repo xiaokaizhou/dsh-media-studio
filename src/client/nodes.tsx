@@ -445,6 +445,18 @@ function LazyVideo({ src, poster }: { src: string; poster?: string | null }) {
   // controls take over).
   const showPoster = !started && !posterFailed && !!poster
 
+  // When the card enters the viewport, ask the SW to prefetch the first 256 KB
+  // of this video in the background. The SW stores it in an in-memory Map and
+  // serves it on the next Range request as 206 Partial Content — so when the
+  // user clicks play the player gets the ftyp+moov header instantly and
+  // playback starts before the full file has streamed in. Deduped internally
+  // by the SW (concurrency cap + inflight set).
+  useEffect(() => {
+    if (!visible || !src) return
+    const preload = (globalThis as Record<string, unknown>).__msPreheatVideo as ((url: string) => void) | undefined
+    if (preload) preload(src)
+  }, [visible, src])
+
   // Start playback once the video mounts after the click (the click itself is
   // the user gesture, so autoplay policy allows play() right after).
   useEffect(() => {
@@ -491,6 +503,26 @@ function LazyVideo({ src, poster }: { src: string; poster?: string | null }) {
               controls
               autoPlay
               playsInline
+              // `preload="none"`: defer ALL media fetches until the user
+              // actually clicks play. The old `preload="auto"` (removed
+              // above) made 10+ concurrent full-file downloads on a
+              // canvas-full-of-videos, thrashing Chrome's 6-connection-per-
+              // host HTTP/1.1 cap and making the clicked card sit at the
+              // back of the queue — that's the "点击播放需要缓冲" symptom
+              // reported on the 时间修理铺 short-drama board.
+              //
+              // `preload="metadata"` (the prior fix) cut the payload to a
+              // ~256 KB header per card, but we still paid 16 HEAD-like
+              // requests on a board with 16 video nodes. `none` removes
+              // that cost entirely: zero pre-fetch, only the click-driven
+              // Range fetch fires. A local-file Range 206 over localhost
+              // takes <200 ms from SYN to first byte, so the UX is
+              // indistinguishable from instant-play. The poster <img>
+              // (loaded via the media-file proxy from
+              // `projects/<id>/assets/clips/v-<id>.thumb.jpg`, now
+              // project-relative thanks to the video-cover.ts change) is
+              // just one tiny image fetch and is unaffected.
+              preload="none"
             />
           )}
         </>

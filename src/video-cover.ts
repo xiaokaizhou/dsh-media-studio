@@ -10,10 +10,11 @@
  *   (1) "embed" — preferred. The provider response carries a separate
  *       thumbnail URL (Sora / Veo / Kling / Seedance all do); we download
  *       both, then ffmpeg-mux the JPG into the MP4 as `attached_pic`. The
- *       cover image is ALSO kept as a sibling `.poster.jpg` under web-jobs/
- *       and returned via `poster` — the frontend LazyVideo renders a plain
- *       `<img>` before the first click (no `<video>` element is mounted),
- *       so the MP4-attached_pic stream alone is never visible there.
+ *       cover image is ALSO kept as a sibling `.poster.jpg` next to the
+ *       .mp4 and returned via `poster` — the frontend LazyVideo renders a
+ *       plain `<img>` before the first click (no `<video>` element is
+ *       mounted), so the MP4-attached_pic stream alone is never visible
+ *       there.
  *
  *   (2) "extract" — fallback when the provider gave no cover (or step 1
  *       failed). We run `ffmpeg -ss 0 -frames:v 1` to pull the real first
@@ -23,9 +24,12 @@
  * Both steps degrade silently when ffmpeg is missing or the input is
  * unreadable — the caller still gets back a working `{ url }` pair.
  *
- * No step ever copies anything into the project's `assets/` tree; outputs
- * live entirely under `<wsRoot>/web-jobs/`, so cleanup on project deletion
- * is unaffected and the user's project directory stays clean.
+ * Output location mirrors `url`: when the project has a `sourcePath` the
+ * .mp4 + .poster/.thumb sibling land in `<sourcePath>/assets/clips/` and
+ * both URLs are returned as `projects/<id>/assets/clips/...` (so the
+ * `resolveMediaTarget()` `projects/<id>/...` branch serves them). Without
+ * a sourcePath we fall back to `<wsRoot>/web-jobs/` + `file://` URLs —
+ * legacy / pre-migration projects only.
  */
 
 import { spawn } from 'node:child_process'
@@ -67,10 +71,37 @@ async function downloadTo(url: string, dest: string): Promise<void> {
     await writeFile(dest, buf)
     return
   }
-  // Local path — copy bytes via fs.readFile/writeFile to keep this module
-  // dependency-light and side-effect free on the source location.
+  // `projects/<pid>/assets/<kind>/<file>` (the public form returned by
+  // `dsh-llm-multimodal.localizeVideoUrl` when outputStrategy=project).
+  // Resolve to the on-disk path through the same handler the
+  // `/api/media-studio/media-file` proxy uses, then copy the bytes.
+  const projectMatch = /^projects\/([^/]+)\/(.+)$/.exec(url)
+  if (projectMatch) {
+    const handles = getMediaStudioHandles()
+    const projectRoots = handles.projectStore?.allSourcePaths?.() ?? {}
+    const sourcePath = projectRoots[projectMatch[1]!]
+    if (sourcePath) {
+      const localPath = join(sourcePath, projectMatch[2]!)
+      const { readFile } = await import('node:fs/promises')
+      const buf = await readFile(localPath)
+      await mkdir(dirname(dest), { recursive: true })
+      await writeFile(dest, buf)
+      return
+    }
+  }
+  // Local path — strip `file://` prefix if present, then copy bytes via
+  // fs.readFile/writeFile to keep this module dependency-light and
+  // side-effect free on the source location. The multimodal plugin's
+  // `localizeVideoUrl` hands us back a `file://` URL after downloading
+  // the CDN bytes into the project's `assets/clips/`, so we MUST handle
+  // the prefix here — otherwise `prepareVideoForCanvas` returns the
+  // original `file://` URL and the canvas card never gets the stable
+  // `projects/<pid>/assets/clips/v-<id>.mp4` form (which in turn breaks
+  // the media-file proxy and leaves the card looking like a streaming
+  // video with no poster first-frame).
   const { readFile } = await import('node:fs/promises')
-  const buf = await readFile(url)
+  const localPath = url.startsWith('file://') ? url.slice(7) : url
+  const buf = await readFile(localPath)
   await mkdir(dirname(dest), { recursive: true })
   await writeFile(dest, buf)
 }
@@ -193,7 +224,16 @@ export async function prepareVideoForCanvas(
       const urlForNode = useSourcePath
         ? `projects/${opts.projectId}/assets/clips/v-${id}.mp4`
         : `file://${localVideo}`
-      return { url: urlForNode, poster: `file://${posterPath}` }
+      // Symmetric with `url`: when sourcePath is available, emit the
+      // project-relative poster path so the browser hits
+      // `/api/media-studio/media-file` via `resolveMediaTarget`'s
+      // `projects/<id>/...` branch instead of relying on the absolute-
+      // path/mediaRoots fallback. The `file://` form stays for legacy
+      // projects with no sourcePath.
+      const posterForNode = useSourcePath
+        ? `projects/${opts.projectId}/assets/clips/v-${id}.poster.jpg`
+        : `file://${posterPath}`
+      return { url: urlForNode, poster: posterForNode }
     } catch (e) {
       // Clean partials; we'll try extract below.
       await unlink(coverTmp).catch(() => {})
@@ -217,7 +257,10 @@ export async function prepareVideoForCanvas(
       const urlForNode = useSourcePath
         ? `projects/${opts.projectId}/assets/clips/v-${id}.mp4`
         : `file://${localVideo}`
-      return { url: urlForNode, poster: `file://${thumb}` }
+      const posterForNode = useSourcePath
+        ? `projects/${opts.projectId}/assets/clips/v-${id}.thumb.jpg`
+        : `file://${thumb}`
+      return { url: urlForNode, poster: posterForNode }
     } catch (e) {
       await unlink(thumb).catch(() => {})
       log.warn(`[media-studio] video-cover: extract failed (${(e as Error).message}); poster disabled`)
