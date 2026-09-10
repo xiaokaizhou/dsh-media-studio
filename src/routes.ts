@@ -7,6 +7,7 @@ import { createReadStream, readFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles, log, type MediaStudioHandles } from './service-state'
 import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch, backfillVideoPosters } from './tools'
@@ -39,6 +40,42 @@ function mimeFor(p: string): string {
   return MEDIA_MIME[extname(p).toLowerCase()] ?? 'application/octet-stream'
 }
 
+/**
+ * Cache-Control for media assets.
+ *
+ * `immutable` tells the browser HTTP cache the body will never change for
+ * this URL, so it must NOT issue conditional revalidation (If-None-Match /
+ * If-Modified-Since) within max-age. The filenames we hand out are stable
+ * per node (`llm-multimodal-<ts>-<rand>` from the multimodal plugin, or
+ * `<assetId>.<ext>` from the asset library) so this assumption holds for
+ * the lifetime of the URL.
+ *
+ * `private` because the body is a user-local file served from
+ * 127.0.0.1/<sourcePath>; shared caches must not store it.
+ *
+ * `max-age=86400` (24h) gives repeat views of the same node a pure cache
+ * hit with zero socket traffic — the dominant cost on a canvas with many
+ * revisits.
+ */
+const MEDIA_CACHE_CONTROL = 'private, max-age=86400, immutable'
+
+/**
+ * Weak ETag for a media file. Uses inode + mtimeMs + size as the fingerprint;
+ * cheap to compute (a single `stat`) and stable across processes. Weak ETag
+ * (`W/"..."`) is correct here: the body is byte-identical across same-ETag
+ * responses served from different segments of a Range request, which is
+ * exactly the case weak ETags are designed for.
+ */
+function etagFor(target: string, st: import('node:fs').Stats): string {
+  const h = createHash('sha1')
+  h.update(String(st.ino))
+  h.update(':')
+  h.update(String(Math.floor(st.mtimeMs)))
+  h.update(':')
+  h.update(String(st.size))
+  return `W/"${h.digest('hex').slice(0, 16)}"`
+}
+
 /** Stream a local file with basic HTTP Range support (media seeking). */
 async function serveMediaFile(target: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   let st
@@ -52,7 +89,23 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
   }
   const mime = mimeFor(target)
   const total = st.size
+  const etag = etagFor(target, st)
   const range = req.headers.range
+
+  // Conditional GET: client already has this version (ETag matched). Return
+  // 304 with no body so the browser uses its cache. For Range requests we
+  // don't honour If-Range here — Chrome / Safari fall back to a full 200 on
+  // miss, which is acceptable because `immutable` already prevents this path
+  // from firing inside max-age in the common case.
+  if (!range && req.headers['if-none-match'] === etag) {
+    res.writeHead(304, {
+      'ETag': etag,
+      'Cache-Control': MEDIA_CACHE_CONTROL,
+      'Accept-Ranges': 'bytes',
+    })
+    res.end()
+    return
+  }
 
   if (range) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
@@ -66,7 +119,8 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
           'Content-Length': end - start + 1,
           'Content-Range': `bytes ${start}-${end}/${total}`,
           'Accept-Ranges': 'bytes',
-          'Cache-Control': 'private, max-age=3600',
+          'Cache-Control': MEDIA_CACHE_CONTROL,
+          'ETag': etag,
         })
         createReadStream(target, { start, end }).on('error', () => res.destroy()).pipe(res)
         return
@@ -78,7 +132,8 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
     'Content-Type': mime,
     'Content-Length': total,
     'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, max-age=3600',
+    'Cache-Control': MEDIA_CACHE_CONTROL,
+    'ETag': etag,
   })
   createReadStream(target).on('error', () => res.destroy()).pipe(res)
 }

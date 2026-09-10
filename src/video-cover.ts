@@ -33,7 +33,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdir, writeFile, unlink, rename } from 'node:fs/promises'
+import { mkdir, writeFile, unlink, rename, stat } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { getMediaStudioHandles, log } from './service-state'
@@ -122,6 +122,68 @@ function runFfmpeg(args: string[]): Promise<void> {
   })
 }
 
+/**
+ * Faststart an MP4 in place: re-mux with `+faststart` so the `moov` box lives
+ * at the head of the file instead of the tail. Browsers (Chrome/Safari/Firefox
+ * with Media Source Extensions) need `moov` early to compute duration and seek
+ * to the first frame; without faststart they must download the entire file
+ * (or do an extra Range request for the tail) before `<video>` knows the clip's
+ * length — which is the dominant cause of "点击视频需要缓冲" with provider-
+ * generated MP4s (most providers mux without faststart).
+ *
+ * Strategy: stream-copy (no re-encode) to a sibling `.faststart.mp4`, then
+ * rename over the original. `-c copy` is essentially free CPU-wise; the wall-
+ * clock cost is dominated by the file read+write of the source bytes, which
+ * for a 20 MB clip lands around 30-80 ms on NVMe.
+ *
+ * Gracefully no-ops when:
+ *   • ffmpeg is unavailable (probeFfmpeg already cached the negative result)
+ *   • the file is not MP4-shaped (no `ftyp` box at byte 4)
+ *   • the moov box is already at the head (idempotent — re-mux is a no-op)
+ *   • anything goes wrong (logged as warn; original file is left untouched)
+ *
+ * Returns true if the rewrite actually happened (file on disk is now
+ * faststart), false if it was skipped. Callers should not branch on the
+ * result — the goal is best-effort first-frame availability, not a guarantee.
+ */
+export async function faststartMp4(localPath: string): Promise<boolean> {
+  if (!(await probeFfmpeg())) return false
+
+  // Cheap "is this even an MP4" check: bytes 4..7 must be `ftyp`. Without
+  // this we'd feed ffmpeg a wav/mov/webm and either succeed with no effect
+  // or fail noisily on mov-files-that-aren't-mp4 (e.g. quicktime). Both
+  // outcomes are harmless but the warning is unhelpful for non-MP4.
+  let head: Buffer
+  try {
+    const fh = await import('node:fs/promises').then((m) => m.open(localPath, 'r'))
+    try {
+      const buf = Buffer.alloc(8)
+      await fh.read(buf, 0, 8, 0)
+      head = buf
+    } finally {
+      await fh.close()
+    }
+  } catch { return false }
+  if (head.slice(4, 8).toString('latin1') !== 'ftyp') return false
+
+  const tmp = `${localPath}.faststart.mp4`
+  try {
+    await runFfmpeg([
+      '-y',
+      '-i', localPath,
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      tmp,
+    ])
+    await rename(tmp, localPath)
+    return true
+  } catch (e) {
+    await unlink(tmp).catch(() => {})
+    log.warn(`[media-studio] faststart: re-mux failed for "${localPath}": ${(e as Error).message} — leaving file as-is`)
+    return false
+  }
+}
+
 /** Drop every field except ones that look like a cover URL. */
 function pickCoverUrl(extra: unknown): string | undefined {
   if (!extra || typeof extra !== 'object') return undefined
@@ -193,6 +255,17 @@ export async function prepareVideoForCanvas(
     log.warn(`[media-studio] video-cover: download failed (${(e as Error).message}); keeping original URL`)
     return { url: videoUrl, poster: null }
   }
+
+  // Faststart the freshly-downloaded MP4 before any cover-embedding. Most
+  // video providers (Agnes / Sora / Seedance / MiniMax) mux without
+  // `+faststart`, leaving the `moov` box at the tail — browsers then need
+  // the whole file (or an extra Range to the end) before <video> can
+  // compute duration or paint the first frame. Re-muxing once here is
+  // stream-copy and ~30–80 ms on NVMe; subsequent embed/extract runs are
+  // also stream-copies and inherit the head-placed moov, so every video
+  // node produced by this function lands faststart on disk regardless of
+  // which cover strategy wins.
+  await faststartMp4(localVideo)
 
   const ffmpegOk = await probeFfmpeg()
 
