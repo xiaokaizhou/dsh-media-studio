@@ -70,7 +70,7 @@ import {
   type OpenConnectOpts,
 } from './canvas-api'
 import { injectMediaStudioStyles } from './canvas-styles'
-import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn, IconEraser, IconX, IconLock, IconUnlock } from './icons'
+import { IconMap, IconMaximize2, IconMinus, IconWand, IconZoomIn, IconEraser, IconX, IconLock, IconUnlock, IconFlow, IconFlowRegion, IconAiArrange } from './icons'
 import { apiRegisterAsset, type AssetKind } from './assets-api'
 import { resolveLang, translate } from './i18n'
 import { subscribeFull, subscribeConn } from './canvas-bus'
@@ -2018,6 +2018,302 @@ function CanvasView({ canvasId }: CanvasProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rf, cardW, mutate, regionsRef])
 
+  // ── AI smart auto-arrange ────────────────────────────────────────────────
+  // Goes one step further than adaptiveAutoArrange: it doesn't just keep the
+  // regions that already exist — it inspects every ungrouped node and
+  // synthesises a set of themed regions ("脚本", "角色设定", "场景设定",
+  // "分镜/视频片段", "配音/音频", …) when the canvas doesn't have enough
+  // structure yet. Existing regions are preserved (and merged into the new
+  // layout when a node already belongs to one), regions never used by any
+  // node get dropped, and after moving everything each region is fitRegion'd
+  // so boxes never end up half-empty.
+  //
+  // Heuristics are intentionally simple and deterministic — this is a
+  // layout pass, not an LLM call:
+  //   • type === 'text' | 'note'              → 「脚本」  (kind: 'script')
+  //   • type === 'image' + portrait/角色 clue → 「角色设定」(kind: 'characters')
+  //   • type === 'image' + scene/landscape    → 「场景设定」(kind: 'scenes')
+  //   • type === 'image'  (no clear cue)     → 「图片素材」(kind: 'media')
+  //   • type === 'video'                      → 「分镜/视频片段」(kind: 'storyboard')
+  //   • type === 'music'                      → 「配音/音频」(kind: 'media')
+  // A node that already has data.region pointing at a live region keeps
+  // that region (the algorithm just adds the missing themed regions, it
+  // never steals a node from an existing box).
+  const smartAutoArrange = useCallback(() => {
+    previewingRef.current = false
+    const flowNodes = rf.getNodes()
+    const flowEdges = rf.getEdges()
+    if (flowNodes.length === 0) return
+
+    // ── doc height auto-fit (text/note) ──────────────────────────────────
+    const estHeights = new Map<string, number>()
+    const heightOps: MsOp[] = []
+    for (const n of flowNodes) {
+      if (n.type !== 'text' && n.type !== 'note') continue
+      const h = estimateDocHeight(n.id, cardW)
+      if (!h) continue
+      const current = n.measured?.height ?? (n.data as { height?: unknown }).height
+      if (typeof current !== 'number' || Math.abs(current - h) > 4) {
+        estHeights.set(n.id, h)
+        heightOps.push({ op: 'updateNode', id: n.id, data: { height: h } })
+      }
+    }
+
+    // ── bucket nodes ──────────────────────────────────────────────────────
+    // themeKey: 'script' | 'characters' | 'scenes' | 'storyboard' | 'media'
+    // Each bucket becomes one region (unless the bucket is empty). Nodes that
+    // are already pinned to a surviving region keep their original region.
+    type SmartBucket = {
+      key: string         // region id we'll mint if no existing region matches
+      label: string
+      kind: string
+      nodes: typeof flowNodes
+      pinnedRegionId?: string
+    }
+    const liveRegions = regionsRef.current
+    const labelOf = (n: typeof flowNodes[number]) => {
+      const d = (n.data ?? {}) as Record<string, unknown>
+      // xyflow's Node<T> typing doesn't surface `label` directly (we keep
+      // it on data.label), so prefer the data fields and fall back to the
+      // optional data.label for cards that store it there.
+      const text = [d.prompt, d.text, d.content, d.label]
+        .filter((v): v is string => typeof v === 'string' && v.length > 0)
+        .join(' \n ')
+        .toLowerCase()
+      return text
+    }
+    const buckets = new Map<string, SmartBucket>()
+    const getBucket = (key: string, label: string, kind: string): SmartBucket => {
+      let b = buckets.get(key)
+      if (!b) {
+        b = { key, label, kind, nodes: [] }
+        buckets.set(key, b)
+      }
+      return b
+    }
+    const CHARACTER_CUES = /(character|角色|人物|portrait|人物设定|character sheet|character design|character reference)/i
+    const SCENE_CUES = /(scene|背景|场景|environment|landscape|backdrop|location|场景设定|scene design|scene reference|wide shot|全景|远景)/i
+
+    // First-reset — for every node, decide its destination bucket.
+    for (const n of flowNodes) {
+      const data = n.data as Record<string, unknown>
+      const existingRegionId = data.region as string | undefined
+      const existingRegion = existingRegionId
+        ? liveRegions.find((r) => r.id === existingRegionId)
+        : undefined
+      if (existingRegion) {
+        // Pin to the existing region: don't steal the node, don't create a
+        // duplicate themed bucket for it. We do record it so we can fitRegion
+        // the box later.
+        const key = `pin:${existingRegion.id}`
+        let b = buckets.get(key)
+        if (!b) {
+          b = { key, label: existingRegion.label, kind: existingRegion.kind ?? 'generic', nodes: [], pinnedRegionId: existingRegion.id }
+          buckets.set(key, b)
+        }
+        b.nodes.push(n)
+        continue
+      }
+
+      const text = labelOf(n)
+      if (n.type === 'text' || n.type === 'note') {
+        getBucket('script', '脚本 / 文本', 'script').nodes.push(n)
+      } else if (n.type === 'music') {
+        getBucket('audio', '配音 / 音频', 'media').nodes.push(n)
+      } else if (n.type === 'video') {
+        getBucket('storyboard', '分镜 / 视频片段', 'storyboard').nodes.push(n)
+      } else if (n.type === 'image') {
+        if (CHARACTER_CUES.test(text)) {
+          getBucket('characters', '角色设定', 'characters').nodes.push(n)
+        } else if (SCENE_CUES.test(text)) {
+          getBucket('scenes', '场景设定', 'scenes').nodes.push(n)
+        } else {
+          getBucket('media', '图片素材', 'media').nodes.push(n)
+        }
+      } else {
+        // Unknown future kinds fall through to media so the layout still works.
+        getBucket('media', '其他', 'media').nodes.push(n)
+      }
+    }
+
+    // Drop empty buckets (e.g. canvas has only images → no script bucket).
+    for (const [key, b] of [...buckets.entries()]) {
+      if (b.nodes.length === 0) buckets.delete(key)
+    }
+
+    // ── plan region geometry ──────────────────────────────────────────────
+    // For each bucket, decide the region id (new or pinned) and a target
+    // size that holds its nodes in a tidy grid. Place buckets left-to-right
+    // with a generous gap; stack the next row when the line is too wide.
+    const ops: MsOp[] = [...heightOps]
+    const PAD = 24
+    const HEADER = 64
+    const COL_PITCH = 300
+    const ROW_PITCH = 280
+    const COLS_PER_REGION = 3
+    const GAP_X = 80
+    const GAP_Y = 100
+    const START_X = 60
+    const START_Y = 60
+    const MAX_LINE_WIDTH = 1800 // wrap to next row when the line gets this wide
+
+    const layoutBuckets: Array<{ bucket: SmartBucket; regionId: string; isNew: boolean; x: number; y: number; w: number; h: number }> = []
+    let cursorX = START_X
+    let cursorY = START_Y
+    let lineMaxH = 0
+    for (const [, b] of buckets) {
+      const n = b.nodes.length
+      const cols = Math.min(COLS_PER_REGION, Math.max(1, n))
+      const rows = Math.max(1, Math.ceil(n / cols))
+      // Each region keeps a tidy, slightly square aspect; wider when many nodes.
+      const w = Math.max(720, cols * COL_PITCH + PAD * 2)
+      const h = Math.max(400, rows * ROW_PITCH + HEADER + PAD)
+      // Wrap to next row when the line would be too wide.
+      if (cursorX - START_X + w > MAX_LINE_WIDTH && cursorX !== START_X) {
+        cursorX = START_X
+        cursorY += lineMaxH + GAP_Y
+        lineMaxH = 0
+      }
+      const regionId = b.pinnedRegionId ?? `r-smart-${b.key}-${Math.random().toString(36).slice(2, 8)}`
+      if (b.pinnedRegionId) {
+        // Move the existing region to its new slot.
+        ops.push({ op: 'updateRegion', id: b.pinnedRegionId, x: cursorX, y: cursorY, w, h })
+      } else {
+        ops.push({ op: 'addRegion', id: regionId, label: b.label, kind: b.kind, x: cursorX, y: cursorY, w, h })
+      }
+      layoutBuckets.push({ bucket: b, regionId, isNew: !b.pinnedRegionId, x: cursorX, y: cursorY, w, h })
+      cursorX += w + GAP_X
+      lineMaxH = Math.max(lineMaxH, h)
+    }
+
+    // ── place nodes inside each region ────────────────────────────────────
+    // For every region bucket, run a BFS depth layout so the result still
+    // looks like a pipeline (sources left, sinks right) instead of an
+    // arbitrary gallery row.
+    const buildMaps = (nodes: typeof flowNodes) => {
+      const inMap = new Map<string, string[]>()
+      const outMap = new Map<string, string[]>()
+      for (const e of flowEdges) {
+        if (!nodes.find((n) => n.id === e.source) || !nodes.find((n) => n.id === e.target)) continue
+        const a = inMap.get(e.target) ?? []; a.push(e.source); inMap.set(e.target, a)
+        const b = outMap.get(e.source) ?? []; b.push(e.target); outMap.set(e.source, b)
+      }
+      return { inMap, outMap }
+    }
+
+    for (const slot of layoutBuckets) {
+      const { inMap, outMap } = buildMaps(slot.bucket.nodes)
+      const depth = new Map<string, number>()
+      const queue: Array<{ id: string; d: number }> = []
+      for (const n of slot.bucket.nodes) {
+        if (!inMap.get(n.id)?.length) { depth.set(n.id, 0); queue.push({ id: n.id, d: 0 }) }
+      }
+      while (queue.length) {
+        const { id, d } = queue.shift()!
+        for (const t of outMap.get(id) ?? []) {
+          if ((depth.get(t) ?? -1) < d + 1) { depth.set(t, d + 1); queue.push({ id: t, d: d + 1 }) }
+        }
+      }
+      for (const n of slot.bucket.nodes) if (!depth.has(n.id)) depth.set(n.id, 0)
+      const byDepth = new Map<number, string[]>()
+      for (const n of slot.bucket.nodes) {
+        const d = depth.get(n.id) ?? 0
+        const list = byDepth.get(d) ?? []
+        list.push(n.id)
+        byDepth.set(d, list)
+      }
+      // We flatten the depth buckets back to a single ordered list so the
+      // gallery grid feels natural, but depth still groups upstream nodes
+      // together (which is the whole point of "flow + region").
+      const ordered: string[] = []
+      for (const [, ids] of [...byDepth.entries()].sort((a, b) => a[0] - b[0])) {
+        for (const id of ids) ordered.push(id)
+      }
+
+      const cols = Math.min(COLS_PER_REGION, Math.max(1, ordered.length))
+      // Determine max measured width inside this bucket so the grid pitch
+      // never lets a card overflow the region box.
+      let maxNodeW = cardW
+      for (const n of slot.bucket.nodes) {
+        const w = n.measured?.width ?? cardW
+        if (w > maxNodeW) maxNodeW = w
+      }
+      const colPitch = Math.min(COL_PITCH, Math.max(280, maxNodeW + 40))
+
+      for (let i = 0; i < ordered.length; i += 1) {
+        const id = ordered[i]
+        const col = i % cols
+        const row = Math.floor(i / cols)
+        ops.push({
+          op: 'moveNode',
+          id,
+          position: {
+            x: slot.x + PAD + col * colPitch,
+            y: slot.y + HEADER + row * ROW_PITCH,
+          },
+        })
+        // Write the membership so the next SSE snapshot keeps the binding
+        // (and so future per-region tidy-ups know where each card lives).
+        ops.push({ op: 'updateNode', id, data: { region: slot.regionId } })
+      }
+    }
+
+    // Drop any existing regions that aren't holding a member after the move
+    // (we don't want stale empty boxes left behind by the rearrangement).
+    const survivingRegionIds = new Set(layoutBuckets.map((s) => s.regionId))
+    for (const r of liveRegions) {
+      if (!survivingRegionIds.has(r.id)) {
+        ops.push({ op: 'deleteRegion', id: r.id })
+        // Nodes still pointing at the dead region: release them so they
+        // don't carry a dangling `data.region` after the patch lands.
+        for (const n of flowNodes) {
+          if ((n.data as Record<string, unknown>).region === r.id) {
+            ops.push({ op: 'updateNode', id: n.id, data: { region: null } })
+          }
+        }
+      }
+    }
+
+    // Fit every surviving region tightly around its members (the boxes we
+    // just sized were upper bounds; fitRegion trims to actual content).
+    for (const slot of layoutBuckets) {
+      ops.push({ op: 'fitRegion', id: slot.regionId })
+    }
+
+    if (ops.length === 0) return
+    try {
+      mutate(ops)
+    } catch (e) {
+      console.error('[media-studio] smartAutoArrange failed:', (e as Error).message)
+      return
+    }
+    // Frame everything we just laid out.
+    setTimeout(() => {
+      try {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+        for (const slot of layoutBuckets) {
+          minX = Math.min(minX, slot.x)
+          minY = Math.min(minY, slot.y)
+          maxX = Math.max(maxX, slot.x + slot.w)
+          maxY = Math.max(maxY, slot.y + slot.h)
+        }
+        if (isFinite(minX) && isFinite(maxX) && isFinite(minY) && isFinite(maxY)) {
+          const pad = 80
+          const cx = (minX + maxX) / 2
+          const cy = (minY + maxY) / 2
+          const w = maxX - minX + pad * 2
+          const h = maxY - minY + pad * 2
+          const vp = viewportSizeRef.current
+          const scale = Math.min(vp.w / w, vp.h / h, 1.5)
+          rf.setCenter(cx, cy, { zoom: Math.max(0.3, scale), duration: 360 })
+        } else {
+          rf.fitView({ padding: 0.15, duration: 360 })
+        }
+      } catch { /* ignore */ }
+    }, 240)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rf, cardW, mutate, regionsRef])
+
   // ── Save-to-library dialog (M2) ─────────────────────────────────────────
   const [saveDlg, setSaveDlg] = useState<{ id: string; type: NodeKind; label: string } | null>(null)
   const openSaveToLibrary = useCallback((id: string) => {
@@ -2385,7 +2681,9 @@ function CanvasView({ canvasId }: CanvasProps) {
           {menu && <CreateMenu menu={menu} onClose={dismissMenu} onPick={onPickCreate} />}
 
           <ViewBar
-            autoArrange={autoArrange}
+            autoArrangeFlow={autoArrange}
+            autoArrangeRegion={adaptiveAutoArrange}
+            autoArrangeSmart={smartAutoArrange}
             minimapOn={prefs.minimap}
             onToggleMinimap={toggleMinimap}
             onClearCanvas={() => setClearConfirmOpen(true)}
@@ -2663,8 +2961,10 @@ function CreateMenu({ menu, onClose, onPick }: {
 
 // ── View bar (auto-arrange / minimap / fit / zoom / clear) ──────────────────
 
-function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
-  autoArrange: () => void
+function ViewBar({ autoArrangeFlow, autoArrangeRegion, autoArrangeSmart, minimapOn, onToggleMinimap, onClearCanvas }: {
+  autoArrangeFlow: () => void
+  autoArrangeRegion: () => void
+  autoArrangeSmart: () => void
   minimapOn: boolean
   onToggleMinimap: () => void
   onClearCanvas: () => void
@@ -2676,15 +2976,18 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
 
   return (
     <div className="ms-view-bar" role="toolbar" aria-label="Canvas view controls">
-      <button
-        type="button"
-        className="ms-view-bar-btn"
-        onClick={autoArrange}
-        title={t('view.autoArrange')}
-        aria-label={t('view.autoArrange')}
-      >
-        <IconWand size={15} strokeWidth={1.8} />
-      </button>
+      {/* Auto-arrange wand: hover reveals a capsule with 3 arrangement modes
+          (flow / flow+region / AI smart) above the button. The capsule stays
+          visible while the pointer is anywhere inside the wand wrapper, so
+          users can move up to the menu without it vanishing. The wrapper
+          itself is a flex container so the button doesn't shift when the
+          capsule pops in. */}
+      <ArrangeWand
+        onFlow={autoArrangeFlow}
+        onRegion={autoArrangeRegion}
+        onSmart={autoArrangeSmart}
+        label={t('view.autoArrange')}
+      />
       <button
         type="button"
         className={`ms-view-bar-btn ${minimapOn ? 'is-active' : ''}`}
@@ -2709,6 +3012,96 @@ function ViewBar({ autoArrange, minimapOn, onToggleMinimap, onClearCanvas }: {
       >
         <IconEraser size={14} strokeWidth={1.8} />
       </button>
+    </div>
+  )
+}
+
+/**
+ * Auto-arrange wand + hover capsule. Three modes are exposed:
+ *   • 拓扑  (flow only — columns by upstream depth, regions untouched)
+ *   • 拓扑 + 区域 (per-region tidy with fitRegion, regions stay)
+ *   • AI 智能 (auto-creates themed regions, sizes them, drops unused ones)
+ *
+ * The capsule sits centered above the wand button. It only opens on hover
+ * so it doesn't steal space from the FAB when the user is panning/zooming.
+ */
+function ArrangeWand({ onFlow, onRegion, onSmart, label }: {
+  onFlow: () => void
+  onRegion: () => void
+  onSmart: () => void
+  label: string
+}) {
+  const lang = resolveLang()
+  const t = (key: string, vars?: Record<string, string | number>) => translate(lang, key, vars)
+  const [open, setOpen] = useState(false)
+  // Keep the capsule mounted briefly after the pointer leaves so users can
+  // move from the button to the capsule without it flickering closed.
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const scheduleClose = useCallback(() => {
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+    closeTimer.current = setTimeout(() => setOpen(false), 120)
+  }, [])
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null }
+  }, [])
+  useEffect(() => () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+  }, [])
+
+  const modes: Array<{ id: 'flow' | 'region' | 'smart'; icon: typeof IconWand; run: () => void; title: string; desc: string }> = [
+    { id: 'flow',   icon: IconFlow,       run: onFlow,   title: t('view.arrange.flow'),   desc: t('view.arrange.flowDesc') },
+    { id: 'region', icon: IconFlowRegion, run: onRegion, title: t('view.arrange.region'), desc: t('view.arrange.regionDesc') },
+    { id: 'smart',  icon: IconAiArrange,  run: onSmart,  title: t('view.arrange.smart'),  desc: t('view.arrange.smartDesc') },
+  ]
+
+  return (
+    <div
+      className={`ms-arrange-wand ${open ? 'is-open' : ''}`}
+      onMouseEnter={() => { cancelClose(); setOpen(true) }}
+      onMouseLeave={scheduleClose}
+    >
+      <button
+        type="button"
+        className="ms-view-bar-btn"
+        title={label}
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        // Click on the wand (without entering the capsule) runs the default
+        // "flow" mode so the keyboard / tap path stays one-click.
+        onClick={onFlow}
+      >
+        <IconWand size={15} strokeWidth={1.8} />
+      </button>
+      <div
+        className="ms-arrange-capsule"
+        role="menu"
+        aria-label={t('view.arrangeMode')}
+        // Prevent the ReactFlow canvas from swallowing the hover when the
+        // pointer crosses the gap between button and capsule.
+        onMouseEnter={cancelClose}
+        onMouseLeave={scheduleClose}
+      >
+        {modes.map((m) => {
+          const Icon = m.icon
+          return (
+            <button
+              key={m.id}
+              type="button"
+              role="menuitem"
+              className={`ms-arrange-mode ms-arrange-mode-${m.id}`}
+              onClick={() => { m.run(); setOpen(false) }}
+              title={m.desc}
+            >
+              <span className="ms-arrange-mode-icon"><Icon size={16} strokeWidth={1.7} /></span>
+              <span className="ms-arrange-mode-text">
+                <span className="ms-arrange-mode-title">{m.title}</span>
+                <span className="ms-arrange-mode-desc">{m.desc}</span>
+              </span>
+            </button>
+          )
+        })}
+      </div>
     </div>
   )
 }

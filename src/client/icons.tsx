@@ -245,6 +245,55 @@ export const IconLock = makeIcon(
   'Lock',
 )
 
+/**
+ * Topology-flow icon — used by the "arrange by flow" (no-region) button
+ * inside the auto-arrange capsule. Three nodes wired head-to-tail, matching
+ * the depth-column layout the topology mode produces on canvas.
+ */
+export const IconFlow = makeIcon(
+  <>
+    <circle cx="5" cy="6" r="2.5" />
+    <circle cx="19" cy="12" r="2.5" />
+    <circle cx="5" cy="18" r="2.5" />
+    <line x1="7.5" y1="6" x2="16.5" y2="12" />
+    <line x1="7.5" y1="18" x2="16.5" y2="12" />
+  </>,
+  'Flow',
+)
+
+/**
+ * Topology-with-region icon — used by the "arrange by flow inside regions"
+ * button. A dotted container box wrapping the same three-node flow to evoke
+ * "preserve existing regions while you tidy the inside".
+ */
+export const IconFlowRegion = makeIcon(
+  <>
+    <rect x="2.5" y="3.5" width="19" height="17" rx="2" stroke-dasharray="3 2" />
+    <circle cx="8" cy="8" r="1.8" />
+    <circle cx="16" cy="12" r="1.8" />
+    <circle cx="8" cy="16" r="1.8" />
+    <line x1="9.5" y1="8" x2="14.5" y2="12" />
+    <line x1="9.5" y1="16" x2="14.5" y2="12" />
+  </>,
+  'Flow with region',
+)
+
+/**
+ * AI-smart-arrange icon — used by the capsule's "smart layout" button.
+ * Sparkles wrapping a grid evokes "AI divides the canvas into tidy groups".
+ */
+export const IconAiArrange = makeIcon(
+  <>
+    <path d="M12 3l1.6 3.4L17 8l-3.4 1.6L12 13l-1.6-3.4L7 8l3.4-1.6z" />
+    <path d="M19 14l.9 1.9L21.8 17l-1.9.9L19 19.8l-.9-1.9L16.2 17l1.9-.9z" />
+    <rect x="3" y="13" width="6" height="6" rx="1" />
+    <rect x="11" y="13" width="6" height="6" rx="1" />
+    <rect x="3" y="19" width="6" height="2" rx="1" />
+    <rect x="11" y="19" width="6" height="2" rx="1" />
+  </>,
+  'Smart arrange',
+)
+
 export const IconUnlock = makeIcon(
   <>
     <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />

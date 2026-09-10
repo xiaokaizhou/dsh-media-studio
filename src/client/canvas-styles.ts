@@ -1443,6 +1443,139 @@ body:not([data-ds-dark-theme]) .ms-menu-backdrop {
 }
 .ms-view-bar-pct:hover { background: var(--ms-panel-soft); color: var(--ms-fg); }
 
+/* ── Arrange wand (hover capsule with 3 modes) ───────────────────────────
+   The wand lives inside the view bar pill like every other FAB button, but
+   on hover/focus it pops a vertical capsule ABOVE the bar, centered on the
+   button. The capsule stays mounted while the pointer is anywhere inside
+   the wrapper (button OR capsule), so the user can move up to the menu
+   without it vanishing. Pointer-events on the capsule itself are tuned so
+   the gap between button and capsule still keeps the menu open. */
+.ms-arrange-wand {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ms-arrange-wand .ms-view-bar-btn {
+  /* default state matches every other view-bar button; the open class
+     below just turns the icon color up so users see the connection. */
+}
+.ms-arrange-wand.is-open > .ms-view-bar-btn {
+  background: var(--ms-panel-soft);
+  color: var(--ms-accent);
+}
+.ms-arrange-capsule {
+  position: absolute;
+  /* Sit above the wand button; we anchor to the bottom-center of the wand
+     and translateY(-100%) so the capsule sits flush with a 10px gap. */
+  bottom: 100%;
+  left: 50%;
+  margin-bottom: 10px;
+  transform: translate(-50%, 6px);
+  min-width: 232px;
+  padding: 6px;
+  border-radius: 18px;
+  background: var(--ms-panel);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--ms-border);
+  box-shadow: var(--ms-shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Hidden by default — the wand is just a button. We use opacity +
+     transform instead of display:none so the open animation has somewhere
+     to land, and the React component tree stays mounted (so the buttons
+     keep their event handlers attached). */
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition: opacity 0.14s ease, transform 0.16s cubic-bezier(.2,.7,.3,1), visibility 0s linear 0.18s;
+  z-index: 18;
+}
+.ms-arrange-wand.is-open .ms-arrange-capsule {
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
+  transform: translate(-50%, 0);
+  /* Override the visibility transition so it flips instantly when opening
+     (the closing transition above already waits 180ms before hiding). */
+  transition: opacity 0.14s ease, transform 0.16s cubic-bezier(.2,.7,.3,1), visibility 0s linear 0s;
+}
+/* Tiny arrow pointing back at the wand button. Drawn as a pseudo-element
+   so the capsule DOM stays clean — and so the arrow flips with the
+   capsule's hover state. */
+.ms-arrange-capsule::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  transform: translateX(-50%) rotate(45deg);
+  width: 12px;
+  height: 12px;
+  background: var(--ms-panel);
+  border-right: 1px solid var(--ms-border);
+  border-bottom: 1px solid var(--ms-border);
+  border-bottom-right-radius: 3px;
+}
+.ms-arrange-mode {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ms-fg);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.12s ease;
+}
+.ms-arrange-mode:hover {
+  background: var(--ms-panel-soft);
+  transform: translateX(1px);
+}
+.ms-arrange-mode:focus-visible {
+  outline: 2px solid var(--ms-accent);
+  outline-offset: 1px;
+}
+.ms-arrange-mode-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--ms-panel-soft);
+  color: var(--ms-fg-dim);
+  flex: 0 0 auto;
+}
+.ms-arrange-mode:hover .ms-arrange-mode-icon { color: var(--ms-accent); }
+.ms-arrange-mode-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+.ms-arrange-mode-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ms-fg);
+  line-height: 1.2;
+}
+.ms-arrange-mode-desc {
+  font-size: 11px;
+  color: var(--ms-fg-faint);
+  line-height: 1.3;
+}
+/* Tint the icon background for the AI mode so users spot it instantly —
+   this is the new flagship path, the visual hook helps it not get lost
+   between the two flow variants. */
+.ms-arrange-mode-smart .ms-arrange-mode-icon {
+  background: linear-gradient(135deg, rgba(124, 131, 255, 0.18), rgba(245, 158, 11, 0.18));
+  color: var(--ms-accent);
+}
+
 /* minimap tucks above the view bar */
 .ms-stage .react-flow__minimap { bottom: 58px; width: 150px; height: 96px; }
 
