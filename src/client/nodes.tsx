@@ -553,6 +553,17 @@ function LazyAudio({ src }: { src: string }) {
   // resultUrl → new src on the same component; stale peaks must not survive.
   const decodedSrcRef = useRef<string | null>(null)
 
+  // Background preheat for the audio file — mirrors LazyVideo. The SW
+  // (service-worker.ts) intercepts /api/media-studio/media-file requests
+  // and stores the first bytes in an in-memory Map. Small files (< 5 MB
+  // threshold) are cached whole, so the second decode pass hits cache with
+  // zero socket traffic. Deduped + concurrency-capped inside the SW.
+  useEffect(() => {
+    if (!visible || !src) return
+    const preload = (globalThis as Record<string, unknown>).__msPreheatAudio as ((url: string) => void) | undefined
+    if (preload) preload(src)
+  }, [visible, src])
+
   // Playback state is driven by the <audio> element's own events so the UI
   // can never desync from the browser (autoplay-policy rejection, buffering,
   // external pause, ended…). `scrubbingRef` gates timeupdate during a drag.
@@ -601,6 +612,21 @@ function LazyAudio({ src }: { src: string }) {
   }, [src])
 
   // WebAudio decode → peaks for real waveform.
+  //
+  // Performance: instead of `fetch(src)` + `arrayBuffer()` which waits for
+  // the WHOLE file to download (5 MB MP3 ≈ several seconds), we request
+  // only the first 512 KB via Range. MP3 frames in that window decode to
+  // several seconds of PCM, which is plenty for:
+  //   • WebAudio to compute the total duration (encoded in the Xing/LAME
+  //     VBR frame-count header that lives in the first ~120 KB),
+  //   • a 96-bar waveform (96 peaks over a multi-second slice).
+  // On the next render the <audio src> element fetches the rest of the
+  // file by itself via native Range streaming — no extra code needed here.
+  //
+  // Some servers (and the proxy when a Range request hits an in-flight SW
+  // cache miss) respond with 200 + full body instead of 206. We accept
+  // either: 206 means the bytes are already truncated to 512 KB; 200 means
+  // we got the whole file and can still use the header section for peaks.
   useEffect(() => {
     if (!visible || !src || decoded) return
     let aborted = false
@@ -611,10 +637,17 @@ function LazyAudio({ src }: { src: string }) {
     const cleanup = () => { try { void ctx.close() } catch { /* ignore */ } }
     ;(async () => {
       try {
-        const res = await fetch(src)
-        if (!res.ok) throw new Error(`fetch ${res.status}`)
+        // 512 KB — comfortably covers the Xing/LAME VBR header (≈ 120 KB)
+        // plus several seconds of frame data for a typical 128 kbps MP3.
+        // WAV/FLAC headers are tiny; the 512 KB window is plenty.
+        const res = await fetch(src, { headers: { Range: 'bytes=0-524287' } })
+        if (aborted) return
+        if (!res.ok && res.status !== 206) throw new Error(`fetch ${res.status}`)
         const buf = await res.arrayBuffer()
         if (aborted) return
+        // decodeAudioData needs a fresh ArrayBuffer (it transfers the
+        // underlying buffer), so slice() to avoid mutating `buf` callers
+        // might still hold via SW / HTTP cache layers.
         const audio = await ctx.decodeAudioData(buf.slice(0))
         if (aborted) return
         const data = audio.getChannelData(0)

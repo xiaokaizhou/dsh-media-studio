@@ -502,6 +502,84 @@ function freeSlot(occupied: Array<{ x: number; y: number }>): { x: number; y: nu
   return { x: 60 + (occupied.length % 8) * 300, y: 60 + Math.floor(occupied.length / 8) * 300 }
 }
 
+/** Slot pitch shared by both free-slot helpers — kept in one place so the
+ *  viewport-aware variant doesn't drift from the global grid. */
+const FREE_SLOT_COL = 300
+const FREE_SLOT_ROW = 300
+const FREE_SLOT_PAD = 60
+const FREE_SLOT_OVERLAP_X = FREE_SLOT_COL - 40
+const FREE_SLOT_OVERLAP_Y = FREE_SLOT_ROW - 90
+
+/** Find a free grid slot whose top-left sits inside the visible viewport
+ *  (in flow space), so the toolbar "+" buttons place the new node where
+ *  the user can already see it. Sprial-searches outward from the viewport
+ *  center; falls back to a clamped center-of-viewport position when the
+ *  visible area is densely packed.
+ *
+ *  `viewport` is the React Flow transform (x/y in flow space + zoom);
+ *  `viewportSize` is the on-screen pane size in CSS pixels. `cardW` /
+ *  `cardH` are the new card's rendered dimensions — used to keep the
+ *  card fully inside the viewport (not just its top-left corner). */
+function freeSlotInViewport(
+  occupied: Array<{ x: number; y: number }>,
+  viewport: { x: number; y: number; zoom: number },
+  viewportSize: { w: number; h: number },
+  cardW: number,
+  cardH: number,
+): { x: number; y: number } {
+  const z = viewport.zoom || 1
+  // Visible flow-space rectangle: top-left and bottom-right of the canvas pane.
+  const visLeft = -viewport.x / z
+  const visTop = -viewport.y / z
+  const visRight = visLeft + viewportSize.w / z
+  const visBottom = visTop + viewportSize.h / z
+  // Snap viewport bounds to the nearest grid lines so the result lines up
+  // with the existing card grid.
+  const gridLeft = Math.floor((visLeft - FREE_SLOT_PAD) / FREE_SLOT_COL) * FREE_SLOT_COL + FREE_SLOT_PAD
+  const gridTop = Math.floor((visTop - FREE_SLOT_PAD) / FREE_SLOT_ROW) * FREE_SLOT_ROW + FREE_SLOT_PAD
+  // Center of the viewport in grid coordinates — the spiral starts here so
+  // the new node appears as close to the user's gaze as possible.
+  const cxFlow = (visLeft + visRight) / 2 - cardW / 2
+  const cyFlow = (visTop + visBottom) / 2 - cardH / 2
+  const startCol = Math.round((cxFlow - gridLeft) / FREE_SLOT_COL)
+  const startRow = Math.round((cyFlow - gridTop) / FREE_SLOT_ROW)
+  // Bound the search by how many rings we expect to scan — once we exceed
+  // the visible ring the slot would obviously be off-screen.
+  const maxCols = Math.ceil((visRight - visLeft) / FREE_SLOT_COL) + 2
+  const maxRows = Math.ceil((visBottom - visTop) / FREE_SLOT_ROW) + 2
+  const maxRing = Math.max(maxCols, maxRows) + 1
+  for (let ring = 0; ring <= maxRing; ring += 1) {
+    for (let dr = -ring; dr <= ring; dr += 1) {
+      for (let dc = -ring; dc <= ring; dc += 1) {
+        // Only scan the outer edge of each ring (the inner cells were
+        // already covered by smaller rings).
+        if (ring > 0 && Math.abs(dr) !== ring && Math.abs(dc) !== ring) continue
+        const col = startCol + dc
+        const row = startRow + dr
+        const x = gridLeft + col * FREE_SLOT_COL
+        const y = gridTop + row * FREE_SLOT_ROW
+        // The whole card (not just its top-left) must stay inside the viewport
+        // with padding so the user can see the new node in its entirety.
+        if (x < visLeft + FREE_SLOT_PAD) continue
+        if (y < visTop + FREE_SLOT_PAD) continue
+        if (x + cardW > visRight - FREE_SLOT_PAD) continue
+        if (y + cardH > visBottom - FREE_SLOT_PAD) continue
+        const free = occupied.every(
+          (p) => !(Math.abs(p.x - x) < FREE_SLOT_OVERLAP_X && Math.abs(p.y - y) < FREE_SLOT_OVERLAP_Y),
+        )
+        if (free) return { x, y }
+      }
+    }
+  }
+  // Visible area is too dense — fall back to the viewport center, clamped
+  // to stay inside the visible rectangle. Better than a freeSlot() default
+  // that's far off-screen and forces an unwanted pan.
+  return {
+    x: Math.max(visLeft + FREE_SLOT_PAD, Math.min(visRight - FREE_SLOT_PAD - cardW, cxFlow)),
+    y: Math.max(visTop + FREE_SLOT_PAD, Math.min(visBottom - FREE_SLOT_PAD - cardH, cyFlow)),
+  }
+}
+
 /**
  * Content-fit height for text/note cards (used by the auto-arrange wand):
  * title row + textarea scrollHeight + paddings, capped so cards never grow
@@ -884,16 +962,15 @@ function CanvasView({ canvasId }: CanvasProps) {
 
   const interactingRef = useRef(false)
   const restoringRef = useRef(false)
-  const lastLocalPostRef = useRef(0)
   const didInitialFitRef = useRef(false)
-  const lastPanTargetRef = useRef(0)
   // M1 — per-project camera memory. When the tab opens a project whose
-  // viewport was persisted, restore it and briefly suppress the automatic
-  // "frame the content" fits so they don't fight the remembered camera.
+  // viewport was persisted, restore it and briefly suppress the initial
+  // "frame the content" fit so it doesn't fight the remembered camera.
+  // (No structural-change auto-fit remains — see the SSE reconciliation
+  // effect below.)
   const suppressAutoFitRef = useRef(false)
   const previewingRef = useRef(false)
   const nodeTokenCacheRef = useRef(new Map<string, string>())
-  const lastFitStructRef = useRef('')
   const vpKey = `dsh-media-studio:viewport:${canvasId}`
 
   // Adaptive card width from the pane width — big cards that still
@@ -1018,7 +1095,6 @@ function CanvasView({ canvasId }: CanvasProps) {
 
   const postLocal = useCallback((ops: MsOp[]) => {
     if (ops.length === 0) return
-    lastLocalPostRef.current = Date.now()
     void postOps(canvasId, ops)
   }, [canvasId])
 
@@ -1090,28 +1166,19 @@ function CanvasView({ canvasId }: CanvasProps) {
       setRegions((cur) => mergeRegions(cur, snap.graph.regions ?? []))
     }
 
-    // Structural change → softly frame the new content. Purely data-level
-    // updates (status toggles while media streams in) keep the camera put.
-    const structToken =
-      snap.graph.nodes.map((n) => `${n.id}@${n.position?.x ?? 0},${n.position?.y ?? 0}`).sort().join('|')
-      + '#'
-      + snap.graph.edges.map((e) => `${e.source}->${e.target}`).sort().join('|')
-      + '#'
-      + (snap.graph.regions ?? []).map((r) => `${r.id}:${r.x},${r.y},${r.w},${r.h}`).sort().join('|')
-    if (snap.version !== lastPanTargetRef.current || structToken !== lastFitStructRef.current) {
-      lastPanTargetRef.current = snap.version
-      lastFitStructRef.current = structToken
-      // Softly frame agent-written content — never right after the user's own
-      // edit (they own the camera at that point) nor during the opening
-      // viewport restore window.
-      if (suppressAutoFitRef.current) {
-        /* remembered camera owns the moment — no auto fit */
-      } else if (Date.now() - lastLocalPostRef.current > 700) {
-        requestAnimationFrame(() => {
-          try { rf.fitView({ padding: 0.18, duration: 220, maxZoom: 1 }) } catch { /* ignore */ }
-        })
-      }
-    }
+    // Camera policy: respect the user's current viewport on every refresh.
+    // The old structural-change auto-fit (rf.fitView) jumped the camera to
+    // frame newly-added content even when the user had deliberately panned
+    // or zoomed somewhere else — every agent `canvas_graph_patch` then
+    // pulled the rug. Per the "canvas refresh should stay in the current
+    // viewport" contract, the only legitimate auto-fit points are:
+    //   • the initial open (see the dedicated effect below) when the user
+    //     has no remembered viewport for this project;
+    //   • explicit user actions (the view-bar Fit button, the auto-arrange
+    //     wand, the smart-arrange AI layout).
+    // Anything else is left exactly where the user put it. New nodes added
+    // by the agent land wherever the agent positioned them; the user pans
+    // to them when they want to see them.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snap])
 
@@ -1276,7 +1343,6 @@ function CanvasView({ canvasId }: CanvasProps) {
     setEdges(projectEdges(target.graph))
     setRegions(projectRegions(target.graph))
     postLocal(restoreOps(target))
-    lastLocalPostRef.current = Date.now()
   }, [postLocal])
 
   const redo = useCallback(() => {
@@ -1290,7 +1356,6 @@ function CanvasView({ canvasId }: CanvasProps) {
     setEdges(projectEdges(target.graph))
     setRegions(projectRegions(target.graph))
     postLocal(restoreOps(target))
-    lastLocalPostRef.current = Date.now()
   }, [postLocal])
 
   useEffect(() => {
@@ -1393,30 +1458,20 @@ function CanvasView({ canvasId }: CanvasProps) {
     const id = nextId(kind)
     const W = cardW
     const ops: MsOp[] = []
-    let position: { x: number; y: number }
-    let center: { x: number; y: number }
+    // Always place the new node at the cursor (pane) or where the connect
+    // drag was released (connect-end) — those points are by construction
+    // inside the current viewport, so the user's camera position survives
+    // the create. The old "snap beside the source node" branch put the new
+    // card at `src.x + srcW + 80`, which could land far off-screen once the
+    // user had panned away from the source; the setCenter that followed then
+    // yanked the camera to compensate. Both effects violated the
+    // "new nodes belong to the current viewport" contract — they were
+    // removed together.
+    const position = { x: menu.flowX - W / 2, y: menu.flowY - 40 }
 
     if (menu.kind === 'connect') {
-      // Snap beside the source node so the new card reads as a branch.
-      const src = rf.getNode(menu.fromId)
-      if (src) {
-        const srcW = src.measured?.width ?? W
-        const srcH = src.measured?.height ?? 160
-        if (menu.side === 'right') {
-          position = { x: src.position.x + srcW + 80, y: src.position.y + Math.max(0, (srcH - W) / 2) }
-        } else {
-          position = { x: src.position.x - W - 80, y: src.position.y + Math.max(0, (srcH - W) / 2) }
-        }
-        center = { x: position.x + W / 2, y: position.y + W / 2 }
-      } else {
-        position = { x: menu.flowX - W / 2, y: menu.flowY - 40 }
-        center = { x: menu.flowX, y: menu.flowY }
-      }
       const isLeft = menu.side === 'left'
       ops.push({ op: 'connect', from: isLeft ? id : menu.fromId, to: isLeft ? menu.fromId : id })
-    } else {
-      position = { x: menu.flowX - W / 2, y: menu.flowY - 40 }
-      center = { x: menu.flowX, y: menu.flowY }
     }
 
     ops.unshift({
@@ -1429,15 +1484,34 @@ function CanvasView({ canvasId }: CanvasProps) {
     })
     dismissMenu()
     mutate(ops)
-    requestAnimationFrame(() => {
-      try { rf.setCenter(center.x, center.y, { zoom: 1, duration: 220 }) } catch { /* not mounted */ }
-    })
+    // Intentionally NO rf.setCenter call: the new node sits inside the
+    // current viewport by construction (cursor / drag-release point).
+    // Panning the camera to re-center would defeat the whole point of
+    // "stay where the user is looking".
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [menu, mutate, nextId, rf, cardW, dismissMenu])
 
   const onToolbarAdd = useCallback((kind: NodeKind) => {
     const id = nextId(kind)
-    const slot = freeSlot(nodesRef.current.map((n) => n.position))
+    // Use a sensible default height for the collision check so the helper
+    // can guarantee the whole new card (not just its top-left) lands inside
+    // the visible viewport.
+    const W = cardW
+    const H = kind === 'music' ? 135 : (kind === 'text' || kind === 'note') ? 160 : 240
+    // Place the new node inside the CURRENT viewport so the user's camera
+    // position is preserved — they shouldn't lose their bearings every time
+    // they hit the "+" button. Falls back to a viewport-centered slot when
+    // the visible area is densely packed.
+    const vp = (() => {
+      try { return rf.getViewport() } catch { return { x: 0, y: 0, zoom: 1 } }
+    })()
+    const slot = freeSlotInViewport(
+      nodesRef.current.map((n) => n.position),
+      vp,
+      viewportSizeRef.current,
+      W,
+      H,
+    )
     mutate([{
       op: 'addNode',
       type: kind,
@@ -1446,11 +1520,12 @@ function CanvasView({ canvasId }: CanvasProps) {
       position: slot,
       data: { kind, status: 'idle' },
     }])
-    requestAnimationFrame(() => {
-      try { rf.setCenter(slot.x + 100, slot.y + 90, { zoom: 1, duration: 220 }) } catch { /* ignore */ }
-    })
+    // Intentionally NO rf.setCenter call: the slot is already inside the
+    // current viewport, so a center-on-it would only pan the camera away
+    // from where the user is looking. The user can scroll to it if they want
+    // a closer look.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mutate, nextId, rf])
+  }, [mutate, nextId, rf, cardW])
 
   // ── Region interactions ─────────────────────────────────────────────────
   const onToolbarAddRegion = useCallback(() => {

@@ -21,6 +21,18 @@ import { registerLocaleDictionaries, translate, resolveLang, LOCALE_NS, type Loc
 import { IconCanvas } from './client/icons'
 import { subscribeProjectFocused } from './client/canvas-bus'
 
+// Augment the global Window type with the SW preheat bridges set in
+// `apply()` below. The Service Worker itself writes the same names to its
+// own `globalThis`, but those bindings are unreachable from the page —
+// this declaration makes TypeScript treat the page-side mirrors as
+// first-class globals.
+declare global {
+  interface Window {
+    __msPreheatVideo?: (url: string) => void
+    __msPreheatAudio?: (url: string) => void
+  }
+}
+
 /**
  * Runtime services we need. Both are soft dependencies — without them we
  * still register what we can; the UI just degrades.
@@ -166,5 +178,37 @@ export function apply(ctx: unknown): void {
   // canonical path; beforeunload just covers hard reloads.
   if (typeof window !== 'undefined') {
     window.addEventListener('beforeunload', () => disposeLocale(), { once: true })
+
+    // ── Service Worker 预热：拦截 media-file 请求，缓存前 256KB header ──
+    // The SW lives at this same origin and intercepts /api/media-studio/media-file
+    // requests with full Range support. After registration + claim it
+    // takes over every subsequent media-file fetch on this page; the React
+    // nodes call `window.__msPreheatVideo/Audio(url)` to ask the SW to
+    // preheat a URL in the background. Registration is fire-and-forget:
+    // if it fails (e.g. SW scope denied) the audio/video nodes still work
+    // via the normal Range path, just without the in-memory SW cache.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker
+        .register('/api/media-studio/service-worker.js', { scope: '/' })
+        .catch((err) => console.warn('[media-studio] SW registration failed:', err))
+
+      // ── Main-thread → SW message bridge ──
+      // The SW can only `globalThis` to itself (different Realm), so we
+      // mirror the `__msPreheatVideo/Audio` functions on `window`. They
+      // no-op until the SW is the active controller (i.e. claims the page),
+      // which is fine — the first call after claim still gets a fresh
+      // background prefetch.
+      const makePreheat = (type: 'ms-preload-video' | 'ms-preload-audio') => (url: string) => {
+        const ctrl = navigator.serviceWorker.controller
+        if (!ctrl) return
+        ctrl.postMessage({ type, url })
+      }
+      navigator.serviceWorker.ready
+        .then(() => {
+          window.__msPreheatVideo = makePreheat('ms-preload-video')
+          window.__msPreheatAudio = makePreheat('ms-preload-audio')
+        })
+        .catch(() => { /* SW 失败也无所谓：原生 fetch 兜底 */ })
+    }
   }
 }

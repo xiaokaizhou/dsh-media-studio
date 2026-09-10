@@ -5,9 +5,10 @@ import '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createReadStream, readFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
-import { extname, resolve, sep } from 'node:path'
+import { extname, resolve, sep, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import type { CanvasStore } from './canvas-store'
 import { getMediaStudioHandles, log, type MediaStudioHandles } from './service-state'
 import { executeNodeRefresh, migrateInaccessibleResultUrl, postProcessCanvasPatch, backfillVideoPosters } from './tools'
@@ -76,6 +77,90 @@ function etagFor(target: string, st: import('node:fs').Stats): string {
   return `W/"${h.digest('hex').slice(0, 16)}"`
 }
 
+/**
+ * Best-effort background faststart for MP4 files whose `moov` box isn't
+ * already at the head of the file. Runs at most once per file — after a
+ * successful rewrite we drop a `.faststarted` sibling so future requests
+ * skip the check entirely.
+ *
+ * Why we do this in the media proxy (vs. only in video-cover.ts): existing
+ * project assets (migrated from /tmp by older code paths, or written before
+ * the prepareVideoForCanvas faststart landed) have moov at the tail. Without
+ * faststart, browsers must download the whole file before <video> knows
+ * its duration — which is the "点击播放需要 10 秒" symptom on legacy clips.
+ *
+ * Strategy:
+ *   1. Probe the first 64 bytes for the `ftyp` box signature (cheap, single
+ *      read). Non-mp4 files bail immediately.
+ *   2. Probe byte 64 for `moov`. If present, the file is already faststart —
+ *      mark it and skip.
+ *   3. Otherwise spawn ffmpeg with `-c copy -movflags +faststart` to a sibling
+ *      `.faststart.mp4`, then atomic-rename over the original.
+ *   4. Drop a `.faststarted` sidecar file (size + mtime fingerprint) so the
+ *      next request short-circuits the probe.
+ *
+ * All work is async, fire-and-forget — the current HTTP response is served
+ * from the existing (unfaststarted) bytes so the user sees the same content.
+ * The next request after the rewrite completes gets faststart bytes.
+ *
+ * Failures are logged and never block serving. The user always gets bytes.
+ */
+async function maybeBackgroundFaststart(target: string): Promise<void> {
+  if (!/\.mp4$/i.test(target)) return
+  const fsPromises = await import('node:fs/promises')
+  const sidecar = `${target}.faststarted`
+
+  // Sidecar fingerprint present → already processed; skip the probe + write.
+  let hasSidecar = false
+  try { hasSidecar = Boolean(await fsPromises.readFile(sidecar, 'utf8')) } catch { /* no sidecar */ }
+  if (hasSidecar) return
+
+  let fd: import('node:fs/promises').FileHandle | null = null
+  try {
+    fd = await fsPromises.open(target, 'r')
+    const headBuf = Buffer.alloc(8)
+    await fd.read(headBuf, 0, 8, 0)
+    if (headBuf.slice(4, 8).toString('latin1') !== 'ftyp') return
+    // ftyp box can be 16-32 bytes; moov, if at the head, follows immediately
+    // after the ftyp box. Reading at offset 64 covers the worst-case ftyp
+    // size plus any leading padding without spending a second syscall.
+    const moovBuf = Buffer.alloc(4)
+    await fd.read(moovBuf, 0, 4, 64)
+    if (moovBuf.toString('latin1') === 'moov') return
+  } catch { return } finally {
+    try { await fd?.close() } catch { /* ignore */ }
+  }
+
+  // Not faststart — rewrite in the background. Use the same ffmpeg call as
+  // video-cover.ts so behaviour stays consistent across the codebase.
+  log.info(`[media-studio] media-file: moov-in-tail detected, background-faststarting "${target}"`)
+  try {
+    const tmp = `${target}.faststart.mp4`
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(FFMPEG_BIN(), ['-y', '-i', target, '-c', 'copy', '-movflags', '+faststart', tmp], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      proc.stderr.on('data', (c) => { stderr += c.toString() })
+      proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`exit ${code}: ${stderr.slice(-200)}`)))
+      proc.on('error', reject)
+    })
+    await fsPromises.rename(tmp, target)
+    // Drop the sidecar with the post-rewrite fingerprint.
+    const fresh = await fsPromises.stat(target)
+    await fsPromises.writeFile(sidecar, `${fresh.size}:${Math.floor(fresh.mtimeMs)}\n`)
+    log.info(`[media-studio] media-file: faststart complete for "${target}"`)
+  } catch (e) {
+    try { await fsPromises.unlink(`${target}.faststart.mp4`) } catch { /* ignore */ }
+    log.warn(`[media-studio] media-file: background faststart failed for "${target}": ${(e as Error).message}`)
+  }
+}
+
+/** Resolve ffmpeg binary lazily; mirrors video-cover.ts's FFMPEG() env override. */
+function FFMPEG_BIN(): string {
+  return process.env.FFMPEG_PATH || 'ffmpeg'
+}
+
 /** Stream a local file with basic HTTP Range support (media seeking). */
 async function serveMediaFile(target: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   let st
@@ -87,6 +172,11 @@ async function serveMediaFile(target: string, req: IncomingMessage, res: ServerR
     res.end('{"ok":false,"error":"not found"}')
     return
   }
+  // Background faststart for legacy mp4s whose moov sits at the tail. Only
+  // mp4s are touched; everything else bails immediately inside the helper.
+  // Non-blocking — we serve the current bytes and the next request gets the
+  // rewritten file.
+  void maybeBackgroundFaststart(target)
   const mime = mimeFor(target)
   const total = st.size
   const etag = etagFor(target, st)
@@ -567,8 +657,20 @@ export function registerCanvasRoutes(ctx: Context): () => void {
   // `navigator.serviceWorker.register('/api/media-studio/service-worker.js')`.
   // The SW intercepts media-file requests and serves cached headers on range
   // hits, turning "click → stream" into "click → instant playback".
+  //
+  // Path resolution: after tsdown bundles everything into a single CJS
+  // `lib/index.js`, `import.meta.url` still resolves to that bundle file —
+  // so computing `../lib/service-worker.js` from it points at a non-existent
+  // `lib/lib/service-worker.js` and the route silently fails to register (the
+  // catch below swallows it). The SW lives in the SAME directory as the
+  // bundle (`lib/service-worker.js`, an independent ES-module output from
+  // tsdown's second entry), so we resolve against `__dirname` (CJS) with an
+  // import.meta.dirname fallback for future ESM targets.
   try {
-    const swPath = resolve(fileURLToPath(import.meta.url), '../lib/service-worker.js')
+    const here = typeof __dirname !== 'undefined'
+      ? __dirname
+      : dirname(fileURLToPath(import.meta.url))
+    const swPath = resolve(here, 'service-worker.js')
     const swBody = readFileSync(swPath, 'utf8')
     if (swBody) {
       wserver.register({
