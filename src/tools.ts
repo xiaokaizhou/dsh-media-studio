@@ -6,7 +6,7 @@ import { join, extname, dirname } from 'node:path'
 import { mkdir, writeFile, stat } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { getMediaStudioHandles, log } from './service-state'
-import { prepareVideoForCanvas } from './video-cover'
+import { prepareVideoForCanvas, extractPosterInPlace, resolveLocalVideoPath } from './video-cover'
 import { prepareImageForCanvas, prepareAudioForCanvas } from './image-cover'
 import {
   registerCanvasAsset,
@@ -298,21 +298,49 @@ export async function migrateInaccessibleResultUrl(
 }
 
 /**
+ * Convert an absolute local thumbnail path back into a canvas-storable URL.
+ * Mirrors the shape `prepareVideoForCanvas` emits so the node's data.poster
+ * goes through the same media-file proxy the browser already knows.
+ *
+ *  • `<sourcePath>/assets/clips/<file>.thumb.jpg` → `assets/clips/<file>.thumb.jpg`
+ *    (the legacy bare form — same convention the existing nodes use, so
+ *    `mediaSrc` rewrites it through `projects/<id>/...`).
+ *  • `<sourcePath>/<other>`                      → `projects/<id>/<other>`
+ *  • outside sourcePath                           → fall back to file:// form
+ *    so the existing media-file proxy can serve it anyway.
+ */
+function thumbnailPathToUrl(absThumb: string, sourcePath: string | undefined, projectId: string): string {
+  if (sourcePath) {
+    const rel = absThumb.startsWith(sourcePath + '/') ? absThumb.slice(sourcePath.length + 1) : null
+    if (rel && rel.startsWith('assets/')) return rel
+    if (rel) return `projects/${projectId}/${rel}`
+  }
+  return `file://${absThumb}`
+}
+
+/**
  * Backfill missing posters for every video node in a canvas. Designed to be
  * called as a one-shot recovery after a session discovers that video cards
  * have no data.poster (typically because the videos were written to the
- * project directory by a path that bypassed `prepareVideoForCanvas`).
+ * project directory by a path that bypassed `prepareVideoForCanvas`, or
+ * because `canvas_node_update` rewrote the resultUrl without triggering
+ * the post-process's cover step).
  *
- * For each video node:
+ * Strategy (in-place, never moves the video):
  *   • If `data.poster` is already set, skip (idempotent).
- *   • Otherwise resolve the local file the node points at, copy/normalize it
- *     into `<sourcePath>/assets/clips/<id>.mp4` (or web-jobs/ for projects
- *     without a sourcePath), run ffmpeg to extract the first frame as a
- *     sibling .thumb.jpg, then patch the node with both the new resultUrl
- *     and the new poster.
+ *   • Resolve the node's `resultUrl` to an absolute local path via
+ *     `resolveLocalVideoPath` (handles `projects/<id>/...`,
+ *     `assets/...`, `file://...`, absolute paths).
+ *   • Extract the first frame as `<video>.thumb.jpg` next to the video
+ *     with ffmpeg — no rename, no copy.
+ *   • Patch the node's `data.poster` with the thumbnail URL in the same
+ *     shape the canvas uses (`assets/clips/...` or `projects/<id>/...`).
+ *     `resultUrl` is never changed.
  *
  * Returns per-node advisory strings so the caller can surface failures in
- * the response payload.
+ * the response payload. Doesn't touch nodes whose URL can't be resolved
+ * locally (https URLs the agent still has the canonical path for, etc.)
+ * — those are out of scope for an in-place backfill.
  */
 export async function backfillVideoPosters(
   projectId: string,
@@ -320,6 +348,7 @@ export async function backfillVideoPosters(
   sourcePath: string | undefined,
   canvasStore: CanvasStore,
 ): Promise<{ processed: number; succeeded: number; issues: string[] }> {
+  void wsRoot
   const snap = canvasStore.snapshot(projectId)
   const issues: string[] = []
   let processed = 0
@@ -331,21 +360,23 @@ export async function backfillVideoPosters(
     if (typeof poster === 'string' && poster.trim()) continue // already set
     const raw = data.resultUrl
     if (typeof raw !== 'string' || !raw.trim()) continue
+    const localVideo = resolveLocalVideoPath(raw, sourcePath, projectId)
+    if (!localVideo) {
+      // Remote URL we can't reach without re-downloading (and the user
+      // may have meant to keep that URL anyway). Don't process — the
+      // dedicated `canvas_refresh_node` flow handles the live regenerate
+      // case. Surface as a silent skip rather than a noisy warn.
+      continue
+    }
     processed++
     try {
-      const prepared = await prepareVideoForCanvas(raw, {
-        wsRoot,
-        projectId,
-        sourcePath,
-      })
-      const updateData: Record<string, unknown> = {}
-      if (prepared.url && prepared.url !== raw) updateData.resultUrl = prepared.url
-      if (prepared.poster) updateData.poster = prepared.poster
-      if (Object.keys(updateData).length === 0) {
+      const absThumb = await extractPosterInPlace(localVideo)
+      if (!absThumb) {
         issues.push(`warn: backfillVideoPosters could not produce a poster for "${node.id}" (${raw})`)
         continue
       }
-      canvasStore.apply(projectId, [{ op: 'updateNode', id: node.id, data: updateData }])
+      const posterUrl = thumbnailPathToUrl(absThumb, sourcePath, projectId)
+      canvasStore.apply(projectId, [{ op: 'updateNode', id: node.id, data: { poster: posterUrl } }])
       succeeded++
     } catch (e) {
       issues.push(`warn: backfillVideoPosters failed for "${node.id}" (${raw}): ${(e as Error).message}`)

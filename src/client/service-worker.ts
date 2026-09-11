@@ -43,7 +43,15 @@ const MEDIA_EXT = new Set([
 // ── In-memory cache ─────────────────────────────────────────────────────────
 // Keyed by the FULL request URL (including query string) so each <video>
 // element gets its own cache entry even if they share a base path.
-const cache = new Map<string, ArrayBuffer>()
+//
+// Each entry stores the actual file size alongside the cached bytes — for
+// header-only entries the size is REQUIRED so the 206 response below can
+// include `bytes start-end/<total>` instead of `bytes start-end/*`. The `*`
+// form (unknown total) confuses Chrome / Safari into thinking the partial
+// response is the entire file, which leaves <video> stuck on a 256 KB stub
+// and the user sees "video won't play" with no obvious error.
+interface CacheEntry { buf: ArrayBuffer; total: number; isFull: boolean }
+const cache = new Map<string, CacheEntry>()
 const inflight = new Set<string>()
 const queue: string[] = []
 let usedBytes = 0
@@ -80,9 +88,9 @@ function evict(targetBytes: number): void {
   if (usedBytes <= targetBytes || cache.size === 0) return
   const it = cache.entries()
   while (usedBytes > targetBytes && !it.next().done) {
-    const [k, v] = it.next().value as [string, ArrayBuffer]
+    const [k, v] = it.next().value as [string, CacheEntry]
     cache.delete(k)
-    usedBytes -= v.byteLength
+    usedBytes -= v.buf.byteLength
   }
 }
 
@@ -146,11 +154,29 @@ function drain(): void {
         drain()
         return
       }
+      // `total` may be 0 if the size probe didn't return Content-Range /
+      // Content-Length; we still cache the bytes but can't represent the
+      // real length in subsequent 206 responses — fall back to `*` (which
+      // the browser interprets as "complete response", so we must only
+      // do that for full-file entries where the cached bytes ARE the file).
+      const isFull = plan.total > 0 && plan.total <= FULL_FILE_THRESHOLD
       fetch(url, { headers: { Range: plan.range } })
         .then((r) => r.arrayBuffer())
         .then((buf) => {
           if (buf.byteLength > 0) {
-            cache.set(url, buf)
+            // For full-file entries, the probe told us total === buf.byteLength
+            // (we fetched 0..total-1). For header-only entries, treat the
+            // probe's total as authoritative — the cached prefix is
+            // HEADER_PREFETCH_SIZE bytes but the file is `total` bytes long.
+            const entryTotal = isFull
+              ? buf.byteLength
+              : (plan!.total > 0 ? plan!.total : buf.byteLength)
+            // If the server returned the full body (despite our Range
+            // header) on a probe we thought was "header-only", treat it as
+            // a full file entry to avoid the broken partial-response bug.
+            const actuallyFull = isFull
+              || (plan!.total > 0 && buf.byteLength >= plan!.total)
+            cache.set(url, { buf, total: entryTotal, isFull: actuallyFull })
             usedBytes += buf.byteLength
             if (usedBytes >= MAX_CACHE_BYTES * 0.8) evict(MAX_CACHE_BYTES * 0.5)
           }
@@ -175,34 +201,80 @@ self.addEventListener('activate', () => {
 
 // ── Fetch interceptor ────────────────────────────────────────────────────────
 
+/** Parse `Range: bytes=a-b` (open-ended allowed on either side) into
+ *  `[start, end]` against the total file size. Returns null when the header
+ *  is missing / malformed; returns null when the requested range falls
+ *  entirely outside the cached window (caller passes through to network). */
+function parseRange(header: string | null, cachedLen: number, total: number):
+    { start: number; end: number } | null {
+  if (!header) return null
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!m || (!m[1] && !m[2])) return null
+  const start = m[1] ? parseInt(m[1], 10) : Math.max(0, total - cachedLen)
+  const end = m[2] ? parseInt(m[2], 10) : total - 1
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  if (start < 0 || end < start) return null
+  return { start, end }
+}
+
 self.addEventListener('fetch', (event: FetchEvent) => {
   const url = event.request.url
   if (!isMedia(url)) return
 
   const cached = cache.get(url)
   if (cached) {
-    const isFull = cached.byteLength > HEADER_PREFETCH_SIZE
+    const { buf, total, isFull } = cached
+
     // Full-file entries are served as 200 — the browser can play straight
-    // through with no further network. Header-only entries are served as
-    // 206 with the correct Content-Range so <video> keeps seeking the rest.
-    const status = isFull ? 200 : 206
-    const statusText = isFull ? 'OK' : 'Partial Content'
-    const headers: Record<string, string> = {
-      'Content-Type': mimeOf(url),
-      'Content-Length': String(cached.byteLength),
-      'Accept-Ranges': 'bytes',
-      // `immutable` means the browser HTTP cache won't even bother with a
-      // conditional request (If-None-Match / If-Modified-Since) inside
-      // max-age; filenames in this app are ts+rand, so they're effectively
-      // write-once. Combined with max-age=86400 this turns repeat views of
-      // the same node into a pure cache hit even after the SW process
-      // restarts and loses its in-memory Map.
-      'Cache-Control': 'private, max-age=86400, immutable',
+    // through with no further network. This is the common case for short
+    // clips (< 5 MB) and never has a "stuck on 256 KB" problem.
+    if (isFull) {
+      event.respondWith(new Response(buf, {
+        status: 200,
+        statusText: 'OK',
+        headers: {
+          'Content-Type': mimeOf(url),
+          'Content-Length': String(buf.byteLength),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'private, max-age=86400, immutable',
+        },
+      }))
+      return
     }
-    if (!isFull) {
-      headers['Content-Range'] = `bytes 0-${cached.byteLength - 1}/*`
+
+    // Header-only cache: only intercept when the browser's request fits
+    // inside our cached prefix. Anything that asks for bytes beyond
+    // HEADER_PREFETCH_SIZE must go to the network — we have no bytes to
+    // serve and lying about the response with `Content-Range: .../*`
+    // leaves the browser thinking the file is 256 KB long.
+    const rangeHeader = event.request.headers.get('Range')
+    const parsed = parseRange(rangeHeader, buf.byteLength, total)
+    if (!parsed) {
+      // No Range header, or the file is too small for partial — let the
+      // browser have the full document from the network. Future Range
+      // requests for the head will hit the cache.
+      return
     }
-    event.respondWith(new Response(cached, { status, statusText, headers }))
+    if (parsed.start >= buf.byteLength) {
+      // Asked for bytes we don't have (e.g. bytes=262144- on a 256 KB
+      // prefix). Network has them — let the request through.
+      return
+    }
+    // Clip the requested end to our cached window. Total is known from the
+    // probe; the browser uses it to set up the seekable timeline correctly.
+    const end = Math.min(parsed.end, buf.byteLength - 1)
+    const slice = buf.slice(parsed.start, end + 1)
+    event.respondWith(new Response(slice, {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: {
+        'Content-Type': mimeOf(url),
+        'Content-Length': String(slice.byteLength),
+        'Content-Range': `bytes ${parsed.start}-${end}/${total}`,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'private, max-age=86400, immutable',
+      },
+    }))
     return
   }
 

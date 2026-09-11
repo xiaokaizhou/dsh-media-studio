@@ -62,7 +62,7 @@ async function probeFfmpeg(): Promise<boolean> {
 
 /** Download a URL to a local file. Resolves absolute file paths and http(s)
  *  URLs the same way the existing media pipeline does. */
-async function downloadTo(url: string, dest: string): Promise<void> {
+async function downloadTo(url: string, dest: string, sourcePath?: string): Promise<void> {
   if (/^https?:\/\//i.test(url)) {
     const res = await fetch(url)
     if (!res.ok) throw new Error(`download ${url} → HTTP ${res.status}`)
@@ -71,37 +71,22 @@ async function downloadTo(url: string, dest: string): Promise<void> {
     await writeFile(dest, buf)
     return
   }
-  // `projects/<pid>/assets/<kind>/<file>` (the public form returned by
-  // `dsh-llm-multimodal.localizeVideoUrl` when outputStrategy=project).
-  // Resolve to the on-disk path through the same handler the
-  // `/api/media-studio/media-file` proxy uses, then copy the bytes.
-  const projectMatch = /^projects\/([^/]+)\/(.+)$/.exec(url)
-  if (projectMatch) {
-    const handles = getMediaStudioHandles()
-    const projectRoots = handles.projectStore?.allSourcePaths?.() ?? {}
-    const sourcePath = projectRoots[projectMatch[1]!]
-    if (sourcePath) {
-      const localPath = join(sourcePath, projectMatch[2]!)
-      const { readFile } = await import('node:fs/promises')
-      const buf = await readFile(localPath)
-      await mkdir(dirname(dest), { recursive: true })
-      await writeFile(dest, buf)
-      return
-    }
+  // Resolve every local URL form (projects/<id>/..., assets/...,
+  // file://..., bare absolute path) through the same helper the
+  // backfill uses, so behaviour is consistent across the codebase.
+  const localPath = resolveLocalVideoPath(url, sourcePath)
+  if (localPath) {
+    const { readFile } = await import('node:fs/promises')
+    const buf = await readFile(localPath)
+    await mkdir(dirname(dest), { recursive: true })
+    await writeFile(dest, buf)
+    return
   }
-  // Local path — strip `file://` prefix if present, then copy bytes via
-  // fs.readFile/writeFile to keep this module dependency-light and
-  // side-effect free on the source location. The multimodal plugin's
-  // `localizeVideoUrl` hands us back a `file://` URL after downloading
-  // the CDN bytes into the project's `assets/clips/`, so we MUST handle
-  // the prefix here — otherwise `prepareVideoForCanvas` returns the
-  // original `file://` URL and the canvas card never gets the stable
-  // `projects/<pid>/assets/clips/v-<id>.mp4` form (which in turn breaks
-  // the media-file proxy and leaves the card looking like a streaming
-  // video with no poster first-frame).
+  // Unrecognised relative form — refuse rather than guess (would read
+  // some random cwd file). Same behaviour as the prior fallback.
   const { readFile } = await import('node:fs/promises')
-  const localPath = url.startsWith('file://') ? url.slice(7) : url
-  const buf = await readFile(localPath)
+  const localPath2 = url.startsWith('file://') ? url.slice(7) : url
+  const buf = await readFile(localPath2)
   await mkdir(dirname(dest), { recursive: true })
   await writeFile(dest, buf)
 }
@@ -195,6 +180,112 @@ function pickCoverUrl(extra: unknown): string | undefined {
   return undefined
 }
 
+/**
+ * Resolve a stored `resultUrl` to an absolute local path on disk. Handles
+ * every form the canvas has historically accepted:
+ *
+ *   • `https?://...`           — return null (remote; can't read locally
+ *                                without downloading).
+ *   • `projects/<id>/<rest>`   — use the supplied `sourcePath` when
+ *                                `projectId` matches; otherwise look up
+ *                                the project's sourcePath via the live
+ *                                project registry. Returns null when the
+ *                                project isn't registered with a
+ *                                sourcePath.
+ *   • `assets/<rest>`          — relative to the supplied `sourcePath`
+ *                                (the legacy form written by earlier code
+ *                                paths before the migration to
+ *                                `projects/<id>/assets/...`).
+ *   • `file://...`             — strip prefix, return rest.
+ *   • bare absolute path       — return verbatim.
+ *
+ * Returns null when the URL form isn't local. Callers use this to decide
+ * whether in-place operations (extract first frame, faststart rewrite,
+ * head-byte probe) are possible.
+ */
+export function resolveLocalVideoPath(
+  url: string,
+  sourcePath?: string,
+  projectId?: string,
+): string | null {
+  if (!url) return null
+  if (/^https?:\/\//i.test(url)) return null
+  if (/^(data:|blob:|\/api\/)/i.test(url)) return null
+
+  const projectMatch = /^projects\/([^/]+)\/(.+)$/.exec(url)
+  if (projectMatch) {
+    const [, pid, rest] = projectMatch
+    // Fast path: the caller already knows the sourcePath for this
+    // project (the common backfill case). Avoid the registry hop so the
+    // helper works in test harnesses without a live project store.
+    if (projectId && pid === projectId && sourcePath) {
+      return join(sourcePath, rest!)
+    }
+    // Fall back to the live project registry. If the plugin hasn't been
+    // initialised yet (e.g. test harnesses) just return null — the
+    // caller can retry later when handles are wired up.
+    let registryRoot: string | undefined
+    try {
+      const handles = getMediaStudioHandles()
+      const projectRoots = handles.projectStore?.allSourcePaths?.() ?? {}
+      registryRoot = projectRoots[pid!]
+    } catch { /* not initialised yet */ }
+    const root = registryRoot ?? (projectId === pid ? sourcePath : undefined)
+    if (root) return join(root, rest!)
+    return null
+  }
+  if (url.startsWith('assets/')) {
+    if (!sourcePath) return null
+    return join(sourcePath, url)
+  }
+  if (url.startsWith('file://')) return url.slice('file://'.length)
+  if (url.startsWith('/')) return url
+  if (/^[a-zA-Z]:[\\/]/.test(url)) return url
+  // Unknown relative form — refuse rather than guess.
+  return null
+}
+
+/**
+ * Extract the first frame of a local video file to a sibling JPEG, in place.
+ * Returns the absolute path of the written JPEG, or null when ffmpeg is
+ * unavailable / the input isn't a recognised video / extraction failed.
+ *
+ * Use this from `backfillVideoPosters` to recover posters for legacy video
+ * nodes whose underlying MP4 already lives at the right place — copying the
+ * file just to give it a poster would rewrite the user's filename and
+ * break any external references to the original clip.
+ */
+export async function extractPosterInPlace(localVideoPath: string): Promise<string | null> {
+  if (!(await probeFfmpeg())) return null
+  const thumbPath = `${localVideoPath}.thumb.jpg`
+  try {
+    await runFfmpeg([
+      '-y',
+      '-ss', '0',
+      '-i', localVideoPath,
+      '-frames:v', '1',
+      '-q:v', '2',
+      thumbPath,
+    ])
+    // Confirm the file landed where ffmpeg claimed. ffmpeg returns 0
+    // on stdout even when it produced nothing useful (e.g. zero-frame
+    // streams), so a stat probe is the cheap gate.
+    const { stat } = await import('node:fs/promises')
+    const s = await stat(thumbPath).catch(() => null)
+    if (!s || s.size === 0) {
+      const { unlink } = await import('node:fs/promises')
+      await unlink(thumbPath).catch(() => {})
+      return null
+    }
+    return thumbPath
+  } catch (e) {
+    const { unlink } = await import('node:fs/promises')
+    await unlink(thumbPath).catch(() => {})
+    log.warn(`[media-studio] extractPosterInPlace: ffmpeg extract failed for "${localVideoPath}": ${(e as Error).message}`)
+    return null
+  }
+}
+
 export interface PreparedVideo {
   /** Always set. Either the embedded-in-place path or the original `videoUrl`. */
   url: string
@@ -250,7 +341,7 @@ export async function prepareVideoForCanvas(
   const localVideo = join(baseDir, `v-${id}.mp4`)
 
   try {
-    await downloadTo(videoUrl, localVideo)
+    await downloadTo(videoUrl, localVideo, opts.sourcePath)
   } catch (e) {
     log.warn(`[media-studio] video-cover: download failed (${(e as Error).message}); keeping original URL`)
     return { url: videoUrl, poster: null }
@@ -275,7 +366,7 @@ export async function prepareVideoForCanvas(
     const coverTmp = join(baseDir, `c-${id}.jpg`)
     const outTmp = join(baseDir, `o-${id}.mp4`)
     try {
-      await downloadTo(coverUrl, coverTmp)
+      await downloadTo(coverUrl, coverTmp, opts.sourcePath)
       await runFfmpeg([
         '-y',
         '-i', localVideo,
