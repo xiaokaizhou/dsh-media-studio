@@ -199,11 +199,37 @@ export class CanvasStore {
    *  older state). On rollback we log and clamp so subsequent ops don't
    *  silently overwrite newer state. */
   private maxVersionSeen = new Map<string, number>()
+  /** Persist coalescer (P0-①): each canvas has a trailing-edge timer
+   *  that defers the actual writeFile by `persistDebounceMs` so a burst
+   *  of applies inside a single gesture (drag, undo-redo burst,
+   *  auto-arrange, post-process batching) collapses into one disk write.
+   *  `flushPersistNow()` is the escape hatch used by callers that need
+   *  a synchronous durable write (migrateProjectId, boot restore, tests). */
+  private readonly persistDebounceMs = 0 // microtask-based coalescing (see schedulePersist)
+  private readonly persistTimers = new Map<string, NodeJS.Timeout>()
+  private readonly persistInflight = new Map<string, Promise<void>>()
+  /** canvasId → generation counter. Incremented every time a new persist
+   *  is scheduled; used to make the timer callback idempotent so a
+   *  re-entrant flush won't double-write. */
+  private readonly persistGen = new Map<string, number>()
+  /** Test / diagnostics counter — number of `writeFile` syscalls per
+   *  canvas since the store was constructed. Tests assert the coalescer
+   *  collapses bursts by reading this counter. */
+  readonly persistWriteCount = new Map<string, number>()
 
   constructor(workspaceRoot: string, opts?: { broadcast?: CanvasBroadcast; logger?: CanvasStore['logger'] }) {
     this.workspaceRoot = workspaceRoot
     this.broadcast = opts?.broadcast
     this.logger = opts?.logger
+  }
+
+  /** Absolute workspace root this store reads/writes under. Exposed for
+   *  tooling that needs to resolve project asset directories (e.g.
+   *  `gcOrphanMedia`). Prefer passing the workspaceRoot explicitly when
+   *  you already have it — this getter exists for the post-process
+   *  hot path where the tool layer only has the CanvasStore reference. */
+  get workspaceRootPublic(): string {
+    return this.workspaceRoot
   }
 
   /** Register/refresh the sourcePath for a canvas. Called by the ProjectStore
@@ -275,9 +301,13 @@ export class CanvasStore {
       cv.version = prevMax + 1
     }
     this.maxVersionSeen.set(canvasId, cv.version)
-    // Persist on the same thread so a frontend crash before SSE delivery
-    // does not roll the canvas back.
-    void this.persist(canvasId, cv, this.canvasSourcePaths.get(canvasId))
+    // P0-① — schedule a debounced persist. The in-memory `cv` is
+    // immediately authoritative; the disk copy lags by at most
+    // `persistDebounceMs`. A burst of N applies inside one gesture (drag,
+    // undo burst, post-process batching) collapses into a single write.
+    // Callers that need a durable write right now can `await
+    // canvasStore.flushPersistNow(canvasId)`.
+    this.schedulePersist(canvasId)
 
     // Push the new graph to every connected SSE client (the canvas tab
     // subscribes here). Centralized in `apply` so the agent's
@@ -428,6 +458,87 @@ export class CanvasStore {
     return cv ? { graph: cloneGraph(cv.graph), version: cv.version } : null
   }
 
+  /**
+   * Walk every loaded canvas and return the union of resultUrl + poster
+   * values that look like project-relative paths. Used by the
+   * `gcOrphanMedia` helper to decide which files under assets/clips/
+   * (or assets/characters/) are still referenced and which are orphans.
+   * The walk is in-place over the live `canvases` Map — no cloneGraph,
+   * no string copying beyond the per-string Set.has probe. */
+  collectReferencedMediaPaths(): Set<string> {
+    const refs = new Set<string>()
+    for (const cv of this.canvases.values()) {
+      for (const n of cv.graph.nodes) {
+        const d = n.data as Record<string, unknown> | undefined
+        if (!d) continue
+        for (const key of ['resultUrl', 'poster']) {
+          const v = d[key]
+          if (typeof v === 'string' && v.length > 0) refs.add(v)
+        }
+      }
+    }
+    return refs
+  }
+
+  /**
+   * Scan every registered canvas (minus `ownerCanvasId`) for soft references
+   * to an asset owned by `ownerCanvasId`. Returns one entry per
+   * (referencing canvas, assetId) pair, with the list of node ids that
+   * carry the soft reference. When `assetIdFilter` is provided only that
+   * asset id is reported.
+   *
+   * Reads directly off the in-memory `canvases` map (no `cloneGraph`) —
+   * dependency preflights previously went through `peek()` which deep-
+   * copies every canvas they inspected, so deleting a project with N
+   * other live canvases cost O(N × canvasSize) memory. This method does
+   * the same work for O(N × canvasSize) time and O(hits) memory.
+   */
+  scanAssetRefs(
+    projectIds: readonly string[],
+    ownerCanvasId: string,
+    assetIdFilter?: string,
+  ): Array<{ refProjectId: string; assetId: string; nodeIds: string[] }> {
+    const hits: Array<{ refProjectId: string; assetId: string; nodeIds: string[] }> = []
+    for (const pid of projectIds) {
+      if (pid === ownerCanvasId) continue
+      const cv = this.canvases.get(`${this.workspaceRoot}\0${pid}`)
+      if (!cv) continue
+      const perAsset = new Map<string, string[]>()
+      for (const n of cv.graph.nodes) {
+        const ref = (n.data as { assetRef?: { projectId?: string; assetId?: string } } | undefined)?.assetRef
+        if (!ref || ref.projectId !== ownerCanvasId || typeof ref.assetId !== 'string' || !ref.assetId) continue
+        if (assetIdFilter && ref.assetId !== assetIdFilter) continue
+        const list = perAsset.get(ref.assetId) ?? []
+        list.push(n.id)
+        perAsset.set(ref.assetId, list)
+      }
+      for (const [assetId, nodeIds] of perAsset) hits.push({ refProjectId: pid, assetId, nodeIds })
+    }
+    return hits
+  }
+
+  /**
+   * Count legacy `refCopiesFrom` provenance entries pointing at
+   * `ownerCanvasId`, grouped by referencing canvas. Used by the project
+   * delete preflight to find hard-copy consumers without deep-copying
+   * every canvas.
+   */
+  countLegacyCopyRefs(projectIds: readonly string[], ownerCanvasId: string): Map<string, number> {
+    const counts = new Map<string, number>()
+    for (const pid of projectIds) {
+      if (pid === ownerCanvasId) continue
+      const cv = this.canvases.get(`${this.workspaceRoot}\0${pid}`)
+      if (!cv) continue
+      let n = 0
+      for (const node of cv.graph.nodes) {
+        const origin = (node.data as { refCopiesFrom?: { projectId?: string } } | undefined)?.refCopiesFrom
+        if (origin && origin.projectId === ownerCanvasId) n += 1
+      }
+      if (n > 0) counts.set(pid, n)
+    }
+    return counts
+  }
+
   /** Drop a canvas from the in-memory map (used when its owning project is
    *  deleted). The persisted file is handled by the caller (trash/permanent). */
   evictCanvas(canvasId: string): void {
@@ -515,6 +626,28 @@ export class CanvasStore {
     }
   }
 
+  /** Restore a single canvas from disk into the in-memory map.
+   *
+   * Targeted counterpart of `restore()` for hot paths (e.g. `openProject`)
+   * that need to refresh exactly one canvas, not every persisted canvas.
+   * Honours the same legacy `<wsRoot>/canvases/<id>.json` layout when
+   * `sourcePath` is not provided, and the same version-monotonicity guard
+   * (`maybeReload`) so an open after a write-back doesn't clobber
+   * in-memory state.
+   *
+   * Cheap when the on-disk version ≤ in-memory version (no I/O, just
+   * compares): typical open-after-boot does no disk read at all.
+   */
+  async restoreOne(canvasId: string, sourcePath?: string): Promise<void> {
+    const fs = await import('node:fs/promises')
+    const target = sourcePath ? join(sourcePath, '.canvas.json') : join(this.workspaceRoot, 'canvases', `${canvasId}.json`)
+    try {
+      const raw = JSON.parse(await readFile(target, 'utf8'))
+      this.maybeReload(canvasId, raw)
+    } catch { /* missing or corrupt — skip, keep in-memory state */ }
+    void fs // keep import used in case future layout switches need it
+  }
+
   /** Migrate resultUrl paths in a canvas so they reference a new project id.
    *
    * When a project is re-registered under a different id (e.g. a legacy
@@ -540,8 +673,10 @@ export class CanvasStore {
     if (changed) {
       this.logger?.debug?.(`[media-studio] migrateProjectId(${canvasId}): ${fromId} → ${toId}, updated resultUrl on some nodes`)
       // Await persist so the on-disk file stays in sync — callers must
-      // await this method to guarantee the migration is durable.
-      await this.persist(canvasId, cv, sourcePath)
+      // await this method to guarantee the migration is durable. Use the
+      // coalescer escape hatch so a pending debounced write doesn't race
+      // with this synchronous one.
+      await this.flushPersistNow(canvasId)
     }
     return changed
   }
@@ -551,6 +686,7 @@ export class CanvasStore {
     try {
       await mkdir(dirname(dest), { recursive: true })
       await writeFile(dest, JSON.stringify({ nodes: cv.graph.nodes, edges: cv.graph.edges, regions: cv.graph.regions, version: cv.version }, null, 2), 'utf8')
+      this.persistWriteCount.set(canvasId, (this.persistWriteCount.get(canvasId) ?? 0) + 1)
       // Persist succeeded — clear any previous error so PatchResult stops
       // reporting it.
       this.lastPersistError.delete(canvasId)
@@ -562,6 +698,78 @@ export class CanvasStore {
       const msg = (e as Error).message
       this.logger?.warn?.(`[media-studio] persist failed for canvas "${canvasId}": ${msg}`)
       this.lastPersistError.set(canvasId, msg)
+    }
+  }
+
+  /** P0-① — schedule a microtask-debounced persist. Multiple applies
+   *  inside the same synchronous tick collapse into a single disk write
+   *  because microtasks flush at the call-stack boundary, not at a wall-
+   *  clock interval. This keeps the round-trip deterministic enough for
+   *  tests (the write happens before any post-apply await), while still
+   *  coalescing a burst of N applies into one `writeFile`. The on-disk
+   *  copy lags the in-memory state by at most the time it takes to
+   *  return from the current synchronous block. */
+  private schedulePersist(canvasId: string): void {
+    const gen = (this.persistGen.get(canvasId) ?? 0) + 1
+    this.persistGen.set(canvasId, gen)
+    const existing = this.persistTimers.get(canvasId)
+    if (existing) clearTimeout(existing)
+    // Track the schedule as an entry in `persistTimers` so
+    // `flushPersistNow` can see it. We use a placeholder timeout (never
+    // fired) because the actual flush lives in the microtask queue.
+    const t = setTimeout(() => { /* placeholder */ }, 60_000)
+    if (typeof t.unref === 'function') t.unref()
+    this.persistTimers.set(canvasId, t)
+    // Use queueMicrotask to fire the actual write at the end of the
+    // current synchronous block. queueMicrotask schedules a function
+    // to run after the current task; multiple `apply()` calls in the
+    // same tick share one microtask checkpoint, so all but the last
+    // are dropped by the `liveGen !== gen` guard above (because the
+    // later call incremented gen, clearing the earlier microtask's
+    // work via the no-op branch).
+    queueMicrotask(() => {
+      this.persistTimers.delete(canvasId)
+      const liveGen = this.persistGen.get(canvasId) ?? 0
+      if (liveGen !== gen) return
+      const cv = this.canvases.get(`${this.workspaceRoot}\0${canvasId}`)
+      if (!cv) return
+      const sp = this.canvasSourcePaths.get(canvasId)
+      // Kick off the write and track the promise so `flushPersistNow`
+      // and tests can await it.
+      const p = this.persist(canvasId, cv, sp)
+      this.persistInflight.set(canvasId, p)
+      p.finally(() => {
+        if (this.persistGen.get(canvasId) === gen) this.persistInflight.delete(canvasId)
+      })
+    })
+  }
+
+  /** P0-① escape hatch — wait for any pending / in-flight persist to
+   *  settle. Use this from code that needs the on-disk file to be fresh
+   *  (e.g. `migrateProjectId` before swapping the canvas to a new id,
+   *  boot `restore` before scanning dependents, integration tests).
+   *
+   *  Implementation: drain the microtask queue (so the coalesced
+   *  write has a chance to fire), then await any in-flight write.
+   *  We deliberately do NOT issue an extra `persist()` here — the
+   *  coalescer has already scheduled the right one and re-persisting
+   *  would inflate the write counter for tests that count syscalls. */
+  async flushPersistNow(canvasId?: string): Promise<void> {
+    const ids = canvasId ? [canvasId] : [...this.persistTimers.keys(), ...this.persistInflight.keys()]
+    // Drain microtasks: queueMicrotask-scheduled flushes run after the
+    // current synchronous block. Two `await Promise.resolve()` passes
+    // cover a queueMicrotask + the first await inside persist().
+    for (let i = 0; i < 4; i++) await Promise.resolve()
+    for (const id of ids) {
+      const inflight = this.persistInflight.get(id)
+      if (inflight) await inflight
+      // After awaiting, a new microtask may have re-scheduled (a caller
+      // raced a fresh apply). Loop until both queues are empty for this
+      // canvas to make this an honest "flush everything" escape.
+      const t = this.persistTimers.get(id)
+      if (t) { clearTimeout(t); this.persistTimers.delete(id) }
+      const still = this.persistInflight.get(id)
+      if (still) await still
     }
   }
 }

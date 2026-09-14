@@ -33,9 +33,9 @@
  */
 
 import { spawn } from 'node:child_process'
-import { mkdir, writeFile, unlink, rename, stat } from 'node:fs/promises'
+import { mkdir, writeFile, unlink, rename, stat, readdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { getMediaStudioHandles, log } from './service-state'
 
 const FFMPEG = (): string => process.env.FFMPEG_PATH || 'ffmpeg'
@@ -336,8 +336,18 @@ export async function prepareVideoForCanvas(
   await mkdir(baseDir, { recursive: true })
 
   // Stable filename — re-running prepareVideoForCanvas on the same source
-  // re-uses the same path so existing nodes don't dangle.
-  const id = randomBytes(8).toString('hex')
+  // re-uses the same path so existing nodes don't dangle AND so the
+  // long-running agent flow of "refresh 6 video nodes 5 times during
+  // iteration" doesn't accumulate 30 random v-*.mp4 files in
+  // assets/clips/. M5-⑤: id is derived from a sha1 of the source URLs
+  // (the video URL + the optional cover URL), so two calls with the same
+  // inputs collide on the same path and overwrite.
+  const id = createHash('sha1')
+    .update(videoUrl)
+    .update('\0')
+    .update(opts.coverUrl ?? '')
+    .digest('hex')
+    .slice(0, 16)
   const localVideo = join(baseDir, `v-${id}.mp4`)
 
   try {

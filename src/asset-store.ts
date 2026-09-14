@@ -113,24 +113,66 @@ export function newAssetFileName(assetId: string, ext: string): string {
 
 /** Read <root>/<indexFile>; never throws — absent/corrupt returns empty.
  *  Default index file name is `index.json`; the source-path variant uses
- *  `.index.json` (hidden) so user-visible asset dirs stay clean. */
+ *  `.index.json` (hidden) so user-visible asset dirs stay clean.
+ *
+ *  Cached: an in-process map keyed by `<root>|<indexFile>` holds the
+ *  parsed result + the file's mtimeMs + size. A second read with the same
+ *  fingerprint returns the cached payload; the readFile syscall (and the
+ *  JSON.parse cost) only fires when the file actually changed on disk.
+ *  Search / dependency scans run for every keystroke in the top-bar
+ *  search box — without this cache the per-keystroke cost is O(P) reads
+ *  where P is the project count, which made search feel laggy on a
+ *  workspace with a few hundred projects. */
+const INDEX_CACHE = new Map<string, { fingerprint: string; index: AssetIndexFile }>()
 export async function loadAssetIndex(root: string, indexFile: string = 'index.json'): Promise<AssetIndexFile> {
+  const target = join(root, indexFile)
+  let fingerprint: string | null = null
   try {
-    const raw = await readFile(join(root, indexFile), 'utf8')
+    const st = await stat(target)
+    fingerprint = `${st.mtimeMs}:${st.size}`
+    const cached = INDEX_CACHE.get(target)
+    if (cached && cached.fingerprint === fingerprint) return cached.index
+  } catch { /* file absent or unreadable — fall through to fresh read */ }
+  try {
+    const raw = await readFile(target, 'utf8')
     const parsed = JSON.parse(raw) as AssetIndexFile
-    if (parsed && Array.isArray(parsed.assets)) return { version: INDEX_VERSION, assets: parsed.assets }
+    const out: AssetIndexFile = parsed && Array.isArray(parsed.assets)
+      ? { version: INDEX_VERSION, assets: parsed.assets }
+      : { version: INDEX_VERSION, assets: [] }
+    if (fingerprint) INDEX_CACHE.set(target, { fingerprint, index: out })
+    return out
   } catch { /* absent/corrupt — empty below */ }
   return { version: INDEX_VERSION, assets: [] }
 }
 
-/** Write <root>/<indexFile> (creates root). Never rejects — logs only. */
+/** Write <root>/<indexFile> (creates root). Never rejects — logs only.
+ *  Updates the in-process index cache after a successful write so the next
+ *  `loadAssetIndex` sees the new content immediately. */
 export async function writeAssetIndex(root: string, index: AssetIndexFile, indexFile: string = 'index.json'): Promise<void> {
   try {
     await mkdir(root, { recursive: true })
-    await writeFile(join(root, indexFile), JSON.stringify(index, null, 2), 'utf8')
+    const target = join(root, indexFile)
+    await writeFile(target, JSON.stringify(index, null, 2), 'utf8')
+    // Bust the cache by removing the entry — the next read will stat + repopulate.
+    INDEX_CACHE.delete(target)
+    // And prime it with the freshly-written payload so a follow-up read
+    // inside the same tick (very common in dependency scans) gets a hit.
+    try {
+      const st = await stat(target)
+      INDEX_CACHE.set(target, { fingerprint: `${st.mtimeMs}:${st.size}`, index })
+    } catch { /* stat failed — next read will fix it */ }
   } catch (e) {
     getMediaStudioHandles().logger?.warn?.(`[media-studio] writeAssetIndex(${root}) failed: ${(e as Error).message}`)
   }
+}
+
+/** Test / debugging hook: drop the in-process index cache. Call after
+ *  external processes (CLI tools, tests) mutate an index file directly so
+ *  the next in-process read re-parses it instead of returning a stale
+ *  cached snapshot. Not exported on the user-facing API surface. */
+export function invalidateAssetIndexCache(root?: string, indexFile?: string): void {
+  if (!root) { INDEX_CACHE.clear(); return }
+  INDEX_CACHE.delete(join(root, indexFile ?? 'index.json'))
 }
 
 export function validateAssetName(name: string): string | null {
@@ -341,30 +383,21 @@ export interface AssetHit {
 }
 
 /** Scan canvases for soft references to assets owned by `ownerProjectId`.
- *  `assetIdFilter` narrows to one asset (asset-level deletion). */
+ *  `assetIdFilter` narrows to one asset (asset-level deletion).
+ *
+ *  Reads directly off the in-memory canvases via `canvasStore.scanAssetRefs`
+ *  — the older `peek`-based implementation deep-copied every canvas it
+ *  inspected (O(N × canvasSize) memory for an N-project dependency
+ *  scan), which made deletion preflights slow and memory-hungry on
+ *  workspaces with many live projects. */
 export function scanCanvasRefs(
   canvasStore: CanvasStore,
   projectIds: string[],
   ownerProjectId: string,
   assetIdFilter?: string,
 ): AssetHit[] {
-  const hits: AssetHit[] = []
-  for (const pid of projectIds) {
-    if (pid === ownerProjectId) continue
-    const snap = canvasStore.peek(pid)
-    if (!snap) continue
-    const perAsset = new Map<string, string[]>()
-    for (const n of snap.graph.nodes) {
-      const ref = (n.data as { assetRef?: { projectId?: string; assetId?: string } }).assetRef
-      if (!ref || ref.projectId !== ownerProjectId || typeof ref.assetId !== 'string' || !ref.assetId) continue
-      if (assetIdFilter && ref.assetId !== assetIdFilter) continue
-      const list = perAsset.get(ref.assetId) ?? []
-      list.push(n.id)
-      perAsset.set(ref.assetId, list)
-    }
-    for (const [assetId, nodeIds] of perAsset) hits.push({ refProjectId: pid, assetId, nodeIds })
-  }
-  return hits
+  const raw = canvasStore.scanAssetRefs(projectIds, ownerProjectId, assetIdFilter)
+  return raw.map((h) => ({ refProjectId: h.refProjectId, assetId: h.assetId, nodeIds: h.nodeIds }))
 }
 
 export class AssetDeleteBlockedError extends Error {

@@ -35,7 +35,7 @@ async function setup(): Promise<void> {
     mediaRoots: [],
     defaultCanvasId: 'main',
     canvasStore,
-    sseClients: new Set(),
+    sseClients: new Map(),
     projectStore,
     projectSseClients: new Set(),
   } as never)

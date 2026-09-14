@@ -74,6 +74,27 @@ export interface RegistrySnapshot {
   projects: ProjectMeta[]
 }
 
+/**
+ * Strip the user-private `sourcePath` (and `legacy` flag, which leaks
+ * layout-internal knowledge) from each project meta. Used by the SSE
+ * broadcaster so a wire-format registry snapshot never carries absolute
+ * filesystem paths to the browser. Server-side consumers (REST endpoints,
+ * tools) still see the full `snapshot()` — only the broadcast path goes
+ * through this filter.
+ *
+ * Performance note: `snapshot()` is sorted + mapped on every emit; the
+ * filter is O(N) per emit, same order of magnitude as the existing
+ * snapshot, so the wire-shape change costs no extra passes.
+ */
+export function safeRegistryForClient(snap: RegistrySnapshot): RegistrySnapshot {
+  const projects = snap.projects.map((p) => {
+    if (p.sourcePath === undefined && !p.legacy) return p
+    const { sourcePath: _sp, legacy: _lg, ...rest } = p
+    return rest as ProjectMeta
+  })
+  return { activeId: snap.activeId, recent: snap.recent, projects }
+}
+
 export type DeleteMode = 'trash' | 'permanent'
 export type DeleteCascade = 'cancel' | 'break-refs' | 'migrate-shared'
 
@@ -414,11 +435,12 @@ export class ProjectStore {
       await this.ensureProjectAgentsMd(meta)
       meta.lastOpenedAt = new Date().toISOString()
       await this.setActiveLocked(id)
-      // Restore the canvas from disk so the in-memory state matches the
-      // persisted .canvas.json even when DSH was restarted or the canvas
-      // was never loaded (e.g. a project opened after boot). Without this,
-      // openProject would return a live canvas snapshot with 0 nodes.
-      await this.canvasStore.restore(this.canvasStore.allSourcePaths())
+      // Restore ONLY the target canvas from disk — not the entire registry.
+      // The previous full-restore scanned every project's .canvas.json on
+      // every open; with N projects it turned a single open into N reads.
+      // restoreOne is version-guarded, so a typical "open after boot"
+      // performs no I/O at all when the in-memory copy is already fresh.
+      await this.canvasStore.restoreOne(id, meta.sourcePath)
       // Migrate stale resultUrl project ids: when a project was re-registered
       // under a new id (e.g. legacy canvas promoted to a sourcePath project),
       // every node's resultUrl that still points to the old id must be
@@ -535,33 +557,42 @@ export class ProjectStore {
   /** Dependency preflight used by both the REST endpoint and deleteProject.
    *  Soft refs come from canvases; hard-copy consumers come from canvas nodes
    *  (legacy refCopiesFrom) and from other projects' asset indexes (M2
-   *  copyAssetToProject provenance). */
+   *  copyAssetToProject provenance).
+   *
+   *  Performance: the in-canvas soft-ref scan delegates to
+   *  `CanvasStore.scanAssetRefs` which walks the live in-memory graph
+   *  without deep-copying it. The previous `peek`-based implementation
+   *  deep-copied every other project's canvas on every delete — O(N ×
+   *  canvasSize) memory + CPU for an N-project workspace. */
   async dependentsOf(ownerId: string): Promise<DependentsInfo> {
     await this.readyPromise
     const hits: RefHit[] = []
     const copyCounts = new Map<string, number>()
+    const allProjectIds = Object.keys(this.registry.projects)
 
+    // Stage 1 — soft refs from canvases (in-memory, no clones).
+    const rawHits = this.canvasStore.scanAssetRefs(allProjectIds, ownerId)
+    for (const h of rawHits) {
+      hits.push({
+        refProjectId: h.refProjectId,
+        refProjectName: this.registry.projects[h.refProjectId]?.name ?? h.refProjectId,
+        assetId: h.assetId,
+        nodeIds: h.nodeIds,
+      })
+    }
+
+    // Stage 2 — `refCopiesFrom` provenance + asset-index `copyOf` provenance.
+    // We do this in one pass over the canvases (for the node-level legacy
+    // field) plus one pass over the asset indexes (for the index-level
+    // copyOf). The asset index read goes through the in-process index
+    // cache (`loadAssetIndex`), so repeated delete-preflights within the
+    // same process don't re-stat disk.
+    const legacyCounts = this.canvasStore.countLegacyCopyRefs(allProjectIds, ownerId)
+    for (const [pid, n] of legacyCounts) copyCounts.set(pid, (copyCounts.get(pid) ?? 0) + n)
     for (const meta of Object.values(this.registry.projects)) {
       if (meta.id === ownerId) continue
-      const snap = this.canvasStore.peek(meta.id)
-      if (snap && snap.graph.nodes.length > 0) {
-        const byAsset = new Map<string, { assetId: string; nodeIds: string[] }>()
-        for (const n of snap.graph.nodes) {
-          const ref = (n.data as { assetRef?: { projectId?: string; assetId?: string } }).assetRef
-          if (ref && ref.projectId === ownerId && typeof ref.assetId === 'string' && ref.assetId) {
-            const bucket = byAsset.get(ref.assetId) ?? { assetId: ref.assetId, nodeIds: [] }
-            bucket.nodeIds.push(n.id)
-            byAsset.set(ref.assetId, bucket)
-          }
-          const origin = (n.data as { refCopiesFrom?: { projectId?: string } }).refCopiesFrom
-          if (origin && origin.projectId === ownerId) copyCounts.set(meta.id, (copyCounts.get(meta.id) ?? 0) + 1)
-        }
-        for (const bucket of byAsset.values()) {
-          hits.push({ refProjectId: meta.id, refProjectName: meta.name, assetId: bucket.assetId, nodeIds: bucket.nodeIds })
-        }
-      }
       // Hard copies stored in the other project's asset index (copyOf).
-      const src = this.registry.projects[meta.id]?.sourcePath
+      const src = meta.sourcePath
       const idxFile = src ? '.index.json' : 'index.json'
       const idx = await loadAssetIndex(this.projectAssetRoot(meta.id), idxFile)
       for (const a of idx.assets) {

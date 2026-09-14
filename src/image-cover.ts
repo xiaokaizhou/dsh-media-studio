@@ -27,7 +27,7 @@
 
 import { mkdir, writeFile, readFile } from 'node:fs/promises'
 import { dirname, join, extname } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { log } from './service-state'
 
 export interface PreparedImage {
@@ -212,7 +212,9 @@ export async function prepareAudioForCanvas(
   audioInput: string,
   opts: { wsRoot: string; projectId: string; sourcePath?: string },
 ): Promise<PreparedAudio> {
-  const id = randomBytes(8).toString('hex')
+  // M5-⑤ — stable filename keyed by the input URL so repeated
+  // preps overwrite the same file instead of accumulating orphans.
+  const id = createHash('sha1').update(audioInput).digest('hex').slice(0, 16)
   const ext = guessAudioExt(audioInput)
   const filename = `a-${id}${ext}`
 
@@ -286,7 +288,9 @@ export async function prepareImageForCanvas(
   // the priority chain; the only thing that *must* change to add a new
   // bucket is the `AssetKindDir` union at the top of this file.
   const kindDir = inferImageKindDir(opts)
-  const id = randomBytes(8).toString('hex')
+  // M5-⑤ — stable filename keyed by the input URL so repeated preps
+  // overwrite the same file instead of accumulating orphans.
+  const id = createHash('sha1').update(imageInput).digest('hex').slice(0, 16)
   const ext = guessImageExt(imageInput)
 
   if (opts.sourcePath) {

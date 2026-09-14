@@ -47,7 +47,7 @@ async function startTestServer(
   const wsRoot = tmpdir()
   const { CanvasStore } = await import('../src/canvas-store')
   const store = new CanvasStore(wsRoot)
-  const sseClients = new Set<http.ServerResponse>()
+  const sseClients = new Map<string, Set<http.ServerResponse>>()
   const projectSseClients = new Set<http.ServerResponse>()
 
   // Minimal mock ProjectStore for the unified SSE endpoint test.
@@ -202,7 +202,7 @@ describe('media-studio HTTP endpoints — canvas surface (after multimodal refac
       workspaceRoot: sub,
       defaultCanvasId: 'main',
       canvasStore: store,
-      sseClients: new Set(),
+      sseClients: new Map(),
     })
 
     const r = await new Promise<{ status: number; ct: string; bytes: number }>((resolve, reject) => {
@@ -258,7 +258,7 @@ describe('media-studio HTTP endpoints — canvas surface (after multimodal refac
       mediaRoots: [projectDir],
       defaultCanvasId: 'main',
       canvasStore: new CanvasStore(wsDir),
-      sseClients: new Set(),
+      sseClients: new Map(),
     })
 
     const get = (p: string) => new Promise<{ status: number; ct: string; bytes: number }>((resolve, reject) => {
@@ -302,7 +302,7 @@ describe('media-studio HTTP endpoints — canvas surface (after multimodal refac
       workspaceRoot: wsDir,
       defaultCanvasId: 'main',
       canvasStore: new (await import('../src/canvas-store')).CanvasStore(wsDir),
-      sseClients: new Set(),
+      sseClients: new Map(),
     })
 
     // Probe (migration) view: /tmp is NOT a persistent root → must deny,

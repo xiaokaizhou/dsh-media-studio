@@ -248,7 +248,7 @@ describe('Fix 5: canvas_refresh_node no longer requires upstream edges', () => {
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore: undefined,
       projectSseClients: new Set(),
     } as never)
@@ -412,7 +412,7 @@ describe('Tool description sanity (CANVAS_RULES embedded)', () => {
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore: store,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore: undefined,
       projectSseClients: new Set(),
     } as never)

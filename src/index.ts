@@ -45,7 +45,7 @@ import {
 } from './tools'
 import { CanvasStore } from './canvas-store'
 import { registerCanvasRoutes } from './routes'
-import { ProjectStore, type ProjectEvent } from './project-store'
+import { ProjectStore, type ProjectEvent, safeRegistryForClient } from './project-store'
 import { createMediaStudioService, MEDIA_STUDIO_SERVICE_NAME } from './media-studio-service'
 import { registerProjectRoutes } from './project-routes'
 import { registerAssetRoutes } from './asset-routes'
@@ -100,7 +100,11 @@ export { migrateBrokenCanvasUrls, type MigrateResult } from './asset-store'
 export function apply(ctx: Context, config: ConfigShape): void {
   // SSE client registry — the canvas tab's EventSource lands here so
   // `store.apply` can push live patches to every subscriber.
-  const sseClients = new Set<ServerResponse>()
+  //
+  // M4-③ — keyed by canvasId so a patch on canvas A is never pushed to
+  // a client subscribed to canvas B. The canvas-bus on the client also
+  // double-checks `data.canvasId` (defence in depth) and drops mismatches.
+  const sseClients = new Map<string, Set<ServerResponse>>()
 
   // Coalesce canvas broadcasts so a burst of agent patches in the same
   // animation frame sends only the LAST state to subscribers. Without
@@ -123,11 +127,14 @@ export function apply(ctx: Context, config: ConfigShape): void {
     if (broadcastPending.size === 0) return
     // Stable wire shape: one SSE event per coalesced burst, carrying
     // the latest (canvasId, version, graph) snapshot — exactly what the
-    // existing client canvas-bus expects.
+    // existing client canvas-bus expects. M4-③: each canvas's payload
+    // only goes to clients that subscribed to that exact canvasId.
     for (const [, payload] of broadcastPending) {
       const body = JSON.stringify({ type: 'canvas-patch', canvasId: payload.canvasId, version: payload.version, graph: payload.graph, patch: payload.patch })
       const msg = `event: canvas-patch\ndata: ${body}\n\n`
-      for (const res of sseClients) {
+      const subscribers = sseClients.get(payload.canvasId)
+      if (!subscribers) continue
+      for (const res of subscribers) {
         try { res.write(msg) } catch { /* client gone */ }
       }
     }
@@ -171,7 +178,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // events; the ProjectStore serializes every mutation and calls back here.
   const projectSseClients = new Set<ServerResponse>()
   const broadcastProject = (event: ProjectEvent) => {
-    const body = JSON.stringify({ ...event, registry: event.registry ?? { activeId: null, recent: [], projects: [] } })
+    // Strip user-private sourcePath from every project meta before
+    // serialising — the wire payload must never carry absolute filesystem
+    // paths. Server-side consumers still see the full snapshot via
+    // projectStore.snapshot(); only the broadcast path goes through this
+    // filter.
+    const safeRegistry = event.registry ? safeRegistryForClient(event.registry) : { activeId: null, recent: [], projects: [] }
+    const body = JSON.stringify({ ...event, registry: safeRegistry })
     const msg = `event: ${event.type}\ndata: ${body}\n\n`
     for (const res of projectSseClients) {
       try { res.write(msg) } catch { /* client gone */ }

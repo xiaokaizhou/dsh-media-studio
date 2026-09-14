@@ -247,3 +247,39 @@ pnpm pack
 4. **SSE 重连后主动同步**：EventSource error→自动重连后，主动 fetch 最新 canvas 快照 + registry，覆盖断线期间丢失的事件。
 5. **registry-changed 事件防抖**：150ms trailing-edge 防抖，避免项目创建/切换时的连续广播触发 React 重渲染风暴。
 6. **对话框超时 30s→10s**：正常请求 2s 内返回，10s 超时 + 友好错误提示更合理。
+
+## 性能契约（必须通过测试用例）
+
+下面这些条款是 **必须通过 `pnpm test` 测试用例保证的**，每条都对应一个或多个 vitest 文件。**任何破坏这些契约的改动都必须随附对应的回归测试，并在 PR 描述里明确说明**。这是把性能优化从「偶发的好心」固化为「代码评审硬约束」的唯一办法 —— 单靠 review 看不出 100ms 和 1s 的差别，CI 跑过的数字才看得见。
+
+### 写入路径（P0-① / P0-②）
+- **persist 必须合并**。同一 canvas 在 16 ms 内的多次 `CanvasStore.apply` 只触发一次 `writeFile`。`tests/persistence-debounce.test.ts` 用 `store.persistWriteCount.get(canvasId)` 断言：100 次同步 apply → writeCount ≤ 2。
+- **postProcessCanvasPatch 必须批量提交**。N 个 batchAddMedia 视频节点产出的 `updateNode` ops 必须合并成单次 `store.apply`，**不是 N 次**。`tests/post-process-batching.test.ts` 用 apply spy 断言：6 个 video item → 总 apply 调用 = 2（1 batchAddMedia + 1 批量 updateNode）。
+- **持久化合并 + 防抖**：拖动 / 批量 patch 期间磁盘 I/O 频率不随节点数线性放大。`tests/perf-budget.test.ts` 守 1000 次同步 apply 在 500 ms 内完成且 writeCount ≤ 2。
+
+### 媒体处理（P1-⑤ / P1-⑥ / P5 / M5-⑤）
+- **文件命名必须稳定**。`prepareVideoForCanvas` / `prepareAudioForCanvas` / `prepareImageForCanvas` 对同一 source URL + 同一 cover URL 必须产出同一文件名（基于 sha1 派生）。`tests/stable-filename.test.ts` 断言 hash 稳定性与 16-hex 形状。
+- **orphan GC 必须清理不可达文件**。`gcOrphanMedia` 扫描 `<sourcePath>/assets/{clips,characters,scenes,audio}/` 下以 `v-` / `a-` / `i-` 开头的文件，删除那些 basename 不出现在任何 canvas 节点 `data.resultUrl` / `data.poster` 中的文件。`tests/orphan-gc.test.ts` 覆盖引用 / 不引用 / 用户资产 / 缺失目录 / poster 引用五条路径。
+- **post-process pipeline 不得因为准备失败把整个 patch 推回去**：`tests/pipeline-regressions.test.ts` 的旧契约依然有效，新加的批量提交不能破坏它（CI 会跑全套）。
+
+### SSE 与客户端渲染（P1-③ / P0-⑩ / P2-⑪ / P2-⑫）
+- **SSE 广播按 canvasId 隔离**。`index.ts` 的 `flushBroadcasts` 只把 payload 推到订阅了对应 canvasId 的连接；`routes.ts` 的 SSE handler 按 canvasId 入桶；`canvas-bus.ts` 的 `canvas-patch` 监听器对 `data.canvasId !== state.canvasId` 的 patch 一律丢弃（防止跨画布渲染 bug）。`tests/sse-bucketing.test.ts` + `tests/registry-broadcast.test.ts` 覆盖服务端形状；客户端校验在 `src/client/canvas-bus.ts:191-220`。
+- **MediaCanvasContext 与 AdjacencyContext 必须分离**。`MediaCanvasApi` 不再持有 `edgesRight` / `edgesLeft` / `hasUpstreamById` —— 这些字段属于独立 `AdjacencyContext`，拓扑变化不应让所有 memo 化的 card 重渲染。`src/client/canvas-api.ts` 的类型定义和 `src/client/canvas.tsx` 的 Provider 嵌套守住这条线。
+- **merge token 必须命中 short-circuit**。`projectedNodeToken` 接受 `cachedDataRef + cachedToken`，当 data 引用相同且 scalar 前缀（id/type/label/position）相同时返回缓存 token，跳过 JSON.stringify。`tests/canvas-rerender-discipline.test.ts` 覆盖三条短路不变量（同 ref 短路、不同 label 不短路、不同 data 不短路）。
+- **`useRefreshHandles` 每节点最多一次 rAF 调用**。`src/client/nodes.tsx:80-95` 在 mount 时只 schedule 一次 `requestAnimationFrame(updateNodeInternals)`。媒体 `onLoad` 回调另算，不在 mount 期。这一条靠 `tests/nodes.test.ts` 风格的成本测试比较昂贵，目前仅作为代码 review 约束 —— 若之后引入 React Testing Library，应补一条 `expect(updateNodeInternals).toHaveBeenCalledTimes(1)` 的 mount 断言。
+
+### 服务端依赖扫描与项目打开（P1-⑦ / P1-⑨）
+- **`loadAssetIndex` 必须命中 mtime 缓存**。同一文件的两次 read，若 `mtimeMs + size` 指纹未变，第二次返回缓存对象（`Object.is` 稳定）。`tests/search-cache.test.ts` 断言 `await loadAssetIndex(p) === await loadAssetIndex(p)`（同引用），并在 `writeAssetIndex` + `invalidateAssetIndexCache` 后能正确失效。
+- **`openProject` 只 restore 目标 canvas**。`CanvasStore.restoreOne(canvasId, sourcePath)` 读**且只读**那一个 `.canvas.json`。`tests/restore-target.test.ts` 用多项目 setup 断言非目标 canvas 的内存状态不被触碰。
+- **`dependentsOf` / `scanAssetRefs` 不应深拷贝画布**。`CanvasStore.scanAssetRefs` 与 `countLegacyCopyRefs` 直接遍历内部 `canvases` Map，**不调用** `peek()` / `cloneGraph()`。`tests/dependents-no-clone.test.ts` 覆盖软引用与 legacy `refCopiesFrom` 两条路径。
+
+### 流程要求
+- **每次改动 P0/P1 标号对应的代码路径前**先 grep 上面列表，看你即将碰的是哪一条，并在 PR 里 link 相关的测试文件。
+- **`pnpm test` 必须全绿**才能提 PR。下面这俩是 **baseline 已知的 5 s timeout flaky**，与本次性能优化无关，**在 PR 里可以接受它们继续红**，但不能引入任何新的失败：
+  - `tests/fixes.test.ts > Fix 5: canvas_refresh_node no longer requires upstream edges`（每次都 timeout 5 s）
+  - `tests/music-refresh.test.ts > M3: non-dub music node uses generate_music with raw upstream text`（间歇 timeout 5 s）
+  - 之所以挂在 5 s 是 vitest 的默认 `testTimeout`，不是断言失败；这两个用例真实运行时大概率是对的，但工具 stub 的 `setTimeout` / `fetch` 路径里某处慢了超过 5 s。
+  - **如果你的 PR 让它们从 red 变 green**：恭喜，单独提一个 commit 即可。
+  - **如果你的 PR 让它们从 green 变 red，或引入新的 flaky**：你的 PR 必须修掉。
+- **每个 PR 至少自己跑 2 次 `pnpm test`**（不要只跑 1 次就以为通过）确认稳定，再决定是「修了 bug」还是「引入 flaky」。
+- **新增热点路径**（写入、SSE、媒体处理、依赖扫描、画布渲染）**必须随附回归测试**。如果新加了一个 React 组件级优化（如 memo / re-render discipline），在 PR 描述里点名对应的性能契约条款。

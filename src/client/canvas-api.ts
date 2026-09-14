@@ -120,18 +120,6 @@ export interface MediaCanvasApi {
   /** M2 — open the "save this media card into the project library" dialog.
    *  Absent when the card type has nothing to save or the host hides it. */
   saveToLibraryNode?(id: string): void
-  /** Node ids that have at least one outgoing edge (source side). Rebuilt
-   *  once per server snapshot in canvas.tsx — never on viewport gestures —
-   *  so AddSideButton / RefreshSideButton can read connectivity without an
-   *  xyflow store selector subscription (which would re-run on every
-   *  pan/zoom tick). Stable Set references are returned so consumers only
-   *  re-render when the graph topology actually changes. */
-  edgesRight: ReadonlySet<string>
-  /** Node ids that have at least one incoming edge (target side). */
-  edgesLeft: ReadonlySet<string>
-  /** Node ids that have at least one upstream (incoming) edge. Equivalent
-   *  to `edgesLeft`, kept as a separate name for readability at call sites. */
-  hasUpstreamById: ReadonlySet<string>
 }
 
 export const MediaCanvasContext = createContext<MediaCanvasApi | null>(null)
@@ -140,6 +128,35 @@ export function useMediaCanvas(): MediaCanvasApi {
   const api = useContext(MediaCanvasContext)
   if (!api) throw new Error('media-studio: <Canvas> provider missing')
   return api
+}
+
+/**
+ * Graph-topology context (M4-⑩). Lives on a separate provider from
+ * `MediaCanvasContext` so a topology-only change (an edge added by a
+ * server patch) does NOT flip the api reference — only the topology-
+ * sensitive components (AddSideButton, RefreshSideButton, EdgeView)
+ * subscribe to this and re-render. Before this split, the api object
+ * was rebuilt on every `useMemo([..., connMaps])` cycle and any context
+ * value change re-rendered every memoised node card regardless of
+ * whether its props actually moved; large canvases saw the full card
+ * tree re-render on every SSE patch.
+ */
+export interface CanvasAdjacency {
+  /** Node ids that have at least one outgoing edge (source side). */
+  edgesRight: ReadonlySet<string>
+  /** Node ids that have at least one incoming edge (target side). */
+  edgesLeft: ReadonlySet<string>
+  /** Adjacency map for edge lookup (source → targets, target → sources). */
+  out: ReadonlyMap<string, readonly string[]>
+  in: ReadonlyMap<string, readonly string[]>
+}
+
+export const AdjacencyContext = createContext<CanvasAdjacency | null>(null)
+
+export function useCanvasAdjacency(): CanvasAdjacency {
+  const adj = useContext(AdjacencyContext)
+  if (!adj) throw new Error('media-studio: <AdjacencyContext> provider missing')
+  return adj
 }
 
 /**

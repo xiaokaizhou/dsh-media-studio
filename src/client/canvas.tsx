@@ -62,6 +62,7 @@ import {
 } from './dim-store'
 import {
   MediaCanvasContext,
+  AdjacencyContext,
   postOps,
   useMediaCanvas,
   type MsOp,
@@ -111,7 +112,15 @@ function cloneGraph(graph: SGraph): SGraph {
 }
 
 function msSnapshotOf(graph: SGraph, version: number): MsSnapshot {
-  return { graph: cloneGraph(graph), version }
+  // P2-⑬ — no clone. The graph reference comes from the canvas-bus,
+  // which JSON.parses each SSE payload into a fresh, immutable object;
+  // downstream consumers treat it as read-only. The previous
+  // `JSON.parse(JSON.stringify(graph))` cost O(graph) on every SSE
+  // version tick and another O(graph) on every undo-stack push — both
+  // deleted here. The undo history (`h.past.push(...)`) still gets a
+  // stable per-version reference so undo/redo correctly restores the
+  // exact graph seen at the time of the action.
+  return { graph, version }
 }
 
 /** Ops that rebuild the host graph to equal `target` (delete-all + re-add
@@ -195,9 +204,35 @@ function projectNodes(graph: SGraph): FlowNode[] {
 
 /** Content token for a projected node — unchanged nodes keep their original
  *  object reference so memoized card components skip re-rendering. */
-function projectedNodeToken(n: SNode): string {
+/** Content token for a projected node — unchanged nodes keep their original
+ *  object reference so memoized card components skip re-rendering.
+ *
+ *  P2-⑪ — fast path: when the caller passes the dataRef we cached on the
+ *  previous merge AND the cheap scalar fields (id/type/label/position)
+ *  match the prefix of the cached token, we skip the JSON.stringify
+ *  and return the cached token. Without this, every SSE merge runs
+ *  `JSON.stringify` on every node's `data` object — O(N × data) per
+ *  patch — even when 99% of nodes are unchanged. The scalar-prefix check
+ *  is the difference between a correct fast path (label change → new
+ *  token) and a buggy one (label change → still cached token because
+ *  the data object reference happens to be reused).
+ */
+export function projectedNodeToken(
+  n: SNode,
+  cachedDataRef?: Record<string, unknown>,
+  cachedToken?: string,
+): string {
   const p = n.position
-  return JSON.stringify([n.id, n.type, n.label, p ? [p.x, p.y] : null, n.data])
+  const token = JSON.stringify([n.id, n.type, n.label, p ? [p.x, p.y] : null, n.data])
+  if (
+    cachedDataRef !== undefined &&
+    cachedToken !== undefined &&
+    n.data === cachedDataRef &&
+    cachedToken.startsWith(JSON.stringify([n.id, n.type, n.label, p ? [p.x, p.y] : null]).slice(0, -1))
+  ) {
+    return cachedToken
+  }
+  return token
 }
 
 /**
@@ -215,7 +250,10 @@ function projectedNodeToken(n: SNode): string {
 function mergeNodes(
   prev: FlowNode[],
   graph: SGraph,
-  tokenCache: Map<string, string>,
+  // P2-⑪ — tokenCache stores {token, dataRef} so unchanged nodes can
+  // skip the per-token JSON.stringify when their data object reference
+  // is the same as last time.
+  tokenCache: Map<string, { token: string; dataRef: Record<string, unknown> | undefined }>,
   frozenIds?: ReadonlySet<string>,
 ): FlowNode[] {
   if (prev.length === 0 || graph.nodes.length === 0) {
@@ -230,9 +268,9 @@ function mergeNodes(
   const out: FlowNode[] = []
   for (const n of graph.nodes) {
     const existing = prevById.get(n.id)
-    const token = projectedNodeToken(n)
     const cached = tokenCache.get(n.id)
-    if (existing && cached === token) {
+    const token = projectedNodeToken(n, cached?.dataRef, cached?.token)
+    if (existing && cached && cached.token === token) {
       out.push(existing)
       continue
     }
@@ -244,7 +282,7 @@ function mergeNodes(
     if (frozenIds && frozenIds.has(n.id) && existing?.position) {
       projected.position = existing.position
     }
-    tokenCache.set(n.id, token)
+    tokenCache.set(n.id, { token, dataRef: n.data as Record<string, unknown> })
     out.push(projected)
   }
   // Drop tokens for ids that disappeared.
@@ -970,7 +1008,7 @@ function CanvasView({ canvasId }: CanvasProps) {
   // effect below.)
   const suppressAutoFitRef = useRef(false)
   const previewingRef = useRef(false)
-  const nodeTokenCacheRef = useRef(new Map<string, string>())
+  const nodeTokenCacheRef = useRef(new Map<string, { token: string; dataRef: Record<string, unknown> | undefined }>())
   const vpKey = `dsh-media-studio:viewport:${canvasId}`
 
   // Adaptive card width from the pane width — big cards that still
@@ -2408,13 +2446,13 @@ function CanvasView({ canvasId }: CanvasProps) {
   // was the dominant source of UI jank when the canvas tab was on screen.
   // The out/in adjacency arrays feed the chain-highlight BFS (dim-store.ts).
   const connMaps = useMemo(() => {
-    const right = new Set<string>()
-    const left = new Set<string>()
+    const edgesRight = new Set<string>()
+    const edgesLeft = new Set<string>()
     const out = new Map<string, string[]>()
     const inn = new Map<string, string[]>()
     for (const e of edges) {
-      right.add(e.source)
-      left.add(e.target)
+      edgesRight.add(e.source)
+      edgesLeft.add(e.target)
       const a = out.get(e.source) ?? []
       a.push(e.target)
       out.set(e.source, a)
@@ -2422,7 +2460,7 @@ function CanvasView({ canvasId }: CanvasProps) {
       b.push(e.source)
       inn.set(e.target, b)
     }
-    return { right, left, out, in: inn }
+    return { edgesRight, edgesLeft, out, in: inn }
   }, [edges])
 
   // ── Chain highlight (dim unrelated nodes/edges while a node is selected) ─
@@ -2560,9 +2598,6 @@ function CanvasView({ canvasId }: CanvasProps) {
     renameNode: (id: string, label: string) => mutate([{ op: 'renameNode', id, label }]),
     patchData: (id: string, data: Record<string, unknown>) => mutate([{ op: 'updateNode', id, data }]),
     post: postLocal,
-    edgesRight: connMaps.right,
-    edgesLeft: connMaps.left,
-    hasUpstreamById: connMaps.left,
     refreshNode: async (id: string) => {
       // Optimistically set status to 'running' immediately so the user sees
       // feedback before the (potentially long) generation completes. The SSE
@@ -2609,7 +2644,7 @@ function CanvasView({ canvasId }: CanvasProps) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [canvasId, cardW, openConnectMenu, mutate, postLocal, connMaps])
+  }), [canvasId, cardW, openConnectMenu, mutate, postLocal])
 
   // ── Clear-canvas confirmation ───────────────────────────────────────────
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
@@ -2639,6 +2674,7 @@ function CanvasView({ canvasId }: CanvasProps) {
         tabIndex={0}
       >
         <MediaCanvasContext.Provider value={api}>
+          <AdjacencyContext.Provider value={connMaps}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -2799,6 +2835,7 @@ function CanvasView({ canvasId }: CanvasProps) {
               </div>
             </div>
           )}
+          </AdjacencyContext.Provider>
         </MediaCanvasContext.Provider>
       </div>
 

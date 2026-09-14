@@ -49,7 +49,7 @@ describe('M1: TTS/dub node reads RAW upstream text (no [label]: prefix)', () => 
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore: undefined,
       projectSseClients: new Set(),
     } as never)
@@ -102,7 +102,7 @@ describe('M2: dub node inherits clone_audio + voice_name from upstream music', (
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore: undefined,
       projectSseClients: new Set(),
     } as never)
@@ -150,7 +150,7 @@ describe('M3: non-dub music node uses generate_music with raw upstream text', ()
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore: undefined,
       projectSseClients: new Set(),
     } as never)

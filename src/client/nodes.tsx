@@ -41,6 +41,7 @@ import {
   cardWidthVar,
   mediaSrc,
   useMediaCanvas,
+  useCanvasAdjacency,
   type MsData,
   type MsStatus,
   type NodeKind,
@@ -76,14 +77,21 @@ export function defaultLabel(kind: NodeKind): string {
   return `New ${KIND_META[kind].label.toLowerCase()}`
 }
 
-/** Remeasure handle positions after media loads / node resizes. */
+/** Remeasure handle positions after media loads / node resizes.
+ *
+ *  P2-⑫ — the previous version fired `updateNodeInternals` five times
+ *  per node mount (immediate + rAF + three setTimeout ticks at 60/200/500ms).
+ *  On a canvas with N cards that's 5N ReactFlow handle re-measurements
+ *  on first paint, the dominant cause of "open the canvas tab → jank"
+ *  on large projects. We now fire exactly once on the next animation
+ *  frame; media elements that load after that (an `<img>` decode, an
+ *  `<audio>` metadata load) trigger a second remeasure via the
+ *  `onLoad` callback paths inside LazyVideo / LazyAudio. */
 function useRefreshHandles(id: string) {
   const updateNodeInternals = useUpdateNodeInternals()
   useEffect(() => {
     const raf = requestAnimationFrame(() => updateNodeInternals(id))
-    const timers = [60, 200, 500].map((ms) => setTimeout(() => updateNodeInternals(id), ms))
-    updateNodeInternals(id)
-    return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout) }
+    return () => cancelAnimationFrame(raf)
   }, [id, updateNodeInternals])
 }
 
@@ -194,13 +202,12 @@ function CornerDelete({ id }: { id: string }) {
 }
 
 function AddSideButton({ id, side }: { id: string; side: 'left' | 'right' }) {
-  const { openConnectMenu, edgesLeft, edgesRight } = useMediaCanvas()
-  // Connectivity is precomputed once per SSE merge in canvas.tsx (kept as
-  // stable Set references) and shipped through the canvas context. That
-  // avoids the per-gesture cost of running `s.edges.some(...)` inside an
-  // xyflow `useStore` selector — every pan/zoom frame would otherwise
-  // re-invoke the selector for every AddSideButton × every node.
-  const isConnected = side === 'right' ? edgesRight.has(id) : edgesLeft.has(id)
+  const { openConnectMenu } = useMediaCanvas()
+  // Topology lives on the dedicated AdjacencyContext (M4-⑩) so changes
+  // here do NOT re-render every node card via MediaCanvasContext — only
+  // the topology-sensitive components subscribe.
+  const adj = useCanvasAdjacency()
+  const isConnected = side === 'right' ? adj.edgesRight.has(id) : adj.edgesLeft.has(id)
   return (
     <button
       type="button"
@@ -225,10 +232,12 @@ function AddSideButton({ id, side }: { id: string; side: 'left' | 'right' }) {
  * from upstream node content via the host refresh endpoint.
  */
 function RefreshSideButton({ id }: { id: string }) {
-  const { refreshNode, hasUpstreamById } = useMediaCanvas()
-  // Show only when this node has at least one upstream edge. We read the
-  // precomputed Set from context (see AddSideButton above for the why).
-  const hasUpstream = hasUpstreamById.has(id)
+  const { refreshNode } = useMediaCanvas()
+  // Topology-only dependency — read from the dedicated adjacency context
+  // so a topology change doesn't re-render every node card. See
+  // AddSideButton and M4-⑩.
+  const adj = useCanvasAdjacency()
+  const hasUpstream = adj.edgesLeft.has(id)
   // ALL hooks must run on every render — React tracks hooks by call order,
   // so any conditional `return null` must come AFTER every hook above it.
   // The previous layout declared `useState` then `return null` then

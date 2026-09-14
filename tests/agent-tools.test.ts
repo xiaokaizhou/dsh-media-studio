@@ -160,7 +160,7 @@ describe('agent tools: 12 new media_studio_* tools', () => {
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore,
       projectSseClients: new Set(),
     })
@@ -193,7 +193,7 @@ describe('agent tools: 12 new media_studio_* tools', () => {
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore,
       projectSseClients: new Set(),
     })
@@ -264,7 +264,7 @@ describe('single-node CRUD tools: execute() smoke', () => {
       mediaRoots: [],
       defaultCanvasId: 'main',
       canvasStore: store,
-      sseClients: new Set(),
+      sseClients: new Map(),
       projectStore,
       projectSseClients: new Set(),
     })

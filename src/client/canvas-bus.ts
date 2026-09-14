@@ -190,8 +190,15 @@ function ensureConnection(canvasId: string) {
 
   es.addEventListener('canvas-patch', (e: MessageEvent) => {
     try {
-      const data = JSON.parse(e.data) as { type?: string; graph?: MsSnapshot['graph']; version?: number }
+      const data = JSON.parse(e.data) as { type?: string; canvasId?: string; graph?: MsSnapshot['graph']; version?: number }
       if (data?.type !== 'canvas-patch' || !data.graph) return
+      // M4-③ — defence in depth on the client side: drop any canvas-patch
+      // whose canvasId doesn't match the canvas we subscribed to. The
+      // server already bucketed SSE delivery per canvas, but a
+      // misconfigured proxy / replay / older build might still send a
+      // foreign patch; ignoring it here keeps the tab from rendering a
+      // different project's graph.
+      if (data.canvasId && state.canvasId && data.canvasId !== state.canvasId) return
       const snap: MsSnapshot = { graph: data.graph, version: data.version ?? 0 }
       // While switchPending is set, the SSE initial snapshot may race with
       // server-side canvas loading and deliver an empty v0 graph. Ignore it

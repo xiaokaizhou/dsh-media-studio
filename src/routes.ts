@@ -409,8 +409,12 @@ export function registerCanvasRoutes(ctx: Context): () => void {
       }
 
       // Register with BOTH broadcast sets so canvas patches and project
-      // events flow down the same socket.
-      sseClients.add(res)
+      // events flow down the same socket. M4-③ — canvas-patch subscribers
+      // are bucketed by canvasId so a patch on canvas A is never pushed
+      // to a client subscribed to canvas B.
+      let bucket = sseClients.get(canvasId)
+      if (!bucket) { bucket = new Set(); sseClients.set(canvasId, bucket) }
+      bucket.add(res)
       handles.projectSseClients?.add(res)
 
       const ping = setInterval(() => {
@@ -419,7 +423,10 @@ export function registerCanvasRoutes(ctx: Context): () => void {
 
       req.on('close', () => {
         clearInterval(ping)
-        sseClients.delete(res)
+        bucket?.delete(res)
+        // Drop the bucket key when its last subscriber leaves — keeps the
+        // map from growing unbounded across long-running sessions.
+        if (bucket && bucket.size === 0) sseClients.delete(canvasId)
         handles.projectSseClients?.delete(res)
       })
     },

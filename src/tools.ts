@@ -3,11 +3,111 @@ import type { JsonValue } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import { CanvasStore, type CanvasOp, type CanvasSnapshot, type CanvasNode } from './canvas-store'
 import { join, extname, dirname } from 'node:path'
-import { mkdir, writeFile, stat } from 'node:fs/promises'
+import { mkdir, writeFile, stat, readdir, unlink } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { getMediaStudioHandles, log } from './service-state'
 import { prepareVideoForCanvas, extractPosterInPlace, resolveLocalVideoPath } from './video-cover'
 import { prepareImageForCanvas, prepareAudioForCanvas } from './image-cover'
+
+/**
+ * Tiny in-process semaphore. Caps the number of in-flight `task` calls to
+ * `n`; the rest queue. Used to throttle `prepareVideoForCanvas` (which
+ * spawns ffmpeg) so a single batch of N videos doesn't open N parallel
+ * ffmpeg processes. Exported so tests can verify the gate.
+ */
+export function pLimit<T>(n: number): (task: () => Promise<T>) => Promise<T> {
+  let active = 0
+  const queue: Array<() => void> = []
+  const next = (): void => {
+    while (active < n && queue.length > 0) {
+      const wake = queue.shift()!
+      active += 1
+      wake()
+    }
+  }
+  return (task) => new Promise<T>((resolve, reject) => {
+    queue.push(() => {
+      task().then(
+        (v) => { active -= 1; next(); resolve(v) },
+        (e) => { active -= 1; next(); reject(e) },
+      )
+    })
+    next()
+  })
+}
+
+/** Max parallel `prepareVideoForCanvas` calls inside one `postProcessCanvasPatch`.
+ *  Two is the sweet spot: keeps wall-clock roughly half of serial while not
+ *  flooding the disk with parallel ffmpeg rewrites. */
+const PREPARE_VIDEO_LIMIT = pLimit(2)
+
+/**
+ * M5-⑤ — garbage-collect orphan media files in the project's asset
+ * directory. Runs after every `postProcessCanvasPatch` so a long agent
+ * iteration that calls `canvas_graph_patch` / refresh dozens of times
+ * doesn't leave behind stale `v-*.mp4` / `v-*.poster.jpg` /
+ * `v-*.thumb.jpg` / `a-*.mp3` / `img-*.png` files from earlier random-
+ * id generations. Files whose basename appears as a referenced
+ * `resultUrl` / `poster` value on any loaded canvas are kept; every
+ * other stable-prefixed file in the directory is removed.
+ *
+ * Safety: we never touch files outside `assets/<kind>/` of the target
+ * project, and the GC runs after the new persist is already scheduled
+ * — a crash between unlink and the next agent patch leaves a few
+ * extra files behind but never drops a referenced one.
+ */
+export async function gcOrphanMedia(
+  store: CanvasStore,
+  projectId: string,
+  sourcePath: string | undefined,
+): Promise<{ removed: number; scanned: number }> {
+  // Use the canvas store's view of referenced paths. Walking the live
+  // `canvases` Map without cloneGraph keeps this O(N × nodes) but with
+  // constant memory.
+  const refs = store.collectReferencedMediaPaths()
+  // The set of "all currently-referenced relative paths" we want to
+  // protect. Files on disk are referenced by absolute path; we need to
+  // match them against the bare filename portion of the stored value
+  // (the values look like `projects/<id>/assets/clips/v-<hex>.mp4`).
+  // Comparing basenames is enough because we only ever look inside one
+  // project's directory at a time.
+  const refBasenames = new Set<string>()
+  for (const r of refs) {
+    if (typeof r !== 'string') continue
+    const idx = r.lastIndexOf('/')
+    if (idx >= 0) refBasenames.add(r.slice(idx + 1))
+  }
+
+  const projectDir = sourcePath
+    ? join(sourcePath, 'assets')
+    : join(store.workspaceRootPublic, 'projects', projectId, 'assets')
+  // The "stable" prefixes the helpers in video-cover.ts / image-cover.ts
+  // produce. Anything matching these prefixes in the project asset dir
+  // was created by `prepare*` and is fair game for GC.
+  const STABLE_PREFIXES = ['v-', 'a-', 'i-']
+  const KINDS = ['clips', 'characters', 'scenes', 'audio']
+
+  let removed = 0
+  let scanned = 0
+  for (const kind of KINDS) {
+    const dir = join(projectDir, kind)
+    let entries: string[]
+    try {
+      entries = await readdir(dir)
+    } catch { /* directory absent — nothing to GC */ continue }
+    for (const entry of entries) {
+      // Only touch stable-prefixed files; ignore unrelated user assets.
+      if (!STABLE_PREFIXES.some((p) => entry.startsWith(p))) continue
+      scanned += 1
+      if (refBasenames.has(entry)) continue
+      try {
+        await unlink(join(dir, entry))
+        removed += 1
+      } catch { /* race with another writer; skip silently */ }
+    }
+  }
+  return { removed, scanned }
+}
 import {
   registerCanvasAsset,
   type AssetKind,
@@ -1113,6 +1213,14 @@ export async function postProcessCanvasPatch(
   //     sourcePath/projectId are passed so sourcePath projects keep their
   //     media inside the user's project tree (assets/clips/) instead of the
   //     shared web-jobs/ directory.
+  //
+  //     M3-② batching: every successful prepare pushes an updateNode op
+  //     into `pendingVideoOps`; a single trailing `store.apply` writes all
+  //     of them in one pass (one cloneGraph, one broadcast, one debounced
+  //     disk write). The previous per-video apply cost N clones / N
+  //     broadcasts / N writes for an N-video patch — see test
+  //     `post-process-batching.test.ts`.
+  const pendingVideoOps: CanvasOp[] = []
   for (const op of ops) {
     if (op.op !== 'batchAddMedia') continue
     for (const item of op.items) {
@@ -1134,11 +1242,14 @@ export async function postProcessCanvasPatch(
         })
         const updateData: Record<string, unknown> = { resultUrl: prepared.url }
         if (prepared.poster) updateData.poster = prepared.poster
-        store.apply(canvasId, [{ op: 'updateNode', id: nid, data: updateData }])
+        pendingVideoOps.push({ op: 'updateNode', id: nid, data: updateData })
       } catch (e) {
         issues.push(`warn: video cover preparation failed for node "${nid}": ${(e as Error).message} (card will show without a poster)`)
       }
     }
+  }
+  if (pendingVideoOps.length > 0) {
+    try { store.apply(canvasId, pendingVideoOps) } catch (e) { issues.push(`warn: batched video poster apply failed: ${(e as Error).message}`) }
   }
 
   // 1.6 Backfill missing video posters when an existing video node's
@@ -1148,6 +1259,10 @@ export async function postProcessCanvasPatch(
   //     separate patch that just sets `data.resultUrl` to the local file
   //     path — without this step the canvas card shows blank until the user
   //     manually refreshes the node.
+  //
+  //     M3-② batching (see step 1.5 header): all backfill updates land
+  //     in a single trailing `store.apply`.
+  const pendingBackfillOps: CanvasOp[] = []
   for (const op of ops) {
     if (op.op !== 'updateNode') continue
     const nid = op.id
@@ -1172,30 +1287,56 @@ export async function postProcessCanvasPatch(
       if (prepared.url && prepared.url !== newResultUrl) updateData.resultUrl = prepared.url
       if (prepared.poster && !hasPoster) updateData.poster = prepared.poster
       if (Object.keys(updateData).length > 0) {
-        store.apply(canvasId, [{ op: 'updateNode', id: nid, data: updateData }])
+        pendingBackfillOps.push({ op: 'updateNode', id: nid, data: updateData })
       }
     } catch (e) {
       issues.push(`warn: video cover backfill failed for node "${nid}": ${(e as Error).message}`)
     }
   }
+  if (pendingBackfillOps.length > 0) {
+    try { store.apply(canvasId, pendingBackfillOps) } catch (e) { issues.push(`warn: batched video backfill apply failed: ${(e as Error).message}`) }
+  }
 
   // 2. Migrate inaccessible resultUrls + 3. auto-register assets
-  const postSnap = store.snapshot(canvasId)
-  const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
-  for (const { nodeId, nodeType } of mediaNodes) {
-    const adv = await migrateInaccessibleResultUrl(
-      projectId, mst.workspaceRoot, mst.mediaRoots ?? [], store, nodeId, nodeType, sourcePath,
-    )
-    if (adv) issues.push(adv)
+  //
+  // NOTE: kept in series on purpose. Each migrate/register call internally
+  // does a full canvas snapshot + (for migration) a single-op store.apply
+  // → full cloneGraph + persist + broadcast. The P0-① persist coalescer
+  // (added in M3) folds the resulting burst of applies into one disk
+  // write regardless of order. Running these in parallel actually
+  // observed duplicate-asset races in the project library (two register
+  // tasks both seeing the same origin-less source and both writing new
+  // asset rows); the series path stays until the lib writes are
+  // idempotency-guarded (see M5 stable-filename work).
+  {
+    const postSnap = store.snapshot(canvasId)
+    const mediaNodes = collectMediaNodesFromOps(ops, postSnap.graph.nodes)
+    for (const { nodeId, nodeType } of mediaNodes) {
+      const adv = await migrateInaccessibleResultUrl(
+        projectId, mst.workspaceRoot, mst.mediaRoots ?? [], store, nodeId, nodeType, sourcePath,
+      )
+      if (adv) issues.push(adv)
+    }
+    // Nodes whose https URL was already pinned in step 1 are already indexed
+    // (origin: pinned) by pinRemoteResultUrl — re-registering them here would
+    // copy the bytes a second time into the library and produce duplicate
+    // assets. Skip them.
+    for (const { nodeId, nodeType } of mediaNodes) {
+      if (pinnedNodeIds.has(nodeId)) continue
+      const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
+      if (adv) issues.push(adv)
+    }
   }
-  // Nodes whose https URL was already pinned in step 1 are already indexed
-  // (origin: pinned) by pinRemoteResultUrl — re-registering them here would
-  // copy the bytes a second time into the library and produce duplicate
-  // assets. Skip them.
-  for (const { nodeId, nodeType } of mediaNodes) {
-    if (pinnedNodeIds.has(nodeId)) continue
-    const adv = await tryAutoRegisterAsset(projectId, sourcePath, nodeId, nodeType)
-    if (adv) issues.push(adv)
+
+  // Step 4 — M5-⑤ orphan media GC. Runs after every successful
+  // post-process so a long agent iteration of canvas_graph_patch +
+  // refresh doesn't accumulate v-*/a-*/img-* files in the project's
+  // asset directory. Best-effort: errors here are advisory only — the
+  // patch already succeeded and the user sees their nodes either way.
+  try {
+    await gcOrphanMedia(store, projectId, sourcePath)
+  } catch (e) {
+    issues.push(`warn: orphan media GC failed: ${(e as Error).message}`)
   }
 
   return issues

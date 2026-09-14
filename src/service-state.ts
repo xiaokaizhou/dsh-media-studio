@@ -33,8 +33,9 @@ export interface MediaStudioHandles {
   defaultCanvasId: string
   /** Server-side canvas state (atomic, persisted). */
   canvasStore: CanvasStore
-  /** SSE client registry — the canvas tab's EventSource lands here. */
-  sseClients: Set<ServerResponse>
+  /** SSE client registry — keyed by canvasId (M4-③) so a patch on canvas
+   *  A is only delivered to clients that subscribed to canvas A. */
+  sseClients: Map<string, Set<ServerResponse>>
   /** Multi-project registry (added M0). Absent during transitional boots. */
   projectStore?: ProjectStore
   /** SSE client registry for project-level events (registry/open/delete). */
