@@ -1,10 +1,31 @@
 {
   "name": "dsh-media-studio",
   "version": "0.3.1",
-  "description": "DSH plugin: infinite-canvas editor with media node refresh. Sibling plugin dsh-llm-multimodal owns the LLM-facing config + tools.",
+  "description": "DSH 插件：多项目无限画布编辑器 —— 画布节点编排、分门别类的素材库、全局素材搜索与跨项目软引用，配合 dsh-llm-multimodal 的生成工具与 media-preview 的聊天内预览。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "dsh-plugin",
+    "canvas",
+    "media",
+    "storyboard",
+    "infinite-canvas",
+    "asset-library",
+    "image",
+    "video",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaokaizhou/dsh-media-studio.git"
+  },
+  "homepage": "https://github.com/xiaokaizhou/dsh-media-studio#readme",
+  "bugs": {
+    "url": "https://github.com/xiaokaizhou/dsh-media-studio/issues"
+  },
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",

@@ -1,11 +1,17 @@
 # dsh-media-studio bundle layer — registers the host plugin as a bundle row.
 #
-# After the multimodal refactor this plugin owns FOUR canvas-only tools
-# (canvas_graph_view / canvas_graph_patch / canvas_auto_arrange /
-# canvas_refresh_node) plus the canvas HTTP/SSE routes. LLM-facing tools
-# (generate_text / generate_image / generate_video / generate_tts /
-# generate_music) and the `llm-multimodal` settings namespace live in the
-# sibling `dsh-llm-multimodal` plugin.
+# This plugin owns the canvas surface: 25 tools total — 13 `canvas_*`
+# (graph view/patch, auto-arrange, node refresh, single-node CRUD,
+# region CRUD/fit) and 12 `media_studio_*` (project management, asset
+# library, global cross-project search) — plus the canvas HTTP/SSE routes
+# and the media-file proxy.
+#
+# LLM-facing generation tools (generate_text / generate_image /
+# generate_video / generate_vision / generate_tts / generate_music) and
+# the `llm-multimodal` settings namespace live in the sibling
+# `dsh-llm-multimodal` plugin. This plugin publishes the `mediaStudio`
+# service that the generator uses to write media into the active project;
+# that dependency is a soft lookup, so either plugin works standalone.
 #
 # Layer semantics: a YAML array of row verbs; `insert` adds plugin rows to
 # the composed config. A row's `id` must be unique within the layer stack;
