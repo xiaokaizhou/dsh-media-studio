@@ -4,6 +4,18 @@
 
 एक DeepSeek Harness (DSH) प्लगइन जो agents को **मल्टी-प्रोजेक्ट इनफ़िनिट कैनवास एडिटर** देता है: कैनवास स्टोरीबोर्ड, हर प्रोजेक्ट के लिए श्रेणीबद्ध asset library, ग्लोबल रियल-टाइम asset search, और प्रोजेक्ट्स के बीच soft references। Agent की media generation (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) साथी प्लगइन `dsh-llm-multimodal` में रहती है और यहाँ से कैनवास के "refresh" flows के ज़रिए पहुँचती है।
 
+## AI वीडियो निर्माण के लिए बनाया गया
+
+यह canvas कई shots वाले लंबे AI वीडियो काम के लिए production board है — ऐसे प्रोजेक्ट के लिए जिनमें एक जैसे पात्र, दोबारा इस्तेमाल होने वाले assets और shot-by-shot topology चाहिए, न कि सिर्फ़ एक prompt:
+
+| उपयोग | canvas क्या देता है |
+|---|---|
+| **AI comic drama (漫剧)** | हर episode के लिए एक region: character/scene asset blocks shots के बीच दोबारा काम आते हैं, और एक साझा art-style node नीचे के सभी prompts को feed करता है, जिससे दर्जनों panels में look एक जैसा रहता है |
+| **AI micro film (微电影)** | script → storyboard → shot → edit regions से पूरी फ़िल्म की स्थिति एक नज़र में जाँची जा सकती है; first/last-frame keyframe chaining लगातार shots को जोड़े रखती है, slides जैसा नहीं बनने देती |
+| **AI video creation (视频创作)** | कोई भी multi-shot काम — product ads, MV, explainers। node-स्तर का `canvas_refresh_node` सिर्फ़ उसी shot को दोबारा बनाता है जो खराब आया, पूरा board दोबारा नहीं करना पड़ता |
+
+नीचे दी गई सुविधाएँ इसे व्यवहारिक बनाती हैं: हर प्रोजेक्ट की **asset library** (characters / scenes / audio / clips) मुख्य पात्र को एक जैसा रखती है, **soft references** से एक character asset कई canvases में बिना फ़ाइल कॉपी किए काम आता है, और **global search (⌘K)** पुराने प्रोजेक्ट से scene asset ढूँढकर मौजूदा canvas में ले आता है।
+
 ## साथी प्लगइन
 
 यह प्लगइन उसी लेखक के दो साथी DSH प्लगइन्स के साथ एक पूरा **generate → orchestrate → preview** लूप बनाता है। इन्हें साथ में इंस्टॉल करें:

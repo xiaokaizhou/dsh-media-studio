@@ -4,6 +4,18 @@
 
 Un plugin de DeepSeek Harness (DSH) que dota a los agentes de un **editor de lienzo infinito multiproyecto**: storyboards en lienzo, una biblioteca de recursos categorizada por proyecto, búsqueda global de recursos en tiempo real y referencias blandas entre proyectos. La generación de medios por parte del agente (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) reside en el plugin hermano `dsh-llm-multimodal` y se alcanza desde aquí a través de los flujos "refresh" del lienzo.
 
+## Pensado para la producción de vídeo con IA
+
+El lienzo es la mesa de producción para trabajo de vídeo con IA de varios planos y recorrido largo: el tipo de proyecto que necesita personajes coherentes, activos reutilizables y una topología plano a plano, no un único prompt:
+
+| Caso de uso | Qué aporta el lienzo |
+|---|---|
+| **AI comic drama (漫剧)** | Una región por episodio: los bloques de activos de personaje y escena se reutilizan entre planos, y un nodo compartido de estilo artístico alimenta todos los prompts posteriores para que el look se mantenga a lo largo de decenas de viñetas |
+| **AI micro film (微电影)** | Las regiones guion → storyboard → plano → montaje hacen que el estado del film completo sea auditable de un vistazo; el encadenado de fotogramas clave inicial/final mantiene continuos los planos consecutivos en lugar de parecer diapositivas |
+| **AI video creation (视频创作)** | Cualquier pieza de varios planos: anuncios de producto, videoclips, explicativos. `canvas_refresh_node` a nivel de nodo regenera solo el plano que falló, sin rehacer el resto del tablero |
+
+Las funciones de abajo son las que hacen esto practicable: una **biblioteca de activos** por proyecto (personajes / escenas / audio / clips) mantiene coherente al protagonista, las **referencias blandas** permiten que un activo de personaje sirva a muchos lienzos sin copiar archivos, y la **búsqueda global (⌘K)** encuentra un activo de escena de un proyecto antiguo para reutilizarlo en el actual.
+
 ## Plugins complementarios
 
 Este plugin forma un ciclo completo **generar → orquestar → previsualizar** junto con dos plugins hermanos de DSH del mismo autor. Instálalos en conjunto:

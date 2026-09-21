@@ -4,6 +4,18 @@
 
 A DeepSeek Harness (DSH) plugin that gives agents a **multi-project infinite-canvas editor**: canvas storyboards, a categorized asset library per project, global real-time asset search, and soft references across projects. Agent media generation (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) lives in the sibling `dsh-llm-multimodal` plugin and is reached from here through the canvas "refresh" flows.
 
+## Built for AI video production
+
+The canvas is the production board for long-form, multi-shot AI video work — the kind that needs consistent characters, persistent assets, and a shot-by-shot topology rather than a single prompt:
+
+| Use case | What the canvas gives you |
+|---|---|
+| **AI comic drama (AI 漫剧)** | One region per episode: character/scene asset blocks stay reusable across shots, and a shared art-style node feeds every downstream prompt so the look holds together across dozens of panels |
+| **AI micro film (AI 微电影)** | Script → storyboard → shot → edit regions make the whole film auditable at a glance; first/last-frame keyframe chaining keeps consecutive shots continuous instead of looking like slides |
+| **AI video creation (AI 视频创作)** | Any multi-shot piece — product ads, MV, explainers. Node-level `canvas_refresh_node` re-generates just the shot that missed, without redoing the rest of the board |
+
+The features below are what make that practical: a per-project **asset library** (characters / scenes / audio / clips) keeps a protagonist visually consistent, **soft references** let one character asset serve many canvases without copying files, and **global search (⌘K)** finds a scene asset from an older project to reuse in the current one.
+
 ## Companion plugins
 
 This plugin forms a complete **generate → orchestrate → preview** loop with two sibling DSH plugins by the same author. Install them together:

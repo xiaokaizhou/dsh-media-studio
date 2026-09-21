@@ -4,6 +4,18 @@
 
 Um plugin do DeepSeek Harness (DSH) que dá aos agentes um **editor de canvas infinito com múltiplos projetos**: storyboards em canvas, uma biblioteca de assets categorizada por projeto, busca global de assets em tempo real e referências suaves entre projetos. A geração de mídia pelo agente (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) vive no plugin irmão `dsh-llm-multimodal` e é acessada a partir daqui pelos fluxos de "refresh" do canvas.
 
+## Feito para produção de vídeo com IA
+
+O canvas é a mesa de produção para trabalho de vídeo com IA com vários planos e cadeia longa — o tipo de projeto que precisa de personagens consistentes, ativos reutilizáveis e uma topologia plano a plano, e não de um único prompt:
+
+| Caso de uso | O que o canvas entrega |
+|---|---|
+| **AI comic drama (漫剧)** | Uma região por episódio: os blocos de ativos de personagem e cenário são reutilizados entre planos, e um nó compartilhado de estilo artístico alimenta todos os prompts seguintes, mantendo o visual coerente ao longo de dezenas de quadros |
+| **AI micro film (微电影)** | As regiões roteiro → storyboard → plano → montagem deixam o estado do filme inteiro auditável de relance; o encadeamento de quadros-chave inicial/final mantém planos consecutivos contínuos em vez de parecerem slides |
+| **AI video creation (视频创作)** | Qualquer peça com vários planos — anúncios de produto, videoclipes, explicativos. O `canvas_refresh_node` no nível do nó regenera apenas o plano que falhou, sem refazer o resto do quadro |
+
+Os recursos abaixo são o que torna isso praticável: uma **biblioteca de ativos** por projeto (personagens / cenários / áudio / clipes) mantém o protagonista visualmente consistente, as **referências leves** permitem que um ativo de personagem sirva a vários canvases sem copiar arquivos, e a **busca global (⌘K)** encontra um ativo de cenário de um projeto antigo para reutilizá-lo no atual.
+
 ## Plugins complementares
 
 Este plugin forma um ciclo completo **gerar → orquestrar → visualizar** com dois plugins irmãos do DSH, do mesmo autor. Instale-os juntos:
