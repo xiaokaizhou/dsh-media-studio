@@ -4,6 +4,12 @@
 
 一个 DeepSeek Harness（DSH）插件，为 agent 提供**多项目无限画布编辑器**：项目画布、每项目分门别类的素材库、全局实时素材搜索、跨项目软引用。媒体生成能力（`generate_image` / `generate_video` / `generate_vision` / `generate_music` / TTS）位于姊妹插件 `dsh-llm-multimodal`，本插件通过画布「重新生成」流程调用。
 
+## 效果预览
+
+![Media Studio 画布](https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/demo-canvas.png)
+
+<sub>一条 59 节点、76 条连线的 AI 微电影工作台：五个分区——编排计划、剧本与制作计划、资产锚点、分镜与关键帧、视频片段——在 22% 缩放下总览。点击可放大。</sub>
+
 ## 面向 AI 视频创作
 
 画布是为**多镜头、长链路**的 AI 视频生产准备的工作台——这类工作需要一致的角色、可复用的资产与逐镜头的拓扑，而不是一条提示词：

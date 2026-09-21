@@ -4,6 +4,12 @@
 
 Un plugin de DeepSeek Harness (DSH) que dota a los agentes de un **editor de lienzo infinito multiproyecto**: storyboards en lienzo, una biblioteca de recursos categorizada por proyecto, búsqueda global de recursos en tiempo real y referencias blandas entre proyectos. La generación de medios por parte del agente (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) reside en el plugin hermano `dsh-llm-multimodal` y se alcanza desde aquí a través de los flujos "refresh" del lienzo.
 
+## Vista previa
+
+![Lienzo de Media Studio](https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/demo-canvas.png)
+
+<sub>Un tablero de microfilm con IA de 59 nodos: cinco regiones — planificación, guion, anclas de activos, storyboard/fotogramas clave y clips de vídeo — unidas por 76 aristas, visto al 22 % de zoom. Haz clic para ampliar.</sub>
+
 ## Pensado para la producción de vídeo con IA
 
 El lienzo es la mesa de producción para trabajo de vídeo con IA de varios planos y recorrido largo: el tipo de proyecto que necesita personajes coherentes, activos reutilizables y una topología plano a plano, no un único prompt:

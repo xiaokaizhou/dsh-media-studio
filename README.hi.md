@@ -4,6 +4,12 @@
 
 एक DeepSeek Harness (DSH) प्लगइन जो agents को **मल्टी-प्रोजेक्ट इनफ़िनिट कैनवास एडिटर** देता है: कैनवास स्टोरीबोर्ड, हर प्रोजेक्ट के लिए श्रेणीबद्ध asset library, ग्लोबल रियल-टाइम asset search, और प्रोजेक्ट्स के बीच soft references। Agent की media generation (`generate_image` / `generate_video` / `generate_music` / TTS / `generate_vision`) साथी प्लगइन `dsh-llm-multimodal` में रहती है और यहाँ से कैनवास के "refresh" flows के ज़रिए पहुँचती है।
 
+## झलक
+
+![Media Studio canvas](https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/demo-canvas.png)
+
+<sub>59 nodes और 76 edges वाला एक AI माइक्रो-फ़िल्म बोर्ड: पाँच regions — planning, script, asset anchors, storyboard/keyframes और video clips — 22% zoom पर। बड़ा करने के लिए क्लिक करें।</sub>
+
 ## AI वीडियो निर्माण के लिए बनाया गया
 
 यह canvas कई shots वाले लंबे AI वीडियो काम के लिए production board है — ऐसे प्रोजेक्ट के लिए जिनमें एक जैसे पात्र, दोबारा इस्तेमाल होने वाले assets और shot-by-shot topology चाहिए, न कि सिर्फ़ एक prompt:
