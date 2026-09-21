@@ -4,7 +4,7 @@
   "description": "DSH 插件：多项目无限画布编辑器 —— 画布节点编排、分门别类的素材库、全局素材搜索与跨项目软引用，配合 dsh-llm-multimodal 的生成工具与 media-preview 的聊天内预览。",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
+  "types": "lib/index.d.ts",
   "keywords": [
     "deepseek",
     "dsh",
@@ -28,18 +28,21 @@
   },
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": {
-      "types": "./lib/types/client/index.d.ts",
       "default": "./lib/client.js"
+    },
+    "./service-worker": {
+      "default": "./lib/service-worker.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "src/presets"
   ],
   "scripts": {
     "build": "tsdown",

@@ -52,6 +52,12 @@ dsh plugin --profile <name> add ./dsh-media-studio-0.3.1.tgz
 dsh --profile <name> --dump-config | grep 'dsh-media-studio'
 ```
 
+### Optional: the media-studio agent preset
+
+The package also ships an agent preset (`src/presets/media-studio/agent.cordis.yml`) that gives a session a media-production persona and the matching prompt sections. Tools are **not** declared there — the plugin's own fiber already registers them, and every session inherits them through `ctx.tools`. The preset only adds identity and prompt framing.
+
+From a source checkout, `pnpm run prepare` (or `bash scripts/setup-preset.sh [profile]`) symlinks it into `$DSH_HOME/profiles/<profile>/agent-presets/media-studio/`. From an npm install, symlink it yourself from `node_modules/dsh-media-studio/src/presets/media-studio/agent.cordis.yml`. Then pick **media-studio** in the agent preset selector, or run `/preset media-studio` in chat. Skipping this step entirely is fine — the canvas tab and all 25 tools work without it.
+
 ## Configuration
 
 | Key | Type | Default | Description |
@@ -94,6 +100,23 @@ Several hot paths are pinned by regression tests, because a 100 ms vs 1 s differ
 | `dependentsOf` / `scanAssetRefs` never deep-copy the canvas | `tests/dependents-no-clone.test.ts` |
 
 Any change to a hot path (writes, SSE, media processing, dependency scans, canvas rendering) must ship with a matching regression test.
+
+## Sponsorship
+
+If this plugin saves you time, you can buy me a coffee with one of the following QR codes.
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/wechat-pay.jpg" width="180" alt="WeChat Pay"><br>
+      <strong>WeChat Pay</strong>
+    </td>
+    <td align="center">
+      <img src="https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/alipay.jpg" width="180" alt="Alipay"><br>
+      <strong>Alipay</strong>
+    </td>
+  </tr>
+</table>
 
 ## License
 

@@ -52,6 +52,12 @@ dsh plugin --profile <name> add ./dsh-media-studio-0.3.1.tgz
 dsh --profile <name> --dump-config | grep 'dsh-media-studio'
 ```
 
+### 可选：media-studio agent preset
+
+包内还附带一份 agent preset（`src/presets/media-studio/agent.cordis.yml`），让会话带上媒体制作人格与配套的 prompt 段落。preset 里**不声明任何工具**——本插件自己的 fiber 已注册全部工具，每个会话都能通过 `ctx.tools` 继承；preset 只补充身份与提示词框架。
+
+源码检出场景下，`pnpm run prepare`（或 `bash scripts/setup-preset.sh [profile]`）会把它软链到 `$DSH_HOME/profiles/<profile>/agent-presets/media-studio/`。npm 安装场景请自行从 `node_modules/dsh-media-studio/src/presets/media-studio/agent.cordis.yml` 软链。之后在 agent preset 选择器里选 **media-studio**，或在对话中输入 `/preset media-studio`。完全跳过这一步也没问题——画布标签页与全部 25 个工具都不依赖它。
+
 ## Configuration
 
 | 键 | 类型 | 默认 | 说明 |
@@ -94,6 +100,23 @@ pnpm pack
 | `dependentsOf` / `scanAssetRefs` 不深拷贝画布 | `tests/dependents-no-clone.test.ts` |
 
 任何改动热点路径（写入、SSE、媒体处理、依赖扫描、画布渲染）都必须随附对应的回归测试。
+
+## 打赏支持
+
+若这个插件帮到了你，欢迎用下面的二维码请我喝杯咖啡。
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/wechat-pay.jpg" width="180" alt="WeChat Pay"><br>
+      <strong>微信支付</strong>
+    </td>
+    <td align="center">
+      <img src="https://raw.githubusercontent.com/xiaokaizhou/dsh-media-studio/main/.github/alipay.jpg" width="180" alt="Alipay"><br>
+      <strong>支付宝</strong>
+    </td>
+  </tr>
+</table>
 
 ## License
 
